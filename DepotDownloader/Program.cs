@@ -827,7 +827,6 @@ namespace DepotDownloader
             Console.WriteLine("       depotdownloader -app <id> -ugc <id> [-username <username> [-password <password>]]");
             Console.WriteLine("Usage: downloading workshop items by IDs");
             Console.WriteLine("       depotdownloader -app <id> -workshop <id1> <id2> ... [-username <username> [-password <password>]]");
-            
             Console.WriteLine();
             Console.WriteLine("Parameters:");
             Console.WriteLine("  -app <#>                 - the AppID to download.");
