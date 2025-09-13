@@ -827,6 +827,7 @@ namespace DepotDownloader
             Console.WriteLine("       depotdownloader -app <id> -ugc <id> [-username <username> [-password <password>]]");
             Console.WriteLine("Usage: downloading workshop items by IDs");
             Console.WriteLine("       depotdownloader -app <id> -workshop <id1> <id2> ... [-username <username> [-password <password>]]");
+            
             Console.WriteLine();
             Console.WriteLine("Parameters:");
             Console.WriteLine("  -app <#>                 - the AppID to download.");
@@ -882,6 +883,42 @@ namespace DepotDownloader
             Console.WriteLine();
             Console.WriteLine("  -debug                   - enable verbose debug logging.");
             Console.WriteLine("  -V or --version          - print version and runtime.");
+            Console.WriteLine();
+            Console.WriteLine("Raw archive usage examples:");
+            Console.WriteLine();
+            Console.WriteLine("Basic raw archive download:");
+            Console.WriteLine("  depotdownloader -app 4000 -depot 4001 -raw");
+            Console.WriteLine("  depotdownloader -app 4000 -raw -raw-output archives/");
+            Console.WriteLine();
+            Console.WriteLine("Download specific manifest version in raw mode:");
+            Console.WriteLine("  depotdownloader -app 4000 -depot 4001 -manifest 172736322597516942 -raw");
+            Console.WriteLine("  depotdownloader -app 4000 -depot 4001 -manifest 172736322597516942 -raw -raw-debug-json");
+            Console.WriteLine();
+            Console.WriteLine("Download multiple manifests from same depot:");
+            Console.WriteLine("  depotdownloader -app 4000 -depot 4001 -manifest 123 456 789 -raw");
+            Console.WriteLine();
+            Console.WriteLine("CSV-based manifest downloads:");
+            Console.WriteLine("  # Download latest manifest per depot from CSV");
+            Console.WriteLine("  depotdownloader -app 4000 -manifest-csv manifests.csv -raw");
+            Console.WriteLine();
+            Console.WriteLine("  # Download ALL manifests from CSV (historical archiving)");
+            Console.WriteLine("  depotdownloader -app 4000 -manifest-csv manifests.csv -manifest-csv-all -raw");
+            Console.WriteLine();
+            Console.WriteLine("  # Download all manifests for specific depot from CSV");
+            Console.WriteLine("  depotdownloader -app 4000 -depot 4001 -manifest-csv manifests.csv -manifest-csv-all -raw");
+            Console.WriteLine();
+            Console.WriteLine("Raw archive with advanced options:");
+            Console.WriteLine("  # Dry run (manifests only, no chunks)");
+            Console.WriteLine("  depotdownloader -app 4000 -depot 4001 -raw -raw-dry-run");
+            Console.WriteLine();
+            Console.WriteLine("  # Complete historical archive with all options");
+            Console.WriteLine("  depotdownloader -app 4000 -manifest-csv all_manifests.csv -manifest-csv-all \\");
+            Console.WriteLine("                  -raw -raw-output archives/ -raw-debug-json -raw-verify-chunks");
+            Console.WriteLine();
+            Console.WriteLine("Workshop/UGC raw downloads:");
+            Console.WriteLine("  depotdownloader -app 4000 -workshop 123456789 -raw");
+            Console.WriteLine("  depotdownloader -app 4000 -pubfile 123456789 -raw -raw-debug-json");
+            Console.WriteLine("  depotdownloader -app 4000 -ugc 123456789 -raw");
         }
 
         static void PrintVersion(bool printExtra = false)
