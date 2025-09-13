@@ -10,6 +10,7 @@ using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Text.RegularExpressions;
 using System.Threading.Tasks;
+using System.Globalization;
 using SteamKit2;
 using SteamKit2.CDN;
 
@@ -159,6 +160,15 @@ namespace DepotDownloader
 
             #endregion
 
+            // Raw archive options
+            var rawMode = HasParameter(args, "-raw");
+            var rawDebugJson = HasParameter(args, "-raw-debug-json") || HasParameter(args, "-emit-debug-manifest-json");
+            var rawOutput = GetParameter<string>(args, "-raw-output");
+            var rawRespectFileFilters = HasParameter(args, "-raw-respect-filelist");
+            var rawVerifyChunkSha1 = HasParameter(args, "-raw-verify-chunks") || HasParameter(args, "-raw-verify-sha1");
+            var rawNoSkipExisting = HasParameter(args, "-raw-no-skip-existing");
+            var rawDryRun = HasParameter(args, "-raw-dry-run") || HasParameter(args, "-raw-manifests-only");
+
             var appId = GetParameter(args, "-app", ContentDownloader.INVALID_APP_ID);
             if (appId == ContentDownloader.INVALID_APP_ID)
             {
@@ -168,6 +178,8 @@ namespace DepotDownloader
 
             var pubFile = GetParameter(args, "-pubfile", ContentDownloader.INVALID_MANIFEST_ID);
             var ugcId = GetParameter(args, "-ugc", ContentDownloader.INVALID_MANIFEST_ID);
+            var workshopIds = GetParameterList<ulong>(args, "-workshop");
+
             if (pubFile != ContentDownloader.INVALID_MANIFEST_ID)
             {
                 #region Pubfile Downloading
@@ -178,7 +190,24 @@ namespace DepotDownloader
                 {
                     try
                     {
-                        await ContentDownloader.DownloadPubfileAsync(appId, pubFile).ConfigureAwait(false);
+                        if (rawMode)
+                        {
+                            var rawOptions = new ContentDownloader.RawDownloadOptions
+                            {
+                                Enabled = true,
+                                OutputRoot = rawOutput,
+                                EmitDebugManifestJson = rawDebugJson,
+                                RespectFileFilters = rawRespectFileFilters,
+                                VerifyChunkSha1 = rawVerifyChunkSha1,
+                                SkipExisting = !rawNoSkipExisting,
+                                DryRun = rawDryRun,
+                            };
+                            await ContentDownloader.DownloadPubfileRawAsync(appId, pubFile, rawOptions).ConfigureAwait(false);
+                        }
+                        else
+                        {
+                            await ContentDownloader.DownloadPubfileAsync(appId, pubFile).ConfigureAwait(false);
+                        }
                     }
                     catch (Exception ex) when (
                         ex is ContentDownloaderException
@@ -215,7 +244,24 @@ namespace DepotDownloader
                 {
                     try
                     {
-                        await ContentDownloader.DownloadUGCAsync(appId, ugcId).ConfigureAwait(false);
+                        if (rawMode)
+                        {
+                            var rawOptions = new ContentDownloader.RawDownloadOptions
+                            {
+                                Enabled = true,
+                                OutputRoot = rawOutput,
+                                EmitDebugManifestJson = rawDebugJson,
+                                RespectFileFilters = rawRespectFileFilters,
+                                VerifyChunkSha1 = rawVerifyChunkSha1,
+                                SkipExisting = !rawNoSkipExisting,
+                                DryRun = rawDryRun,
+                            };
+                            await ContentDownloader.DownloadUGCRawAsync(appId, ugcId, rawOptions).ConfigureAwait(false);
+                        }
+                        else
+                        {
+                            await ContentDownloader.DownloadUGCAsync(appId, ugcId).ConfigureAwait(false);
+                        }
                     }
                     catch (Exception ex) when (
                         ex is ContentDownloaderException
@@ -242,12 +288,82 @@ namespace DepotDownloader
 
                 #endregion
             }
+            else if (workshopIds.Count > 0)
+            {
+                #region Workshop Downloading
+
+                PrintUnconsumedArgs(args);
+
+                if (InitializeSteam(username, password))
+                {
+                    int exitStatus = 0;
+                    try
+                    {
+                        var rawOptions = rawMode ? new ContentDownloader.RawDownloadOptions
+                        {
+                            Enabled = true,
+                            OutputRoot = rawOutput,
+                            EmitDebugManifestJson = rawDebugJson,
+                            RespectFileFilters = rawRespectFileFilters,
+                            VerifyChunkSha1 = rawVerifyChunkSha1,
+                            SkipExisting = !rawNoSkipExisting,
+                            DryRun = rawDryRun,
+                        } : null;
+
+                        foreach (var workshopId in workshopIds)
+                        {
+                            try
+                            {
+                                if (rawMode)
+                                {
+                                    await ContentDownloader.DownloadWorkshopItemRawAsync(appId, workshopId, rawOptions).ConfigureAwait(false);
+                                }
+                                else
+                                {
+                                    await ContentDownloader.DownloadWorkshopItemAsync(appId, workshopId).ConfigureAwait(false);
+                                }
+                            }
+                            catch (Exception ex)
+                            {
+                                Console.WriteLine("Error downloading workshop item {0}: {1}", workshopId, ex.Message);
+                                exitStatus++;
+                            }
+                        }
+                    }
+                    catch (Exception ex) when (
+                        ex is ContentDownloaderException
+                        || ex is OperationCanceledException)
+                    {
+                        Console.WriteLine(ex.Message);
+                        return 1;
+                    }
+                    catch (Exception e)
+                    {
+                        Console.WriteLine("Download failed to due to an unhandled exception: {0}", e.Message);
+                        throw;
+                    }
+                    finally
+                    {
+                        ContentDownloader.ShutdownSteam3();
+                    }
+
+                    return exitStatus;
+                }
+                else
+                {
+                    Console.WriteLine("Error: InitializeSteam failed");
+                    return 1;
+                }
+
+                #endregion
+            }
             else
             {
                 #region App downloading
 
                 var branch = GetParameter<string>(args, "-branch") ?? GetParameter<string>(args, "-beta") ?? ContentDownloader.DEFAULT_BRANCH;
                 ContentDownloader.Config.BetaPassword = GetParameter<string>(args, "-branchpassword") ?? GetParameter<string>(args, "-betapassword");
+                var branchExplicit = HasParameter(args, "-branch") || HasParameter(args, "-beta");
 
                 if (!string.IsNullOrEmpty(ContentDownloader.Config.BetaPassword) && string.IsNullOrEmpty(branch))
                 {
@@ -291,20 +407,155 @@ namespace DepotDownloader
 
                 var depotIdList = GetParameterList<uint>(args, "-depot");
                 var manifestIdList = GetParameterList<ulong>(args, "-manifest");
+                var manifestEncList = GetParameterList<string>(args, "-manifest-enc");
+
+                // Support CSV input (new: -manifest-csv-all to take all rows)
+                var manifestCsvPath = GetParameter<string>(args, "-manifest-csv");
+                var manifestCsvAll = HasParameter(args, "-manifest-csv-all");
+                Dictionary<string, List<(uint depotId, ulong manifestId)>> csvAllGroups = null;
+
+                if (!string.IsNullOrWhiteSpace(manifestCsvPath) && manifestIdList.Count == 0 && manifestEncList.Count == 0)
+                {
+                    try
+                    {
+                        var csvRows = ReadManifestCsv(manifestCsvPath)
+                            .Where(r => r.AppID == appId)
+                            .ToList();
+
+                        if (csvRows.Count == 0)
+                        {
+                            Console.WriteLine("Error: No rows for AppID {0} found in -manifest-csv file.", appId);
+                            return 1;
+                        }
+
+                        var depotsToUse = depotIdList.Count > 0 ? depotIdList.Distinct().ToList() : csvRows.Select(r => r.DepotID).Distinct().ToList();
+
+                        if (manifestCsvAll)
+                        {
+                            if (!rawMode)
+                            {
+                                Console.WriteLine("Error: -manifest-csv-all requires -raw to avoid install collisions.");
+                                return 1;
+                            }
+
+                            csvAllGroups = new Dictionary<string, List<(uint depotId, ulong manifestId)>>(StringComparer.OrdinalIgnoreCase);
+
+                            foreach (var depotId in depotsToUse)
+                            {
+                                var depotRows = csvRows.Where(r => r.DepotID == depotId);
+
+                                // Only filter by branch if explicitly specified; otherwise include all branches
+                                if (branchExplicit)
+                                {
+                                    depotRows = depotRows.Where(r => string.Equals(r.Branch, branch, StringComparison.OrdinalIgnoreCase));
+                                }
+
+                                foreach (var row in depotRows.OrderBy(r => r.ReleaseDate))
+                                {
+                                    if (!csvAllGroups.TryGetValue(row.Branch, out var list))
+                                    {
+                                        list = new List<(uint, ulong)>();
+                                        csvAllGroups[row.Branch] = list;
+                                    }
+                                    list.Add((depotId, row.ManifestID));
+                                }
+                            }
+
+                            if (csvAllGroups.Count == 0 || csvAllGroups.All(kv => kv.Value.Count == 0))
+                            {
+                                Console.WriteLine("Error: -manifest-csv-all did not yield any manifest ids to download.");
+                                return 1;
+                            }
+                        }
+                        else
+                        {
+                            // Default behavior: latest per depot, filtered by branch (explicitly specified only)
+                            foreach (var depotId in depotsToUse)
+                            {
+                                var candidates = csvRows.Where(r => r.DepotID == depotId);
+                                if (branchExplicit)
+                                {
+                                    candidates = candidates.Where(r => string.Equals(r.Branch, branch, StringComparison.OrdinalIgnoreCase));
+                                }
+                                var row = candidates.OrderByDescending(r => r.ReleaseDate).FirstOrDefault();
+                                if (row.ManifestID == 0)
+                                {
+                                    Console.WriteLine("Warning: No matching CSV entry found for depot {0}{1}", depotId, branchExplicit ? $" (branch='{branch}')" : "");
+                                    continue;
+                                }
+                                depotManifestIds.Add((depotId, row.ManifestID));
+                            }
+                            if (depotManifestIds.Count == 0)
+                            {
+                                Console.WriteLine("Error: -manifest-csv did not yield any manifest ids to download.");
+                                return 1;
+                            }
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine("Error parsing -manifest-csv: {0}", ex.Message);
+                        return 1;
+                    }
+                }
+
                 if (manifestIdList.Count > 0)
                 {
-                    if (depotIdList.Count != manifestIdList.Count)
+                    if (depotIdList.Count == manifestIdList.Count)
                     {
-                        Console.WriteLine("Error: -manifest requires one id for every -depot specified");
+                        var zippedDepotManifest = depotIdList.Zip(manifestIdList, (depotId, manifestId) => (depotId, manifestId));
+                        depotManifestIds.AddRange(zippedDepotManifest);
+                    }
+                    else if (depotIdList.Count == 1)
+                    {
+                        // Support 1 depot with many manifests
+                        var onlyDepot = depotIdList[0];
+                        foreach (var mid in manifestIdList)
+                        {
+                            depotManifestIds.Add((onlyDepot, mid));
+                        }
+                    }
+                    else
+                    {
+                        Console.WriteLine("Error: -manifest requires either one id for every -depot specified, or a single -depot with multiple -manifest ids.");
+                        return 1;
+                    }
+                }
+                else if (depotManifestIds.Count == 0)
+                {
+                    depotManifestIds.AddRange(depotIdList.Select(depotId => (depotId, ContentDownloader.INVALID_MANIFEST_ID)));
+                }
+
+                // Process encrypted manifest ids if provided; resolve them to decrypted gids using current -branch
+                if (manifestEncList.Count > 0)
+                {
+                    List<(uint depotId, string enc)> encPairs;
+                    if (depotIdList.Count == manifestEncList.Count)
+                    {
+                        encPairs = depotIdList.Zip(manifestEncList, (d, e) => (d, e)).ToList();
+                    }
+                    else if (depotIdList.Count == 1)
+                    {
+                        encPairs = manifestEncList.Select(e => (depotIdList[0], e)).ToList();
+                    }
+                    else
+                    {
+                        Console.WriteLine("Error: -manifest-enc requires either one id for every -depot specified, or a single -depot with multiple -manifest-enc ids.");
                         return 1;
                     }
 
-                    var zippedDepotManifest = depotIdList.Zip(manifestIdList, (depotId, manifestId) => (depotId, manifestId));
-                    depotManifestIds.AddRange(zippedDepotManifest);
-                }
-                else
-                {
-                    depotManifestIds.AddRange(depotIdList.Select(depotId => (depotId, ContentDownloader.INVALID_MANIFEST_ID)));
+                    // Resolve encrypted gids to decrypted manifest ids
+                    var outputRootForKeys = rawMode ? (rawOutput ?? ContentDownloader.Config.InstallDirectory) : ContentDownloader.Config.InstallDirectory;
+                    try
+                    {
+                        var resolved = await ContentDownloader.ResolveEncryptedManifestIdsAsync(appId, encPairs, branch, outputRootForKeys).ConfigureAwait(false);
+                        depotManifestIds.AddRange(resolved);
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine("Error resolving -manifest-enc ids: {0}", ex.Message);
+                        return 1;
+                    }
                 }
 
                 PrintUnconsumedArgs(args);
@@ -313,7 +564,38 @@ namespace DepotDownloader
                 {
                     try
                     {
-                        await ContentDownloader.DownloadAppAsync(appId, depotManifestIds, branch, os, arch, language, lv, isUGC).ConfigureAwait(false);
+                        if (rawMode)
+                        {
+                            var rawOptions = new ContentDownloader.RawDownloadOptions
+                            {
+                                Enabled = true,
+                                OutputRoot = rawOutput,
+                                EmitDebugManifestJson = rawDebugJson,
+                                RespectFileFilters = rawRespectFileFilters,
+                                VerifyChunkSha1 = rawVerifyChunkSha1,
+                                SkipExisting = !rawNoSkipExisting,
+                                DryRun = rawDryRun,
+                            };
+
+                            if (csvAllGroups != null)
+                            {
+                                foreach (var kv in csvAllGroups)
+                                {
+                                    var grpBranch = kv.Key;
+                                    var pairs = kv.Value;
+                                    Console.WriteLine("Downloading {0} manifests for branch '{1}'...", pairs.Count, grpBranch);
+                                    await ContentDownloader.DownloadAppRawAsync(appId, pairs, grpBranch, os, arch, language, lv, rawOptions).ConfigureAwait(false);
+                                }
+                            }
+                            else
+                            {
+                                await ContentDownloader.DownloadAppRawAsync(appId, depotManifestIds, branch, os, arch, language, lv, rawOptions).ConfigureAwait(false);
+                            }
+                        }
+                        else
+                        {
+                            await ContentDownloader.DownloadAppAsync(appId, depotManifestIds, branch, os, arch, language, lv, isUGC).ConfigureAwait(false);
+                        }
                     }
                     catch (Exception ex) when (
                         ex is ContentDownloaderException
@@ -342,6 +624,55 @@ namespace DepotDownloader
             }
 
             return 0;
+        }
+
+        // Parse a simple CSV with header: AppID,DepotID,ManifestID,Branch,Release Date
+        // Values are not quoted and separated by commas
+        private static IEnumerable<(uint AppID, uint DepotID, ulong ManifestID, string Branch, DateTime ReleaseDate)> ReadManifestCsv(string path)
+        {
+            using var reader = new StreamReader(File.OpenRead(path));
+
+            string? line;
+            bool headerSkipped = false;
+            var culture = CultureInfo.InvariantCulture;
+
+            while ((line = reader.ReadLine()) != null)
+            {
+                if (string.IsNullOrWhiteSpace(line))
+                    continue;
+
+                if (!headerSkipped)
+                {
+                    headerSkipped = true;
+                    // If it's not a header line, attempt to parse it anyway
+                    if (line.StartsWith("AppID,DepotID,ManifestID", StringComparison.OrdinalIgnoreCase))
+                        continue;
+                }
+
+                var parts = line.Split(',');
+                if (parts.Length < 5)
+                    continue;
+
+                if (!uint.TryParse(parts[0], NumberStyles.Integer, culture, out var appId))
+                    continue;
+                if (!uint.TryParse(parts[1], NumberStyles.Integer, culture, out var depotId))
+                    continue;
+                if (!ulong.TryParse(parts[2], NumberStyles.Integer, culture, out var manifestId))
+                    continue;
+                var branch = parts[3].Trim();
+
+                // Release Date may have commas in exotic locales, but SteamDB export uses English like "25 June 2025 19:15:08"
+                var dateStr = string.Join(',', parts.Skip(4)).Trim();
+                if (!DateTime.TryParse(dateStr, culture, DateTimeStyles.AssumeLocal, out var release))
+                {
+                    // Try a couple of common formats explicitly
+                    var formats = new[] { "d MMMM yyyy HH:mm:ss", "dd MMMM yyyy HH:mm:ss", "d MMM yyyy HH:mm:ss", "dd MMM yyyy HH:mm:ss" };
+                    if (!DateTime.TryParseExact(dateStr, formats, culture, DateTimeStyles.AssumeLocal, out release))
+                        continue;
+                }
+
+                yield return (appId, depotId, manifestId, branch, release);
+            }
         }
 
         static bool InitializeSteam(string username, string password)
@@ -494,13 +825,22 @@ namespace DepotDownloader
             Console.WriteLine("       depotdownloader -app <id> -pubfile <id> [-username <username> [-password <password>]]");
             Console.WriteLine("Usage: downloading a workshop item using ugc id");
             Console.WriteLine("       depotdownloader -app <id> -ugc <id> [-username <username> [-password <password>]]");
+            Console.WriteLine("Usage: downloading workshop items by IDs");
+            Console.WriteLine("       depotdownloader -app <id> -workshop <id1> <id2> ... [-username <username> [-password <password>]]");
             Console.WriteLine();
             Console.WriteLine("Parameters:");
             Console.WriteLine("  -app <#>                 - the AppID to download.");
             Console.WriteLine("  -depot <#>               - the DepotID to download.");
             Console.WriteLine("  -manifest <id>           - manifest id of content to download (requires -depot, default: current for branch).");
+            Console.WriteLine("                             Pairing rules: if multiple -depot and -manifest are provided, they are paired by position.");
+            Console.WriteLine("                             Alternatively, you may specify a single -depot with many -manifest ids to fetch multiple manifests from that depot.");
+            Console.WriteLine("  -manifest-enc <hex>      - UNTESTED!!! encrypted manifest id (hex). Decrypted using the branch key and appended to the manifest list.");
+            Console.WriteLine("                             Pair like -manifest (1:1 with -depot or 1 depot with many -manifest-enc). Requires -branch and either a saved branch key or -branchpassword.");
             Console.WriteLine($"  -branch <branchname>    - download from specified branch if available (default: {ContentDownloader.DEFAULT_BRANCH}).");
             Console.WriteLine("  -branchpassword <pass>   - branch password if applicable.");
+            Console.WriteLine("  -manifest-csv <file>     - load manifest ids from a CSV with columns: AppID,DepotID,ManifestID,Branch,Release Date.");
+            Console.WriteLine("                             When used (and -manifest/-manifest-enc omitted), picks the latest manifest per specified -depot.");
+            Console.WriteLine("  -manifest-csv-all        - with -manifest-csv, select ALL rows per depot (optionally filter with -branch). Requires -raw.");
             Console.WriteLine("  -all-platforms           - downloads all platform-specific depots when -app is used.");
             Console.WriteLine("  -all-archs               - download all architecture-specific depots when -app is used.");
             Console.WriteLine("  -os <os>                 - the operating system for which to download the game (windows, macos or linux, default: OS the program is currently running on)");
@@ -511,6 +851,7 @@ namespace DepotDownloader
             Console.WriteLine();
             Console.WriteLine("  -ugc <#>                 - the UGC ID to download.");
             Console.WriteLine("  -pubfile <#>             - the PublishedFileId to download. (Will automatically resolve to UGC id)");
+            Console.WriteLine("  -workshop <#> [<#> ...]  - one or more Workshop item IDs to download. Automatically detects pubfile vs UGC format.");
             Console.WriteLine();
             Console.WriteLine("  -username <user>         - the username of the account to login to for restricted content.");
             Console.WriteLine("  -password <pass>         - the password of the account to login to for restricted content.");
@@ -529,6 +870,15 @@ namespace DepotDownloader
             Console.WriteLine("  -max-downloads <#>       - maximum number of chunks to download concurrently. (default: 8).");
             Console.WriteLine("  -loginid <#>             - a unique 32-bit integer Steam LogonID in decimal, required if running multiple instances of DepotDownloader concurrently.");
             Console.WriteLine("  -use-lancache            - forces downloads over the local network via a Lancache instance.");
+            Console.WriteLine();
+            Console.WriteLine("Raw archive options (download raw manifests/chunks without installing files):");
+            Console.WriteLine("  -raw                     - enable raw archive mode (save raw manifest zip, and chunks per depot).");
+            Console.WriteLine("  -raw-output <dir>        - output root for raw archive (default: -dir or depots).");
+            Console.WriteLine("  -raw-debug-json          - write a debug JSON for each manifest (<manifestId>.<version>.json).");
+            Console.WriteLine("  -raw-respect-filelist    - only include files that match -filelist (or regex entries).");
+            Console.WriteLine("  -raw-verify-chunks       - verify saved chunk content SHA1 matches chunk id.");
+            Console.WriteLine("  -raw-no-skip-existing    - overwrite existing chunks instead of skipping by size.");
+            Console.WriteLine("  -raw-dry-run             - only save manifests and optional debug JSON; do not download chunks.");
             Console.WriteLine();
             Console.WriteLine("  -debug                   - enable verbose debug logging.");
             Console.WriteLine("  -V or --version          - print version and runtime.");
