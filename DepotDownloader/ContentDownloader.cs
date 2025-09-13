@@ -1607,82 +1607,93 @@ namespace DepotDownloader
                 }
             }
 
-            // Discover depots similar to normal flow
-            var hasSpecificDepots = depotManifestIds.Count > 0;
-            var depotIdsFound = new List<uint>();
-            var depotIdsExpected = depotManifestIds.Select(x => x.depotId).ToList();
-            var depotsSection = GetSteam3AppSection(appId, EAppInfoSection.Depots);
+            // Skip depot validation for raw mode when we have explicit manifest IDs
+            // This allows CSV-based downloads of historical/unlisted depots
+            var hasExplicitManifests = depotManifestIds.Count > 0 && depotManifestIds.All(x => x.manifestId != INVALID_MANIFEST_ID);
 
-            Console.WriteLine("Using app branch: '{0}'.", branch);
-
-            if (depotsSection != null)
+            if (!hasExplicitManifests)
             {
-                foreach (var depotSection in depotsSection.Children)
+                // Discover depots similar to normal flow
+                var hasSpecificDepots = depotManifestIds.Count > 0;
+                var depotIdsFound = new List<uint>();
+                var depotIdsExpected = depotManifestIds.Select(x => x.depotId).ToList();
+                var depotsSection = GetSteam3AppSection(appId, EAppInfoSection.Depots);
+
+                Console.WriteLine("Using app branch: '{0}'.", branch);
+
+                if (depotsSection != null)
                 {
-                    if (depotSection.Children.Count == 0)
-                        continue;
-
-                    if (!uint.TryParse(depotSection.Name, out var id))
-                        continue;
-
-                    if (hasSpecificDepots && !depotIdsExpected.Contains(id))
-                        continue;
-
-                    if (!hasSpecificDepots)
+                    foreach (var depotSection in depotsSection.Children)
                     {
-                        var depotConfig = depotSection["config"];
-                        if (depotConfig != KeyValue.Invalid)
+                        if (depotSection.Children.Count == 0)
+                            continue;
+
+                        if (!uint.TryParse(depotSection.Name, out var id))
+                            continue;
+
+                        if (hasSpecificDepots && !depotIdsExpected.Contains(id))
+                            continue;
+
+                        if (!hasSpecificDepots)
                         {
-                            if (!Config.DownloadAllPlatforms &&
-                                depotConfig["oslist"] != KeyValue.Invalid &&
-                                !string.IsNullOrWhiteSpace(depotConfig["oslist"].Value))
+                            var depotConfig = depotSection["config"];
+                            if (depotConfig != KeyValue.Invalid)
                             {
-                                var oslist = depotConfig["oslist"].Value.Split(',');
-                                if (Array.IndexOf(oslist, os ?? Util.GetSteamOS()) == -1)
+                                if (!Config.DownloadAllPlatforms &&
+                                    depotConfig["oslist"] != KeyValue.Invalid &&
+                                    !string.IsNullOrWhiteSpace(depotConfig["oslist"].Value))
+                                {
+                                    var oslist = depotConfig["oslist"].Value.Split(',');
+                                    if (Array.IndexOf(oslist, os ?? Util.GetSteamOS()) == -1)
+                                        continue;
+                                }
+
+                                if (!Config.DownloadAllArchs &&
+                                    depotConfig["osarch"] != KeyValue.Invalid &&
+                                    !string.IsNullOrWhiteSpace(depotConfig["osarch"].Value))
+                                {
+                                    var depotArch = depotConfig["osarch"].Value;
+                                    if (depotArch != (arch ?? Util.GetSteamArch()))
+                                        continue;
+                                }
+
+                                if (!Config.DownloadAllLanguages &&
+                                    depotConfig["language"] != KeyValue.Invalid &&
+                                    !string.IsNullOrWhiteSpace(depotConfig["language"].Value))
+                                {
+                                    var depotLang = depotConfig["language"].Value;
+                                    if (depotLang != (language ?? "english"))
+                                        continue;
+                                }
+
+                                if (!lv &&
+                                    depotConfig["lowviolence"] != KeyValue.Invalid &&
+                                    depotConfig["lowviolence"].AsBoolean())
                                     continue;
                             }
-
-                            if (!Config.DownloadAllArchs &&
-                                depotConfig["osarch"] != KeyValue.Invalid &&
-                                !string.IsNullOrWhiteSpace(depotConfig["osarch"].Value))
-                            {
-                                var depotArch = depotConfig["osarch"].Value;
-                                if (depotArch != (arch ?? Util.GetSteamArch()))
-                                    continue;
-                            }
-
-                            if (!Config.DownloadAllLanguages &&
-                                depotConfig["language"] != KeyValue.Invalid &&
-                                !string.IsNullOrWhiteSpace(depotConfig["language"].Value))
-                            {
-                                var depotLang = depotConfig["language"].Value;
-                                if (depotLang != (language ?? "english"))
-                                    continue;
-                            }
-
-                            if (!lv &&
-                                depotConfig["lowviolence"] != KeyValue.Invalid &&
-                                depotConfig["lowviolence"].AsBoolean())
-                                continue;
                         }
+
+                        depotIdsFound.Add(id);
+
+                        if (!hasSpecificDepots)
+                            depotManifestIds.Add((id, INVALID_MANIFEST_ID));
                     }
+                }
 
-                    depotIdsFound.Add(id);
+                if (depotManifestIds.Count == 0 && !hasSpecificDepots)
+                {
+                    throw new ContentDownloaderException(string.Format("Couldn't find any depots to download for app {0}", appId));
+                }
 
-                    if (!hasSpecificDepots)
-                        depotManifestIds.Add((id, INVALID_MANIFEST_ID));
+                if (depotIdsFound.Count < depotIdsExpected.Count)
+                {
+                    var remainingDepotIds = depotIdsExpected.Except(depotIdsFound);
+                    throw new ContentDownloaderException(string.Format("Depot {0} not listed for app {1}", string.Join(", ", remainingDepotIds), appId));
                 }
             }
-
-            if (depotManifestIds.Count == 0 && !hasSpecificDepots)
+            else
             {
-                throw new ContentDownloaderException(string.Format("Couldn't find any depots to download for app {0}", appId));
-            }
-
-            if (depotIdsFound.Count < depotIdsExpected.Count)
-            {
-                var remainingDepotIds = depotIdsExpected.Except(depotIdsFound);
-                throw new ContentDownloaderException(string.Format("Depot {0} not listed for app {1}", string.Join(", ", remainingDepotIds), appId));
+                Console.WriteLine("Using app branch: '{0}' (skipping depot validation for explicit manifests).", branch);
             }
 
             var infos = new List<DepotDownloadInfo>();
