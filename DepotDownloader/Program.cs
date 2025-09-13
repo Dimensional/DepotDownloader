@@ -632,7 +632,7 @@ namespace DepotDownloader
         {
             using var reader = new StreamReader(File.OpenRead(path));
 
-            string? line;
+            string line;
             bool headerSkipped = false;
             var culture = CultureInfo.InvariantCulture;
 
