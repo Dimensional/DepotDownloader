@@ -61,6 +61,14 @@ jobs:
         if: matrix.configuration == 'Release' && matrix.runs-on == 'ubuntu-latest'
         run: dotnet publish DepotDownloader/DepotDownloader.csproj --configuration Release -p:PublishSingleFile=true -p:DebugType=embedded --self-contained --runtime linux-arm64 --output selfcontained-linux-arm64
 
+      - name: Publish NixOS-x64
+        if: matrix.configuration == 'Release' && matrix.runs-on == 'ubuntu-latest'
+        run: dotnet publish DepotDownloader/DepotDownloader.csproj --configuration Release -p:PublishSingleFile=true -p:DebugType=embedded -p:PublishReadyToRun=false --self-contained --runtime linux-x64 --output selfcontained-nixos-x64
+
+      - name: Publish NixOS-arm64
+        if: matrix.configuration == 'Release' && matrix.runs-on == 'ubuntu-latest'
+        run: dotnet publish DepotDownloader/DepotDownloader.csproj --configuration Release -p:PublishSingleFile=true -p:DebugType=embedded -p:PublishReadyToRun=false --self-contained --runtime linux-arm64 --output selfcontained-nixos-arm64
+
       - name: Publish macOS-x64
         if: matrix.configuration == 'Release' && matrix.runs-on == 'macos-latest'
         run: dotnet publish DepotDownloader/DepotDownloader.csproj --configuration Release -p:PublishSingleFile=true -p:DebugType=embedded --self-contained --runtime osx-x64 --output selfcontained-osx-x64
@@ -109,6 +117,22 @@ jobs:
           path: selfcontained-linux-arm64
           if-no-files-found: error
 
+      - name: Upload NixOS-x64
+        uses: actions/upload-artifact@v4
+        if: matrix.configuration == 'Release' && matrix.runs-on == 'ubuntu-latest'
+        with:
+          name: DepotDownloader-nixos-x64
+          path: selfcontained-nixos-x64
+          if-no-files-found: error
+
+      - name: Upload NixOS-arm64
+        uses: actions/upload-artifact@v4
+        if: matrix.configuration == 'Release' && matrix.runs-on == 'ubuntu-latest'
+        with:
+          name: DepotDownloader-nixos-arm64
+          path: selfcontained-nixos-arm64
+          if-no-files-found: error
+
       - name: Upload macOS-x64
         uses: actions/upload-artifact@v4
         if: matrix.configuration == 'Release' && matrix.runs-on == 'macos-latest'
@@ -146,6 +170,8 @@ jobs:
         chmod +x artifacts/DepotDownloader-linux-x64/DepotDownloader
         chmod +x artifacts/DepotDownloader-linux-arm/DepotDownloader
         chmod +x artifacts/DepotDownloader-linux-arm64/DepotDownloader
+        chmod +x artifacts/DepotDownloader-nixos-x64/DepotDownloader
+        chmod +x artifacts/DepotDownloader-nixos-arm64/DepotDownloader
         chmod +x artifacts/DepotDownloader-macos-x64/DepotDownloader
         chmod +x artifacts/DepotDownloader-macos-arm64/DepotDownloader
         zip -9j release/DepotDownloader-framework.zip artifacts/DepotDownloader-framework/*
@@ -154,6 +180,8 @@ jobs:
         zip -9j release/DepotDownloader-linux-x64.zip artifacts/DepotDownloader-linux-x64/*
         zip -9j release/DepotDownloader-linux-arm.zip artifacts/DepotDownloader-linux-arm/*
         zip -9j release/DepotDownloader-linux-arm64.zip artifacts/DepotDownloader-linux-arm64/*
+        zip -9j release/DepotDownloader-nixos-x64.zip artifacts/DepotDownloader-nixos-x64/*
+        zip -9j release/DepotDownloader-nixos-arm64.zip artifacts/DepotDownloader-nixos-arm64/*
         zip -9j release/DepotDownloader-macos-x64.zip artifacts/DepotDownloader-macos-x64/*
         zip -9j release/DepotDownloader-macos-arm64.zip artifacts/DepotDownloader-macos-arm64/*
 
