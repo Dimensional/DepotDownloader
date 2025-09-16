@@ -546,12 +546,7 @@ namespace DepotDownloader
             File.Move(fileStagingPath, fileFinalPath);
         }
 
-        public static async Task DownloadAppAsync(uint appId, List<(uint depotId, ulong manifestId)> depotManifestIds, string branch, string os, string arch, string language, bool lv, bool isUgc)
-        {
-            await DownloadAppAsync(appId, depotManifestIds, branch, os, arch, language, lv, isUgc, null, null);
-        }
-
-        public static async Task DownloadAppAsync(uint appId, List<(uint depotId, ulong manifestId)> depotManifestIds, string branch, string os, string arch, string language, bool lv, bool isUgc, string workshopId, string workshopName)
+        public static async Task DownloadAppAsync(uint appId, List<(uint depotId, ulong manifestId)> depotManifestIds, string branch, string os, string arch, string language, bool lv, bool isUgc, string workshopId = null, string workshopName = null)
         {
             cdnPool = new CDNClientPool(steam3, appId);
 
@@ -1391,7 +1386,7 @@ namespace DepotDownloader
                     }
                     catch (SteamKitWebRequestException e)
                     {
-                        // If the CDN returned 403, attempt to get a cdn auth if we didn't yet,
+                        // If the CDN returned 403, attempt to get a cdn auth if we didn't yet
                         if (e.StatusCode == HttpStatusCode.Forbidden &&
                             (!steam3.CDNAuthTokens.TryGetValue((depot.DepotId, connection.Host), out var authTokenCallbackPromise) || !authTokenCallbackPromise.Task.IsCompleted))
                         {
@@ -1559,22 +1554,9 @@ namespace DepotDownloader
             string arch,
             string language,
             bool lv,
-            RawDownloadOptions options)
-        {
-            await DownloadAppRawAsync(appId, depotManifestIds, branch, os, arch, language, lv, options, null, null);
-        }
-
-        public static async Task DownloadAppRawAsync(
-            uint appId,
-            List<(uint depotId, ulong manifestId)> depotManifestIds,
-            string branch,
-            string os,
-            string arch,
-            string language,
-            bool lv,
             RawDownloadOptions options,
-            string workshopId,
-            string workshopName)
+            string workshopId = null,
+            string workshopName = null)
         {
             if (options == null || !options.Enabled)
             {
@@ -1720,8 +1702,9 @@ namespace DepotDownloader
         {
             Console.WriteLine("Archiving raw CDN content for depot {0}", depot.DepotId);
 
-            // Folder structure: <outputRoot>/depot/<depotId>/
-            var depotRoot = Path.Combine(outputRoot, "depot", depot.DepotId.ToString());
+            // For raw mode, use a cleaner directory structure: depot/{depotId}/
+            // Instead of the standard depots/depot/{depotId}/ structure used by normal downloads
+            var depotRoot = Path.Combine("depot", depot.DepotId.ToString());
             var manifestsDir = Path.Combine(depotRoot, "manifests");
             var chunksDir = Path.Combine(depotRoot, "chunks");
             var debugDir = Path.Combine(depotRoot, "debug");
@@ -2324,12 +2307,8 @@ namespace DepotDownloader
                 if (steam3.AppBetaPasswords.ContainsKey(branch))
                     return;
 
-                // Branch key file lives at raw depot root if raw mode is used, otherwise prefer -dir (if provided)
-                var root = string.IsNullOrWhiteSpace(outputRootForKeys)
-                    ? (string.IsNullOrWhiteSpace(Config.InstallDirectory) ? DEFAULT_DOWNLOAD_DIR : Config.InstallDirectory)
-                    : outputRootForKeys;
-
-                var depotRoot = Path.Combine(root, "depot", depotId.ToString());
+                // Branch key file lives at raw depot root: depot/{depotId}/
+                var depotRoot = Path.Combine("depot", depotId.ToString());
                 var branchKeyName = $"{Sanitize(branch)}_Password.branchkey";
                 var branchKeyPath = Path.Combine(depotRoot, branchKeyName);
                 if (File.Exists(branchKeyPath))
