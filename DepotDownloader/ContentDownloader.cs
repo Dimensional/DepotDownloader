@@ -1781,11 +1781,21 @@ namespace DepotDownloader
             var manifestV4Path = Path.Combine(manifestsDir, $"{manifestFileName}.manif4");
             if (File.Exists(manifestV5Path) || File.Exists(manifestV4Path))
             {
+                if (options.DryRun)
+                {
+                    Console.WriteLine("Dry run: existing manifest for depot found: {0}", depot.ManifestId);
+                }
+                else
+                {
+                    Console.WriteLine("Reusing existing manifest for depot {0}", depot.DepotId);
+                }
                 var existingPath = File.Exists(manifestV5Path) ? manifestV5Path : manifestV4Path;
                 raw = await LoadRawManifestFromDiskAsync(existingPath, depot, cts.Token);
             }
             else
             {
+                // Add delay in downloading the manifests to avoid hammering the CDN
+                await Task.Delay(2000, cts.Token);
                 raw = await DownloadRawManifestZipAndDetectAsync(cts, depot);
                 var finalManifestPath = Path.Combine(manifestsDir, $"{manifestFileName}.manif{raw.Version}");
                 await File.WriteAllBytesAsync(finalManifestPath, raw.ZipBytes, cts.Token);
@@ -1794,10 +1804,10 @@ namespace DepotDownloader
             // Optional: emit debug json for the manifest
             if (options.EmitDebugManifestJson)
             {
-                var debugModel = BuildManifestDebugModel(depot.DepotId, raw.ParsedManifest, raw.Version, raw.EncryptedNames);
                 var debugJsonPath = Path.Combine(debugDir, $"{manifestFileName}.{raw.Version}.json");
                 if (!File.Exists(debugJsonPath))
                 {
+                    var debugModel = BuildManifestDebugModel(depot.DepotId, raw.ParsedManifest, raw.Version, raw.EncryptedNames);
                     await File.WriteAllTextAsync(debugJsonPath, System.Text.Json.JsonSerializer.Serialize(debugModel, new System.Text.Json.JsonSerializerOptions { WriteIndented = true }), cts.Token);
                 }
             }
