@@ -146,7 +146,7 @@ jobs:
           nix-channel --update
           
           # Install .NET SDK and required tools
-          nix-env -iA nixpkgs.dotnet-sdk_8 nixpkgs.icu nixpkgs.openssl
+          nix-env -iA nixpkgs.dotnet-sdk_8 nixpkgs.icu nixpkgs.openssl nixpkgs.glibc nixpkgs.stdenv.cc.cc.lib
 
       - name: Build NixOS x64
         run: |
@@ -163,6 +163,16 @@ jobs:
             --self-contained \
             --runtime linux-x64 \
             --output nixos-x64
+
+      - name: List output after build
+        run: ls -l nixos-x64
+
+      - name: Check for build output
+        run: |
+          if [ ! -f nixos-x64/DepotDownloader ]; then
+            echo "DepotDownloader build failed, output file missing."
+            exit 1
+          fi
 
       - name: Create NixOS package structure
         run: |
