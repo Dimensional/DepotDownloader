@@ -125,152 +125,9 @@ jobs:
           path: selfcontained-osx-arm64
           if-no-files-found: error
 
-  build-nixos:
-    name: Build for NixOS
-    runs-on: ubuntu-latest
-    container:
-      image: nixos/nix:latest
-    strategy:
-      matrix:
-        configuration: [Release]
-    steps:
-      - uses: actions/checkout@v5
-
-      - name: Setup Nix environment
-        run: |
-          # Enable flakes and nix-command
-          echo "experimental-features = nix-command flakes" >> /etc/nix/nix.conf
-          
-          # Update channel and install required packages
-          nix-channel --add https://nixos.org/channels/nixos-unstable nixpkgs
-          nix-channel --update
-          
-          # Install .NET SDK and required tools
-          nix-env -iA nixpkgs.dotnet-sdk_8 nixpkgs.icu nixpkgs.openssl nixpkgs.glibc nixpkgs.stdenv.cc.cc.lib
-
-      - name: Build NixOS x64
-        run: |
-          export DOTNET_ROOT=$(nix-build '<nixpkgs>' -A dotnet-sdk_8)/
-          export PATH="$DOTNET_ROOT:$PATH"
-          export DOTNET_CLI_TELEMETRY_OPTOUT=1
-          
-          # Build for linux-x64 in NixOS environment
-          dotnet publish DepotDownloader/DepotDownloader.csproj \
-            --configuration ${{ matrix.configuration }} \
-            -p:PublishSingleFile=true \
-            -p:DebugType=embedded \
-            -p:PublishReadyToRun=false \
-            --self-contained \
-            --runtime linux-x64 \
-            --output nixos-x64
-
-      - name: List output after build
-        run: ls -l nixos-x64
-
-      - name: Check for build output
-        run: |
-          if [ ! -f nixos-x64/DepotDownloader ]; then
-            echo "DepotDownloader build failed, output file missing."
-            exit 1
-          fi
-
-      - name: Create NixOS package structure
-        run: |
-          # Create a proper NixOS-compatible directory structure
-          mkdir -p nixos-release/nixos-x64
-          cp nixos-x64/DepotDownloader nixos-release/nixos-x64/
-          chmod +x nixos-release/nixos-x64/DepotDownloader
-          
-          # Create a shell wrapper that uses nix-shell for compatibility
-          cat > nixos-release/nixos-x64/depot-downloader-nix << 'EOF'
-          #!/usr/bin/env bash
-          # NixOS wrapper for DepotDownloader
-          # This ensures the binary runs with proper NixOS environment
-          
-          SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-          
-          # Try different methods to run the binary
-          if command -v nix-shell >/dev/null 2>&1; then
-              # Method 1: Use nix-shell with required dependencies
-              exec nix-shell -p glibc stdenv.cc.cc.lib icu openssl --run "$SCRIPT_DIR/DepotDownloader \"\$@\""
-          elif [ -f "/run/current-system/sw/bin/nix-shell" ]; then
-              # Method 2: System nix-shell
-              exec /run/current-system/sw/bin/nix-shell -p glibc stdenv.cc.cc.lib icu openssl --run "$SCRIPT_DIR/DepotDownloader \"\$@\""
-          else
-              # Method 3: Direct execution (might work if system is configured properly)
-              exec "$SCRIPT_DIR/DepotDownloader" "$@"
-          fi
-          EOF
-          
-          chmod +x nixos-release/nixos-x64/depot-downloader-nix
-          
-          # Create README with NixOS-specific instructions
-          cat > nixos-release/nixos-x64/README-NixOS.md << 'EOF'
-          # DepotDownloader for NixOS
-          
-          This build was compiled natively on NixOS and should work better with NixOS systems.
-          
-          ## Usage:
-          
-          ### Method 1: Using the Nix wrapper (Recommended)
-          ```bash
-          ./depot-downloader-nix [arguments]
-          ```
-          
-          ### Method 2: Direct execution (if your system is properly configured)
-          ```bash
-          ./DepotDownloader [arguments]
-          ```
-          
-          ### Method 3: Using nix-shell manually
-          ```bash
-          nix-shell -p glibc stdenv.cc.cc.lib icu openssl --run './DepotDownloader [arguments]'
-          ```
-          
-          ### Method 4: Using steam-run (if available)
-          ```bash
-          steam-run ./DepotDownloader [arguments]
-          ```
-          
-          ## Installation in NixOS
-          
-          You can also create a proper Nix derivation for this. Add this to your configuration:
-          
-          ```nix
-          environment.systemPackages = with pkgs; [
-            (stdenv.mkDerivation {
-              name = "depotdownloader";
-              src = ./.;
-              buildInputs = [ glibc stdenv.cc.cc.lib icu openssl ];
-              installPhase = ''
-                mkdir -p $out/bin
-                cp DepotDownloader $out/bin/
-                chmod +x $out/bin/DepotDownloader
-              '';
-            })
-          ];
-          ```
-          
-          ## Troubleshooting
-          
-          If you encounter issues:
-          1. Make sure you have the Nix package manager installed
-          2. Try the nix-shell method which provides all required dependencies
-          3. Check that your NixOS system has the necessary channels updated
-          
-          For more help, see: https://nix.dev/
-          EOF
-
-      - name: Upload NixOS x64
-        uses: actions/upload-artifact@v4
-        with:
-          name: DepotDownloader-nixos-x64
-          path: nixos-release/nixos-x64
-          if-no-files-found: error
-
   release:
     if: startsWith(github.ref, 'refs/tags/')
-    needs: [build, build-nixos]
+    needs: [build]
     runs-on: ubuntu-latest
     steps:
     - name: Download artifacts
@@ -289,8 +146,6 @@ jobs:
         chmod +x artifacts/DepotDownloader-linux-x64/DepotDownloader
         chmod +x artifacts/DepotDownloader-linux-arm/DepotDownloader
         chmod +x artifacts/DepotDownloader-linux-arm64/DepotDownloader
-        chmod +x artifacts/DepotDownloader-nixos-x64/DepotDownloader
-        chmod +x artifacts/DepotDownloader-nixos-x64/depot-downloader-nix
         chmod +x artifacts/DepotDownloader-macos-x64/DepotDownloader
         chmod +x artifacts/DepotDownloader-macos-arm64/DepotDownloader
         zip -9j release/DepotDownloader-framework.zip artifacts/DepotDownloader-framework/*
@@ -299,7 +154,6 @@ jobs:
         zip -9j release/DepotDownloader-linux-x64.zip artifacts/DepotDownloader-linux-x64/*
         zip -9j release/DepotDownloader-linux-arm.zip artifacts/DepotDownloader-linux-arm/*
         zip -9j release/DepotDownloader-linux-arm64.zip artifacts/DepotDownloader-linux-arm64/*
-        zip -9r release/DepotDownloader-nixos-x64.zip artifacts/DepotDownloader-nixos-x64/*
         zip -9j release/DepotDownloader-macos-x64.zip artifacts/DepotDownloader-macos-x64/*
         zip -9j release/DepotDownloader-macos-arm64.zip artifacts/DepotDownloader-macos-arm64/*
 
