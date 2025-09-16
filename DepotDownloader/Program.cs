@@ -986,7 +986,7 @@ namespace DepotDownloader
                             depotRows = depotRows.Where(r => string.Equals(r.Branch, branch, StringComparison.OrdinalIgnoreCase));
                         }
 
-                        foreach (var row in depotRows.OrderBy(r => r.ReleaseDate))
+                        foreach (var row in depotRows.OrderByDescending(r => r.ReleaseDate))
                         {
                             if (!csvAllGroups.TryGetValue(row.Branch, out var list))
                             {

@@ -1694,6 +1694,8 @@ namespace DepotDownloader
 
             foreach (var depot in infos)
             {
+                // Keep session alive between depot downloads
+                //await KeepSessionAlive(depot.AppId);
                 await ArchiveDepotRawAsync(cts, depot, outputRoot, options, workshopId, workshopName);
             }
         }
@@ -1781,6 +1783,9 @@ namespace DepotDownloader
             var manifestV4Path = Path.Combine(manifestsDir, $"{manifestFileName}.manif4");
             if (File.Exists(manifestV5Path) || File.Exists(manifestV4Path))
             {
+                // Keep session alive while processing existing files
+                //await KeepSessionAlive(depot.AppId);
+
                 if (options.DryRun)
                 {
                     Console.WriteLine("Dry run: existing manifest for depot found: {0}", depot.ManifestId);
@@ -1794,8 +1799,11 @@ namespace DepotDownloader
             }
             else
             {
+                // Keep session alive before downloading new manifest
+                //await KeepSessionAlive(depot.AppId);
+
                 // Add delay in downloading the manifests to avoid hammering the CDN
-                await Task.Delay(2000, cts.Token);
+                await Task.Delay(500, cts.Token);
                 raw = await DownloadRawManifestZipAndDetectAsync(cts, depot);
                 var finalManifestPath = Path.Combine(manifestsDir, $"{manifestFileName}.manif{raw.Version}");
                 await File.WriteAllBytesAsync(finalManifestPath, raw.ZipBytes, cts.Token);
@@ -2479,6 +2487,32 @@ namespace DepotDownloader
 
             // Try UGC if published file failed
             await DownloadUGCRawAsync(appId, workshopId, options);
+        }
+
+        // Add simple session keepalive for long operations
+        private static DateTime lastSessionActivity = DateTime.Now;
+
+        // Call this periodically during long operations to keep session alive
+        private static async Task KeepSessionAlive(uint? appId = null)
+        {
+            // Only check every 60 seconds to avoid spam
+            if (DateTime.Now - lastSessionActivity < TimeSpan.FromSeconds(60))
+                return;
+
+            if (steam3?.IsLoggedOn == true)
+            {
+                // Simple keepalive - request app info for a known app to keep session active
+                try
+                {
+                    var targetAppId = appId ?? 753;
+                    await steam3.RequestAppInfo(targetAppId, true);
+                    lastSessionActivity = DateTime.Now;
+                }
+                catch
+                {
+                    // Ignore errors, just don't update lastSessionActivity
+                }
+            }
         }
     }
 }
