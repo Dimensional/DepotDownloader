@@ -63,11 +63,127 @@ jobs:
 
       - name: Publish NixOS-x64
         if: matrix.configuration == 'Release' && matrix.runs-on == 'ubuntu-latest'
-        run: dotnet publish DepotDownloader/DepotDownloader.csproj --configuration Release -p:PublishSingleFile=true -p:DebugType=embedded -p:PublishReadyToRun=false --self-contained --runtime linux-x64 --output selfcontained-nixos-x64
+        run: |
+          # Build the standard Linux binary first
+          dotnet publish DepotDownloader/DepotDownloader.csproj --configuration Release -p:PublishSingleFile=true -p:DebugType=embedded -p:PublishReadyToRun=false --self-contained --runtime linux-x64 --output selfcontained-nixos-x64-temp
+          
+          # Install patchelf for ELF patching
+          sudo apt-get update && sudo apt-get install -y patchelf
+          
+          # Copy the binary to final directory
+          mkdir -p selfcontained-nixos-x64
+          cp selfcontained-nixos-x64-temp/DepotDownloader selfcontained-nixos-x64/
+          
+          # Patch the ELF binary for NixOS compatibility
+          # Set the interpreter to a common NixOS path and add typical NixOS library paths
+          patchelf --set-interpreter /run/current-system/sw/lib/ld-linux-x86-64.so.2 selfcontained-nixos-x64/DepotDownloader || true
+          patchelf --set-rpath '/run/current-system/sw/lib:/nix/store/*/lib' selfcontained-nixos-x64/DepotDownloader || true
+          
+          # Create a NixOS-compatible wrapper script
+          cat > selfcontained-nixos-x64/DepotDownloader-nixos << 'EOF'
+          #!/usr/bin/env bash
+          # NixOS compatibility wrapper for DepotDownloader
+          
+          # Try to find the NixOS dynamic linker
+          if [ -f "/run/current-system/sw/lib/ld-linux-x86-64.so.2" ]; then
+              INTERP="/run/current-system/sw/lib/ld-linux-x86-64.so.2"
+          elif [ -f "/lib64/ld-linux-x86-64.so.2" ]; then
+              INTERP="/lib64/ld-linux-x86-64.so.2"
+          else
+              # Fallback: try to use patchelf if available
+              if command -v patchelf >/dev/null 2>&1; then
+                  echo "Attempting to patch DepotDownloader for NixOS compatibility..."
+                  patchelf --set-interpreter "$(cat /proc/sys/kernel/osrelease | grep -q nixos && echo '/run/current-system/sw/lib/ld-linux-x86-64.so.2' || echo '/lib64/ld-linux-x86-64.so.2')" "$0/../DepotDownloader" 2>/dev/null || true
+              fi
+              # Try direct execution
+              exec "$(dirname "$0")/DepotDownloader" "$@"
+          fi
+          
+          # Execute with explicit interpreter
+          exec "$INTERP" "$(dirname "$0")/DepotDownloader" "$@"
+          EOF
+          
+          chmod +x selfcontained-nixos-x64/DepotDownloader-nixos
+          
+          # Create README for NixOS users
+          cat > selfcontained-nixos-x64/README-NixOS.md << 'EOF'
+          # DepotDownloader for NixOS
+          
+          This build has been specifically prepared for NixOS compatibility.
+          
+          ## Usage Options:
+          
+          1. **Use the wrapper script (Recommended):**
+             ```bash
+             ./DepotDownloader-nixos [arguments]
+             ```
+          
+          2. **Use with nix-shell:**
+             ```bash
+             nix-shell -p glibc --run './DepotDownloader [arguments]'
+             ```
+          
+          3. **Use with steam-run (if you have Steam installed):**
+             ```bash
+             steam-run ./DepotDownloader [arguments]
+             ```
+          
+          4. **Install in a NixOS environment:**
+             Add to your NixOS configuration or use nix-env:
+             ```bash
+             nix-shell -p glibc stdenv.cc.cc.lib --run './DepotDownloader [arguments]'
+             ```
+          
+          ## Troubleshooting:
+          
+          If you still get dynamic linking errors, try:
+          ```bash
+          patchelf --set-interpreter $(nix-build '<nixpkgs>' -A glibc)/lib/ld-linux-x86-64.so.2 ./DepotDownloader
+          ```
+          EOF
 
       - name: Publish NixOS-arm64
         if: matrix.configuration == 'Release' && matrix.runs-on == 'ubuntu-latest'
-        run: dotnet publish DepotDownloader/DepotDownloader.csproj --configuration Release -p:PublishSingleFile=true -p:DebugType=embedded -p:PublishReadyToRun=false --self-contained --runtime linux-arm64 --output selfcontained-nixos-arm64
+        run: |
+          # Build the standard Linux binary first
+          dotnet publish DepotDownloader/DepotDownloader.csproj --configuration Release -p:PublishSingleFile=true -p:DebugType=embedded -p:PublishReadyToRun=false --self-contained --runtime linux-arm64 --output selfcontained-nixos-arm64-temp
+          
+          # Copy the binary to final directory
+          mkdir -p selfcontained-nixos-arm64
+          cp selfcontained-nixos-arm64-temp/DepotDownloader selfcontained-nixos-arm64/
+          
+          # Patch the ELF binary for NixOS compatibility (ARM64)
+          patchelf --set-interpreter /run/current-system/sw/lib/ld-linux-aarch64.so.1 selfcontained-nixos-arm64/DepotDownloader || true
+          patchelf --set-rpath '/run/current-system/sw/lib:/nix/store/*/lib' selfcontained-nixos-arm64/DepotDownloader || true
+          
+          # Create a NixOS-compatible wrapper script for ARM64
+          cat > selfcontained-nixos-arm64/DepotDownloader-nixos << 'EOF'
+          #!/usr/bin/env bash
+          # NixOS compatibility wrapper for DepotDownloader (ARM64)
+          
+          # Try to find the NixOS dynamic linker
+          if [ -f "/run/current-system/sw/lib/ld-linux-aarch64.so.1" ]; then
+              INTERP="/run/current-system/sw/lib/ld-linux-aarch64.so.1"
+          elif [ -f "/lib/ld-linux-aarch64.so.1" ]; then
+              INTERP="/lib/ld-linux-aarch64.so.1"
+          else
+              # Fallback: try to use patchelf if available
+              if command -v patchelf >/dev/null 2>&1; then
+                  echo "Attempting to patch DepotDownloader for NixOS compatibility..."
+                  patchelf --set-interpreter "$(cat /proc/sys/kernel/osrelease | grep -q nixos && echo '/run/current-system/sw/lib/ld-linux-aarch64.so.1' || echo '/lib/ld-linux-aarch64.so.1')" "$0/../DepotDownloader" 2>/dev/null || true
+              fi
+              # Try direct execution
+              exec "$(dirname "$0")/DepotDownloader" "$@"
+          fi
+          
+          # Execute with explicit interpreter
+          exec "$INTERP" "$(dirname "$0")/DepotDownloader" "$@"
+          EOF
+          
+          chmod +x selfcontained-nixos-arm64/DepotDownloader-nixos
+          
+          # Copy README for ARM64
+          cp selfcontained-nixos-x64/README-NixOS.md selfcontained-nixos-arm64/README-NixOS.md
 
       - name: Publish macOS-x64
         if: matrix.configuration == 'Release' && matrix.runs-on == 'macos-latest'
@@ -171,7 +287,9 @@ jobs:
         chmod +x artifacts/DepotDownloader-linux-arm/DepotDownloader
         chmod +x artifacts/DepotDownloader-linux-arm64/DepotDownloader
         chmod +x artifacts/DepotDownloader-nixos-x64/DepotDownloader
+        chmod +x artifacts/DepotDownloader-nixos-x64/DepotDownloader-nixos
         chmod +x artifacts/DepotDownloader-nixos-arm64/DepotDownloader
+        chmod +x artifacts/DepotDownloader-nixos-arm64/DepotDownloader-nixos
         chmod +x artifacts/DepotDownloader-macos-x64/DepotDownloader
         chmod +x artifacts/DepotDownloader-macos-arm64/DepotDownloader
         zip -9j release/DepotDownloader-framework.zip artifacts/DepotDownloader-framework/*
@@ -180,8 +298,8 @@ jobs:
         zip -9j release/DepotDownloader-linux-x64.zip artifacts/DepotDownloader-linux-x64/*
         zip -9j release/DepotDownloader-linux-arm.zip artifacts/DepotDownloader-linux-arm/*
         zip -9j release/DepotDownloader-linux-arm64.zip artifacts/DepotDownloader-linux-arm64/*
-        zip -9j release/DepotDownloader-nixos-x64.zip artifacts/DepotDownloader-nixos-x64/*
-        zip -9j release/DepotDownloader-nixos-arm64.zip artifacts/DepotDownloader-nixos-arm64/*
+        zip -9r release/DepotDownloader-nixos-x64.zip artifacts/DepotDownloader-nixos-x64/*
+        zip -9r release/DepotDownloader-nixos-arm64.zip artifacts/DepotDownloader-nixos-arm64/*
         zip -9j release/DepotDownloader-macos-x64.zip artifacts/DepotDownloader-macos-x64/*
         zip -9j release/DepotDownloader-macos-arm64.zip artifacts/DepotDownloader-macos-arm64/*
 
