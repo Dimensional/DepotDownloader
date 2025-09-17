@@ -803,6 +803,67 @@ namespace DepotDownloader
             public ulong depotBytesUncompressed;
         }
 
+        private class ChunkProgressTracker
+        {
+            public ulong Total;
+            public ulong Downloaded;
+            public ulong Skipped;
+            public ulong Completed => Downloaded + Skipped;
+            private readonly object _lockObject = new object();
+            private DateTime _lastUpdate = DateTime.MinValue;
+
+            public void IncrementDownloaded()
+            {
+                Interlocked.Increment(ref Downloaded);
+                UpdateProgress();
+            }
+
+            public void IncrementSkipped()
+            {
+                Interlocked.Increment(ref Skipped);
+                UpdateProgress();
+            }
+
+            private void UpdateProgress()
+            {
+                lock (_lockObject)
+                {
+                    var now = DateTime.Now;
+                    var completed = Completed;
+
+                    // Update Ansi progress bar
+                    if (Total > 0)
+                    {
+                        Ansi.Progress(completed, Total);
+                    }
+
+                    // Also show text progress every 100 chunks or every 2 seconds for slower downloads
+                    if (completed % 100 == 0 ||
+                        completed == Total ||
+                        (now - _lastUpdate).TotalSeconds >= 2)
+                    {
+                        var percentage = Total > 0 ? (completed * 100.0) / Total : 0;
+                        Console.Write($"\rProgress: {completed}/{Total} chunks ({percentage:F1}%) - {Downloaded} downloaded, {Skipped} skipped");
+                        _lastUpdate = now;
+
+                        // Only add newline if we're done
+                        if (completed == Total)
+                        {
+                            Console.WriteLine();
+                        }
+                    }
+                }
+            }
+
+            public void ShowFinalStats(uint depotId)
+            {
+                // Clear the progress line and show final stats
+                Console.Write("\r" + new string(' ', 80) + "\r"); // Clear line
+                Console.WriteLine("Depot {0} - {1}/{2} chunks processed ({3} downloaded, {4} skipped)",
+                    depotId, Completed, Total, Downloaded, Skipped);
+            }
+        }
+
         private static async Task DownloadSteam3Async(List<DepotDownloadInfo> depots)
         {
             Ansi.Progress(Ansi.ProgressState.Indeterminate);
@@ -1386,7 +1447,7 @@ namespace DepotDownloader
                     }
                     catch (SteamKitWebRequestException e)
                     {
-                        // If the CDN returned 403, attempt to get a cdn auth if we didn't yet
+
                         if (e.StatusCode == HttpStatusCode.Forbidden &&
                             (!steam3.CDNAuthTokens.TryGetValue((depot.DepotId, connection.Host), out var authTokenCallbackPromise) || !authTokenCallbackPromise.Task.IsCompleted))
                         {
@@ -1401,7 +1462,7 @@ namespace DepotDownloader
 
                         if (e.StatusCode == HttpStatusCode.Unauthorized || e.StatusCode == HttpStatusCode.Forbidden)
                         {
-                            Console.WriteLine("Encountered {1} for chunk {0}. Aborting.", chunkID, (int)e.StatusCode);
+                            Console.WriteLine("Encountered {2} for chunk {0}. Aborting.", chunkID, (int)e.StatusCode);
                             break;
                         }
 
@@ -1859,19 +1920,21 @@ namespace DepotDownloader
                 CancellationToken = cts.Token
             };
 
-            ulong total = (ulong)chunks.Count;
-            ulong done = 0;
+            var progressTracker = new ChunkProgressTracker
+            {
+                Total = (ulong)chunks.Count
+            };
+
+            Console.WriteLine("Depot {0} - processing {1} chunks...", depot.DepotId, progressTracker.Total);
+            Ansi.Progress(Ansi.ProgressState.Default, 0);
 
             await Parallel.ForEachAsync(chunks, parallelOptions, async (chunk, token) =>
             {
-                await DownloadChunkToArchiveAsync(cts, depot, chunk, chunksDir, options);
-
-                var now = Interlocked.Increment(ref done);
-                if (now % 50 == 0 || now == total)
-                {
-                    Console.WriteLine("Depot {0} - {1}/{2} chunks archived", depot.DepotId, now, total);
-                }
+                await DownloadChunkToArchiveAsync(cts, depot, chunk, chunksDir, options, progressTracker);
             });
+
+            Ansi.Progress(Ansi.ProgressState.Hidden);
+            progressTracker.ShowFinalStats(depot.DepotId);
 
             Console.WriteLine("Depot {0} - raw archive complete", depot.DepotId);
         }
@@ -2038,6 +2101,7 @@ namespace DepotDownloader
                         (!steam3.CDNAuthTokens.TryGetValue((depot.DepotId, connection.Host), out var authTokenCallbackPromise) || !authTokenCallbackPromise.Task.IsCompleted))
                     {
                         await steam3.RequestCDNAuthToken(depot.AppId, depot.DepotId, connection);
+
                         cdnPool.ReturnConnection(connection);
                         continue;
                     }
@@ -2182,7 +2246,8 @@ namespace DepotDownloader
             DepotDownloadInfo depot,
             DepotManifest.ChunkData chunk,
             string chunksRoot,
-            RawDownloadOptions options)
+            RawDownloadOptions options,
+            ChunkProgressTracker progressTracker)
         {
             var chunkID = Convert.ToHexString(chunk.ChunkID).ToLowerInvariant();
             var chunkPath = Path.Combine(chunksRoot, chunkID);
@@ -2198,10 +2263,14 @@ namespace DepotDownloader
                         var sha = SHA1.HashData(fs);
                         var shaHex = Convert.ToHexString(sha).ToLowerInvariant();
                         if (shaHex == chunkID)
+                        {
+                            progressTracker.IncrementSkipped();
                             return;
+                        }
                     }
                     else
                     {
+                        progressTracker.IncrementSkipped();
                         return;
                     }
                 }
@@ -2239,6 +2308,7 @@ namespace DepotDownloader
                             cdnToken).ConfigureAwait(false);
 
                         cdnPool.ReturnConnection(connection);
+
                         break;
                     }
                     catch (TaskCanceledException)
@@ -2253,7 +2323,9 @@ namespace DepotDownloader
                             (!steam3.CDNAuthTokens.TryGetValue((depot.DepotId, connection.Host), out var authTokenCallbackPromise) || !authTokenCallbackPromise.Task.IsCompleted))
                         {
                             await steam3.RequestCDNAuthToken(depot.AppId, depot.DepotId, connection);
+
                             cdnPool.ReturnConnection(connection);
+
                             continue;
                         }
 
@@ -2261,7 +2333,7 @@ namespace DepotDownloader
 
                         if (e.StatusCode == HttpStatusCode.Unauthorized || e.StatusCode == HttpStatusCode.Forbidden)
                         {
-                            Console.WriteLine("Encountered {1} for chunk {0}. Aborting.", chunkID, (int)e.StatusCode);
+                            Console.WriteLine("Encountered {2} for chunk {0}. Aborting.", chunkID, (int)e.StatusCode);
                             break;
                         }
 
@@ -2299,6 +2371,8 @@ namespace DepotDownloader
                         Console.WriteLine("Warning: SHA1 mismatch for chunk {0}.", chunkID);
                     }
                 }
+
+                progressTracker.IncrementDownloaded();
             }
             finally
             {
