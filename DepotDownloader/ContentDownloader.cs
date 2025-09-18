@@ -2006,6 +2006,10 @@ namespace DepotDownloader
                         cdnToken = result.Token;
                     }
 
+                    // ADD DELAY HERE - after connection but before request
+                    // This distributes timing across parallel downloads
+                    await Task.Delay(Random.Shared.Next(100, 1000), cts.Token);
+
                     var now = DateTime.Now;
 
                     if (manifestRequestCode == 0 || now >= manifestRequestCodeExpiration)
@@ -2118,6 +2122,14 @@ namespace DepotDownloader
                     {
                         Console.WriteLine("Encountered 404 for depot manifest {0} {1}. Aborting.", depot.DepotId, depot.ManifestId);
                         break;
+                    }
+
+                    // ADD EXPONENTIAL BACKOFF FOR ERRORS
+                    if (e.StatusCode == HttpStatusCode.ServiceUnavailable ||
+                        e.StatusCode == HttpStatusCode.NotFound)
+                    {
+                        var delay = Random.Shared.Next(500, 2000);
+                        await Task.Delay(delay, cts.Token);
                     }
 
                     Console.WriteLine("Encountered error downloading depot manifest {0} {1}: {2}", depot.DepotId, depot.ManifestId, e.StatusCode);
@@ -2297,6 +2309,10 @@ namespace DepotDownloader
                             cdnToken = result.Token;
                         }
 
+                        // ADD DELAY HERE - after connection but before request
+                        // This distributes timing across parallel downloads
+                        await Task.Delay(Random.Shared.Next(100, 800), cts.Token);
+
                         DebugLog.WriteLine("ContentDownloader", "Downloading chunk {0} from {1} with {2}", chunkID, connection, cdnPool.ProxyServer != null ? cdnPool.ProxyServer : "no proxy");
                         written = await cdnPool.CDNClient.DownloadDepotChunkAsync(
                             depot.DepotId,
@@ -2335,6 +2351,14 @@ namespace DepotDownloader
                         {
                             Console.WriteLine("Encountered {2} for chunk {0}. Aborting.", chunkID, (int)e.StatusCode);
                             break;
+                        }
+
+                        // ADD EXPONENTIAL BACKOFF FOR ERRORS
+                        if (e.StatusCode == HttpStatusCode.ServiceUnavailable ||
+                            e.StatusCode == HttpStatusCode.NotFound)
+                        {
+                            var delay = Random.Shared.Next(500, 2000);
+                            await Task.Delay(delay, cts.Token);
                         }
 
                         Console.WriteLine("Encountered error downloading chunk {0}: {1}", chunkID, e.StatusCode);
