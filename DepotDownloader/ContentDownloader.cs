@@ -1768,7 +1768,7 @@ namespace DepotDownloader
             // For raw mode, use a cleaner directory structure: depot/{depotId}/
             // Instead of the standard depots/depot/{depotId}/ structure used by normal downloads
             var depotRoot = Path.Combine("depot", depot.DepotId.ToString());
-            var manifestsDir = Path.Combine(depotRoot, "manifests");
+            var manifestsDir = Path.Combine(depotRoot, "manifest");
             var chunksDir = Path.Combine(depotRoot, "chunks");
             var debugDir = Path.Combine(depotRoot, "debug");
 
