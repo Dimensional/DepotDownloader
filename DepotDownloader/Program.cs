@@ -51,11 +51,19 @@ namespace DepotDownloader
 
             #region Common Options
 
-            // Not using HasParameter because it is case insensitive
-            if (args.Length == 1 && (args[0] == "-V" || args[0] == "--version"))
+            if (args.Length == 1)
             {
-                PrintVersion(true);
-                return 0;
+                if (args[0] == "-V" || args[0] == "--version")
+                {
+                    PrintVersion(true);
+                    return 0;
+                }
+                if (args[0] == "-h" || args[0] == "--help" || args[0] == "-help")
+                {
+                    PrintVersion();
+                    PrintUsage();
+                    return 0;
+                }
             }
 
             consumedArgs = new bool[args.Length];
@@ -871,19 +879,9 @@ namespace DepotDownloader
             {
                 case OperationMode.App:
                     // App mode: Cannot use manifest CSV or workshop CSV
-                    if (HasParameter(args, "-manifest-csv"))
+                    if (HasParameter(args, "-manifest-csv") || HasParameter(args, "-manifest-csv-all") || HasParameter(args, "-workshop-csv"))
                     {
-                        Console.WriteLine("Error: -manifest-csv cannot be used with -app mode.");
-                        return false;
-                    }
-                    if (HasParameter(args, "-manifest-csv-all"))
-                    {
-                        Console.WriteLine("Error: -manifest-csv-all cannot be used with -app mode.");
-                        return false;
-                    }
-                    if (HasParameter(args, "-workshop-csv"))
-                    {
-                        Console.WriteLine("Error: -workshop-csv cannot be used with -app mode.");
+                        Console.WriteLine("Error: -manifest-csv and -workshop-csv cannot be used with -app mode.");
                         return false;
                     }
                     break;
