@@ -1405,7 +1405,7 @@ namespace DepotDownloader
             var chunkID = Convert.ToHexString(chunk.ChunkID).ToLowerInvariant();
 
             var written = 0;
-            var chunkBuffer = ArrayPool<byte>.Shared.Rent((int)chunk.UncompressedLength);
+            var chunkBuffer = ArrayPool<byte>.Shared.Rent((int)chunk.CompressedLength);
 
             try
             {
@@ -2267,7 +2267,7 @@ namespace DepotDownloader
             if (options.SkipExisting && File.Exists(chunkPath))
             {
                 var fi = new FileInfo(chunkPath);
-                if ((ulong)fi.Length == chunk.UncompressedLength)
+                if ((ulong)fi.Length == chunk.CompressedLength)
                 {
                     if (options.VerifyChunkSha1)
                     {
@@ -2289,7 +2289,7 @@ namespace DepotDownloader
             }
 
             var written = 0;
-            var buffer = ArrayPool<byte>.Shared.Rent((int)chunk.UncompressedLength);
+            var buffer = ArrayPool<byte>.Shared.Rent((int)chunk.CompressedLength);
 
             try
             {
@@ -2311,7 +2311,7 @@ namespace DepotDownloader
 
                         // ADD DELAY HERE - after connection but before request
                         // This distributes timing across parallel downloads
-                        await Task.Delay(Random.Shared.Next(100, 800), cts.Token);
+                        // await Task.Delay(Random.Shared.Next(100, 800), cts.Token);
 
                         DebugLog.WriteLine("ContentDownloader", "Downloading chunk {0} from {1} with {2}", chunkID, connection, cdnPool.ProxyServer != null ? cdnPool.ProxyServer : "no proxy");
                         written = await cdnPool.CDNClient.DownloadDepotChunkAsync(
@@ -2319,7 +2319,7 @@ namespace DepotDownloader
                             chunk,
                             connection,
                             buffer,
-                            depot.DepotKey,
+                            null, // Pass null depot key to get raw compressed data
                             cdnPool.ProxyServer,
                             cdnToken).ConfigureAwait(false);
 
