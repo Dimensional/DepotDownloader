@@ -1769,7 +1769,7 @@ namespace DepotDownloader
             // Instead of the standard depots/depot/{depotId}/ structure used by normal downloads
             var depotRoot = Path.Combine("depot", depot.DepotId.ToString());
             var manifestsDir = Path.Combine(depotRoot, "manifest");
-            var chunksDir = Path.Combine(depotRoot, "chunks");
+            var chunksDir = Path.Combine(depotRoot, "chunk");
             var debugDir = Path.Combine(depotRoot, "debug");
 
             Directory.CreateDirectory(manifestsDir);
