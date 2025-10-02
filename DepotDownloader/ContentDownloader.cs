@@ -1405,7 +1405,8 @@ namespace DepotDownloader
             var chunkID = Convert.ToHexString(chunk.ChunkID).ToLowerInvariant();
 
             var written = 0;
-            var chunkBuffer = ArrayPool<byte>.Shared.Rent((int)chunk.CompressedLength);
+            // Fix: When depot key is provided, CDN client decompresses the chunk, so buffer needs UncompressedLength
+            var chunkBuffer = ArrayPool<byte>.Shared.Rent((int)chunk.UncompressedLength);
 
             try
             {
