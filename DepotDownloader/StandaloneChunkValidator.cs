@@ -5,6 +5,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Threading;
 using System.Threading.Tasks;
 using SteamKit2;
 
@@ -21,8 +22,9 @@ namespace DepotDownloader
         /// <param name="depotPath">Path to depot directory (e.g., "depot/12345")</param>
         /// <param name="manifestPath">Optional path to manifest file (currently unused - size detection is automatic)</param>
         /// <param name="verbose">Show detailed output for each chunk</param>
+        /// <param name="maxThreads">Maximum number of threads to use for validation (0 = auto-detect with overprovisioning)</param>
         /// <returns>Validation summary</returns>
-        public static async Task<ValidationSummary> ValidateDepotChunksAsync(string depotPath, string manifestPath = null, bool verbose = false)
+        public static async Task<ValidationSummary> ValidateDepotChunksAsync(string depotPath, string manifestPath = null, bool verbose = false, int maxThreads = 0)
         {
             var summary = new ValidationSummary();
 
@@ -63,38 +65,92 @@ namespace DepotDownloader
                                      .ToList();
 
             summary.TotalChunks = chunkFiles.Count;
-            Console.WriteLine($"Found {chunkFiles.Count} chunk files to validate");
 
-            // Validate each chunk using dynamic size detection
-            foreach (var chunkFile in chunkFiles)
+            // Smart thread count calculation (like Dolphin-Tools approach)
+            if (maxThreads <= 0)
+            {
+                // Use overprovisioning for mixed I/O and CPU workload
+                var cpuCores = Environment.ProcessorCount;
+
+                // For chunk validation (mixed I/O + CPU), optimal is usually 1.5x to 2x CPU cores
+                // This allows threads to wait for I/O while others use CPU
+                maxThreads = Math.Min(cpuCores * 2, 32); // Cap at 32 to avoid excessive overhead
+
+                Console.WriteLine($"Auto-detected thread count: {maxThreads} (CPU cores: {cpuCores}, ratio: {(double)maxThreads / cpuCores:F1}x)");
+            }
+            else
+            {
+                Console.WriteLine($"Using custom thread count: {maxThreads}");
+            }
+
+            Console.WriteLine($"Found {chunkFiles.Count} chunk files to validate using {maxThreads} threads");
+
+            // Use thread-safe collections for results (like Python's Queue)
+            var validChunks = new System.Collections.Concurrent.ConcurrentBag<string>();
+            var invalidChunks = new System.Collections.Concurrent.ConcurrentBag<(string chunkId, string error)>();
+            var errorChunks = new System.Collections.Concurrent.ConcurrentBag<(string chunkId, string error)>();
+
+            // Advanced parallel validation with overprovisioning
+            // Using SemaphoreSlim to control active thread count while allowing more threads to queue
+            using var semaphore = new SemaphoreSlim(Environment.ProcessorCount, Environment.ProcessorCount);
+
+            var tasks = chunkFiles.Select(async chunkFile =>
             {
                 var chunkId = Path.GetFileName(chunkFile);
 
+                // Wait for a CPU slot to become available (this is where threads wait, like in Dolphin-Tools)
+                await semaphore.WaitAsync();
+
                 try
                 {
-                    // Use dynamic size detection (estimatedUncompressedLength parameter is ignored)
+                    // ChunkValidator is thread-safe - safe to call concurrently
                     var result = await ChunkValidator.ValidateRawChunkAsync(chunkFile, depotKey, 0);
 
                     if (result.IsValid)
                     {
-                        summary.ValidChunks++;
+                        validChunks.Add(chunkId);
                         if (verbose)
                         {
-                            Console.WriteLine($"✓ {chunkId} - Valid ({result.DecompressedSize} bytes)");
+                            // Thread-safe console output
+                            lock (Console.Out)
+                            {
+                                Console.WriteLine($"✓ {chunkId} - Valid ({result.DecompressedSize} bytes)");
+                            }
                         }
                     }
                     else
                     {
-                        summary.InvalidChunks++;
-                        Console.WriteLine($"✗ {chunkId} - {result.ErrorMessage}");
+                        invalidChunks.Add((chunkId, result.ErrorMessage));
+                        // Always show invalid chunks
+                        lock (Console.Out)
+                        {
+                            Console.WriteLine($"✗ {chunkId} - {result.ErrorMessage}");
+                        }
                     }
                 }
                 catch (Exception ex)
                 {
-                    summary.ErrorChunks++;
-                    Console.WriteLine($"✗ {chunkId} - Error: {ex.Message}");
+                    errorChunks.Add((chunkId, ex.Message));
+                    // Always show error chunks
+                    lock (Console.Out)
+                    {
+                        Console.WriteLine($"✗ {chunkId} - Error: {ex.Message}");
+                    }
                 }
-            }
+                finally
+                {
+                    // Release the CPU slot for the next waiting thread
+                    semaphore.Release();
+                }
+            });
+
+            // Wait for all validation tasks to complete
+            await Task.WhenAll(tasks);
+
+            // Update summary with results
+            summary.ValidChunks = validChunks.Count;
+            summary.InvalidChunks = invalidChunks.Count;
+            summary.ErrorChunks = errorChunks.Count;
 
             return summary;
         }

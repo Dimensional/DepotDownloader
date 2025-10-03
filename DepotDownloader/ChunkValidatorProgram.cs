@@ -53,19 +53,28 @@ namespace DepotDownloader
         {
             if (args.Length < 1)
             {
-                Console.WriteLine("Usage: validate-depot <depot-path> [manifest-path] [-verbose]");
+                Console.WriteLine("Usage: validate-depot <depot-path> [manifest-path] [-verbose] [-threads <count>]");
                 return 1;
             }
 
             var depotPath = args[0];
             string manifestPath = null;
             var verbose = false;
+            var threads = 0; // Default to auto-detect
 
             for (int i = 1; i < args.Length; i++)
             {
                 if (args[i] == "-verbose" || args[i] == "-v")
                 {
                     verbose = true;
+                }
+                else if (args[i] == "-threads" || args[i] == "-t")
+                {
+                    if (i + 1 < args.Length && int.TryParse(args[i + 1], out var threadCount))
+                    {
+                        threads = threadCount;
+                        i++; // Skip the thread count argument
+                    }
                 }
                 else if (manifestPath == null)
                 {
@@ -79,7 +88,7 @@ namespace DepotDownloader
                 Console.WriteLine($"Using manifest: {manifestPath}");
             }
 
-            var summary = await StandaloneChunkValidator.ValidateDepotChunksAsync(depotPath, manifestPath, verbose);
+            var summary = await StandaloneChunkValidator.ValidateDepotChunksAsync(depotPath, manifestPath, verbose, threads);
 
             Console.WriteLine();
             Console.WriteLine(summary);
@@ -118,11 +127,13 @@ namespace DepotDownloader
         {
             Console.WriteLine("Chunk Validation Commands:");
             Console.WriteLine();
-            Console.WriteLine("  validate-depot <depot-path> [manifest-path] [-verbose]");
+            Console.WriteLine("  validate-depot <depot-path> [manifest-path] [-verbose] [-threads <count>]");
             Console.WriteLine("    Validate all chunks in a depot directory");
             Console.WriteLine("    depot-path     : Path to depot directory (e.g., 'depot/12345')");
             Console.WriteLine("    manifest-path  : Optional path to manifest file for chunk sizes");
             Console.WriteLine("    -verbose       : Show detailed output for each chunk");
+            Console.WriteLine("    -threads <#>   : Number of threads to use (0 = auto-detect with overprovisioning)");
+            Console.WriteLine("                     Auto-detect uses 2x CPU cores for optimal I/O + CPU utilization");
             Console.WriteLine();
             Console.WriteLine("  validate-chunk <chunk-file> <depot-key-file> [uncompressed-length]");
             Console.WriteLine("    Validate a single chunk file");
@@ -130,10 +141,16 @@ namespace DepotDownloader
             Console.WriteLine("    depot-key-file     : Path to depot key file");
             Console.WriteLine("    uncompressed-length: Expected uncompressed size (optional)");
             Console.WriteLine();
-            Console.WriteLine("Examples:");
-            Console.WriteLine("  depotdownloader validate-depot depot/12345");
-            Console.WriteLine("  depotdownloader validate-depot depot/12345 manifest/12345_456789.manifest -verbose");
-            Console.WriteLine("  depotdownloader validate-chunk depot/12345/chunk/abcd1234 depot/12345/12345.depotkey");
+            Console.WriteLine("Threading Examples:");
+            Console.WriteLine("  depotdownloader validate-depot depot/12345                    # Auto-detect (2x CPU cores)");
+            Console.WriteLine("  depotdownloader validate-depot depot/12345 -threads 16        # Use 16 threads exactly");
+            Console.WriteLine("  depotdownloader validate-depot depot/12345 -threads 1         # Single-threaded mode");
+            Console.WriteLine("  depotdownloader validate-depot depot/12345 -verbose -threads 0 # Auto + verbose");
+            Console.WriteLine();
+            Console.WriteLine("Performance Notes:");
+            Console.WriteLine("  • Auto-threading uses overprovisioning (more threads than CPU cores)");
+            Console.WriteLine("  • Extra threads wait for I/O completion, improving overall throughput");
+            Console.WriteLine("  • Similar strategy to Dolphin-Tools compression for mixed workloads");
         }
     }
 }

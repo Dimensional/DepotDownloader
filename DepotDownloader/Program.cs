@@ -790,12 +790,13 @@ namespace DepotDownloader
             Console.WriteLine("                             Without this flag, only the latest manifest per depot is selected.");
             Console.WriteLine();
             Console.WriteLine("Mode 4 (Standalone Validation) parameters:");
-            Console.WriteLine("  validate-depot <depot-path> [manifest-path] [-verbose]");
+            Console.WriteLine("  validate-depot <depot-path> [manifest-path] [-verbose] [-threads <count>]");
             Console.WriteLine("    • depot-path           - path to depot directory containing chunks and depot key");
             Console.WriteLine("                             (e.g., 'depot/12345' containing 'chunk/' subdirectory and '12345.depotkey')");
             Console.WriteLine("    • manifest-path        - optional path to manifest file for precise chunk size information");
             Console.WriteLine("                             (e.g., 'manifest/12345_456789.manifest')");
             Console.WriteLine("    • -verbose, -v         - show detailed validation results for each chunk");
+            Console.WriteLine("    • -threads <count>     - number of threads to use (0 = auto-detect with 2x CPU overprovisioning)");
             Console.WriteLine();
             Console.WriteLine("  validate-chunk <chunk-file> <depot-key-file> [uncompressed-length]");
             Console.WriteLine("    • chunk-file           - path to individual chunk file to validate");
@@ -968,6 +969,8 @@ namespace DepotDownloader
             Console.WriteLine("• Supports all Steam chunk formats: Zstd (VSZa), LZMA (VZa), and ZIP (PK)");
             Console.WriteLine("• Decryption: First 16 bytes = ECB-encrypted IV, rest = CBC with PKCS7 padding");
             Console.WriteLine("• Size detection: Reads decompressed size from chunk format headers/footers");
+            Console.WriteLine("• Multi-threading: Uses overprovisioning strategy (2x CPU cores) for mixed I/O + CPU workloads");
+            Console.WriteLine("• Thread management: Extra threads wait for I/O completion (similar to Dolphin-Tools)");
             Console.WriteLine("• LZMA: Size at offset -6 to -2, LZMA properties at offset 7-11");
             Console.WriteLine("• Zstd: Size at offset -11 to -7, includes CRC32 and footer validation");
             Console.WriteLine("• ZIP: Standard ZIP decompression with automatic size detection");
