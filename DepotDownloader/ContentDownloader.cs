@@ -1405,7 +1405,7 @@ namespace DepotDownloader
             var chunkID = Convert.ToHexString(chunk.ChunkID).ToLowerInvariant();
 
             var written = 0;
-            var chunkBuffer = ArrayPool<byte>.Shared.Rent((int)chunk.CompressedLength);
+            var chunkBuffer = ArrayPool<byte>.Shared.Rent((int)chunk.UncompressedLength);
 
             try
             {
@@ -1435,6 +1435,22 @@ namespace DepotDownloader
                             depot.DepotKey,
                             cdnPool.ProxyServer,
                             cdnToken).ConfigureAwait(false);
+
+                        // Optional validation during download
+                        if (written > 0 && Config.ValidateDownloadedChunks)
+                        {
+                            var validationResult = ChunkValidator.ValidateDecompressedChunk(
+                                chunkBuffer.AsSpan(0, written),
+                                chunk);
+
+                            if (!validationResult.IsValid)
+                            {
+                                Console.WriteLine("Warning: Downloaded chunk {0} failed validation: {1}",
+                                    chunkID, validationResult.ErrorMessage);
+                                written = 0; // Force retry
+                                continue;
+                            }
+                        }
 
                         cdnPool.ReturnConnection(connection);
 
@@ -2008,7 +2024,7 @@ namespace DepotDownloader
 
                     // ADD DELAY HERE - after connection but before request
                     // This distributes timing across parallel downloads
-                    await Task.Delay(Random.Shared.Next(100, 1000), cts.Token);
+                    // await Task.Delay(Random.Shared.Next(100, 1000), cts.Token);
 
                     var now = DateTime.Now;
 

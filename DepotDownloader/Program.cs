@@ -47,6 +47,19 @@ namespace DepotDownloader
 
             DebugLog.Enabled = false;
 
+            // Check if this is a chunk validation command
+            if (args.Length > 0 && (args[0] == "validate-depot" || args[0] == "validate-chunk"))
+            {
+                return await ChunkValidatorProgram.RunChunkValidationAsync(args);
+            }
+
+            // Check for help requests specifically about validation
+            if (args.Length > 0 && (args[0] == "help-validation" || args[0] == "validation-help" || args[0] == "--help-validation"))
+            {
+                PrintValidationHelp();
+                return 0;
+            }
+
             AccountSettingsStore.LoadFromFile("account.config");
 
             #region Common Options
@@ -62,6 +75,11 @@ namespace DepotDownloader
                 {
                     PrintVersion();
                     PrintUsage();
+                    return 0;
+                }
+                if (args[0] == "help-validation" || args[0] == "validation-help" || args[0] == "--help-validation")
+                {
+                    PrintValidationHelp();
                     return 0;
                 }
             }
@@ -154,6 +172,7 @@ namespace DepotDownloader
             ContentDownloader.Config.InstallDirectory = GetParameter<string>(args, "-dir");
 
             ContentDownloader.Config.VerifyAll = HasParameter(args, "-verify-all") || HasParameter(args, "-verify_all") || HasParameter(args, "-validate");
+            ContentDownloader.Config.ValidateDownloadedChunks = HasParameter(args, "-validate-chunks") || HasParameter(args, "-validate-downloaded-chunks");
 
             if (HasParameter(args, "-use-lancache"))
             {
@@ -732,7 +751,7 @@ namespace DepotDownloader
         {
             // Do not use tabs to align parameters here because tab size may differ
             Console.WriteLine();
-            Console.WriteLine("Usage - Three distinct operation modes:");
+            Console.WriteLine("Usage - Four distinct operation modes:");
             Console.WriteLine();
             Console.WriteLine("Mode 1: App-based downloading");
             Console.WriteLine("       depotdownloader -app <id> [-depot <id> [-manifest <id>]]");
@@ -745,6 +764,10 @@ namespace DepotDownloader
             Console.WriteLine("Mode 3: Workshop downloading");
             Console.WriteLine("       depotdownloader -workshop <id1> [<id2> ...] [other options]");
             Console.WriteLine("       depotdownloader -workshop-csv <file> [other options]");
+            Console.WriteLine();
+            Console.WriteLine("Mode 4: Standalone validation (no Steam login required)");
+            Console.WriteLine("       depotdownloader validate-depot <depot-path> [options]");
+            Console.WriteLine("       depotdownloader validate-chunk <chunk-file> <depot-key-file> [options]");
             Console.WriteLine();
             Console.WriteLine("Primary Parameters (mutually exclusive):");
             Console.WriteLine("  -app <#>                 - the AppID to download (Mode 1).");
@@ -765,6 +788,20 @@ namespace DepotDownloader
             Console.WriteLine("Mode 2 (Manifest CSV) specific parameters:");
             Console.WriteLine("  -manifest-csv-all        - with -manifest-csv, select ALL rows per depot (auto-enables raw mode).");
             Console.WriteLine("                             Without this flag, only the latest manifest per depot is selected.");
+            Console.WriteLine();
+            Console.WriteLine("Mode 4 (Standalone Validation) parameters:");
+            Console.WriteLine("  validate-depot <depot-path> [manifest-path] [-verbose]");
+            Console.WriteLine("    • depot-path           - path to depot directory containing chunks and depot key");
+            Console.WriteLine("                             (e.g., 'depot/12345' containing 'chunk/' subdirectory and '12345.depotkey')");
+            Console.WriteLine("    • manifest-path        - optional path to manifest file for precise chunk size information");
+            Console.WriteLine("                             (e.g., 'manifest/12345_456789.manifest')");
+            Console.WriteLine("    • -verbose, -v         - show detailed validation results for each chunk");
+            Console.WriteLine();
+            Console.WriteLine("  validate-chunk <chunk-file> <depot-key-file> [uncompressed-length]");
+            Console.WriteLine("    • chunk-file           - path to individual chunk file to validate");
+            Console.WriteLine("                             (chunk filename should be the SHA1 hash of decompressed content)");
+            Console.WriteLine("    • depot-key-file       - path to depot key file (32-byte binary file)");
+            Console.WriteLine("    • uncompressed-length  - expected size after decompression (optional, estimated if not provided)");
             Console.WriteLine();
             Console.WriteLine("Common parameters:");
             Console.WriteLine($"  -branch <branchname>    - download from specified branch if available (default: {ContentDownloader.DEFAULT_BRANCH}).");
@@ -788,7 +825,11 @@ namespace DepotDownloader
             Console.WriteLine("  -filelist <file.txt>     - the name of a local file that contains a list of files to download (from the manifest).");
             Console.WriteLine("                             prefix file path with `regex:` if you want to match with regex. each file path should be on their own line.");
             Console.WriteLine();
+            Console.WriteLine("Validation options (apply to download modes 1-3):");
             Console.WriteLine("  -validate                - include checksum verification of files already downloaded");
+            Console.WriteLine("  -validate-chunks         - validate each downloaded chunk during download process");
+            Console.WriteLine("                             (slower but ensures data integrity; forces retry on validation failure)");
+            Console.WriteLine();
             Console.WriteLine("  -manifest-only           - downloads a human readable manifest for any depots that would be downloaded.");
             Console.WriteLine("  -cellid <#>              - the overridden CellID of the content server to download from.");
             Console.WriteLine("  -max-downloads <#>       - maximum number of chunks to download concurrently. (default: 8).");
@@ -813,6 +854,7 @@ namespace DepotDownloader
             Console.WriteLine("  depotdownloader -app 4000 -depot 4001 -raw");
             Console.WriteLine("  depotdownloader -app 4000 -depot 4001 -manifest 172736322597516942 -raw");
             Console.WriteLine("  depotdownloader -app 4000 -depot 4001 -manifest 123 456 789  # Auto-enables raw mode");
+            Console.WriteLine("  depotdownloader -app 4000 -depot 4001 -validate-chunks  # Validate chunks during download");
             Console.WriteLine();
             Console.WriteLine("Manifest CSV mode examples:");
             Console.WriteLine("  # Download latest manifest per depot from CSV (auto-enables raw mode)");
@@ -823,6 +865,27 @@ namespace DepotDownloader
             Console.WriteLine();
             Console.WriteLine("  # Download only specific branch manifests from CSV (auto-enables raw mode)");
             Console.WriteLine("  depotdownloader -manifest-csv manifests.csv -manifest-csv-all -branch dev");
+            Console.WriteLine();
+            Console.WriteLine("Standalone validation examples:");
+            Console.WriteLine("  # Validate all chunks in a depot archive (requires depot key file)");
+            Console.WriteLine("  depotdownloader validate-depot depot/12345");
+            Console.WriteLine("  depotdownloader validate-depot depot/12345 -verbose");
+            Console.WriteLine();
+            Console.WriteLine("  # Validate depot with manifest for precise chunk sizes");
+            Console.WriteLine("  depotdownloader validate-depot depot/12345 manifest/12345_456789.manifest -verbose");
+            Console.WriteLine();
+            Console.WriteLine("  # Validate a single chunk file");
+            Console.WriteLine("  depotdownloader validate-chunk depot/12345/chunk/abc123def456 depot/12345/12345.depotkey");
+            Console.WriteLine("  depotdownloader validate-chunk chunk_file.dat depot_key.bin 1048576");
+            Console.WriteLine();
+            Console.WriteLine("Validation notes:");
+            Console.WriteLine("  • Standalone validation works offline and doesn't require Steam login");
+            Console.WriteLine("  • Chunk validation uses Steam's official decryption/decompression process");
+            Console.WriteLine("  • Chunk files must be named with their SHA1 hash (as downloaded in raw mode)");
+            Console.WriteLine("  • Depot key files are 32-byte binary files (saved as '<depotid>.depotkey' in raw mode)");
+            Console.WriteLine("  • Validation confirms decrypted+decompressed content matches expected SHA1 hash");
+            Console.WriteLine();
+            Console.WriteLine("For detailed validation help: depotdownloader help-validation");
         }
 
         static void PrintVersion(bool printExtra = false)
@@ -836,6 +899,98 @@ namespace DepotDownloader
             }
 
             Console.WriteLine($"Runtime: {RuntimeInformation.FrameworkDescription} on {RuntimeInformation.OSDescription}");
+        }
+
+        static void PrintValidationHelp()
+        {
+            Console.WriteLine("=== DEPOT DOWNLOADER VALIDATION GUIDE ===");
+            Console.WriteLine();
+            Console.WriteLine("DepotDownloader supports three types of validation:");
+            Console.WriteLine();
+
+            Console.WriteLine("1. DOWNLOAD-TIME VALIDATION (-validate-chunks)");
+            Console.WriteLine("   Purpose: Validate chunks as they are downloaded to ensure data integrity");
+            Console.WriteLine("   Usage:   Add -validate-chunks to any download command");
+            Console.WriteLine("   Impact:  Slower downloads, but ensures perfect data integrity");
+            Console.WriteLine("   Action:  Automatically retries failed chunks until validation passes");
+            Console.WriteLine();
+            Console.WriteLine("   Examples:");
+            Console.WriteLine("     depotdownloader -app 4000 -depot 4001 -validate-chunks");
+            Console.WriteLine("     depotdownloader -manifest-csv manifests.csv -validate-chunks");
+            Console.WriteLine();
+
+            Console.WriteLine("2. POST-DOWNLOAD VALIDATION (-validate)");
+            Console.WriteLine("   Purpose: Verify existing downloaded files against their checksums");
+            Console.WriteLine("   Usage:   Add -validate to any download command");
+            Console.WriteLine("   Impact:  Re-downloads files that fail checksum verification");
+            Console.WriteLine("   Scope:   Works with installed files (not raw archives)");
+            Console.WriteLine();
+            Console.WriteLine("   Examples:");
+            Console.WriteLine("     depotdownloader -app 4000 -depot 4001 -validate");
+            Console.WriteLine();
+
+            Console.WriteLine("3. STANDALONE VALIDATION (validate-depot / validate-chunk)");
+            Console.WriteLine("   Purpose: Offline validation of raw depot archives");
+            Console.WriteLine("   Usage:   Special commands that don't require Steam login");
+            Console.WriteLine("   Input:   Raw depot directories created with -raw mode");
+            Console.WriteLine("   Process: Decrypt → Decompress → Verify SHA1 hash");
+            Console.WriteLine();
+
+            Console.WriteLine("   A. validate-depot - Validate entire depot archive");
+            Console.WriteLine("      Syntax: validate-depot <depot-path> [manifest-path] [-verbose]");
+            Console.WriteLine();
+            Console.WriteLine("      Required directory structure:");
+            Console.WriteLine("        depot/12345/");
+            Console.WriteLine("        ├── 12345.depotkey      (32-byte depot decryption key)");
+            Console.WriteLine("        └── chunk/              (directory of chunk files)");
+            Console.WriteLine("            ├── abc123def456... (chunk files named by SHA1)");
+            Console.WriteLine("            └── 789abc012def... (more chunk files)");
+            Console.WriteLine();
+            Console.WriteLine("      Optional manifest for precise sizes:");
+            Console.WriteLine("        manifest/12345_456789.manifest");
+            Console.WriteLine();
+            Console.WriteLine("      Examples:");
+            Console.WriteLine("        depotdownloader validate-depot depot/12345");
+            Console.WriteLine("        depotdownloader validate-depot depot/12345 -verbose");
+            Console.WriteLine("        depotdownloader validate-depot depot/12345 manifest/12345_456789.manifest -v");
+            Console.WriteLine();
+
+            Console.WriteLine("   B. validate-chunk - Validate single chunk file");
+            Console.WriteLine("      Syntax: validate-chunk <chunk-file> <depot-key-file> [uncompressed-length]");
+            Console.WriteLine();
+            Console.WriteLine("      Examples:");
+            Console.WriteLine("        depotdownloader validate-chunk depot/12345/chunk/abc123def depot/12345/12345.depotkey");
+            Console.WriteLine("        depotdownloader validate-chunk chunk.dat key.bin 1048576");
+            Console.WriteLine();
+
+            Console.WriteLine("TECHNICAL DETAILS:");
+            Console.WriteLine("• Chunk validation uses custom implementation mirroring depot_validator.py");
+            Console.WriteLine("• Supports all Steam chunk formats: Zstd (VSZa), LZMA (VZa), and ZIP (PK)");
+            Console.WriteLine("• Decryption: First 16 bytes = ECB-encrypted IV, rest = CBC with PKCS7 padding");
+            Console.WriteLine("• Size detection: Reads decompressed size from chunk format headers/footers");
+            Console.WriteLine("• LZMA: Size at offset -6 to -2, LZMA properties at offset 7-11");
+            Console.WriteLine("• Zstd: Size at offset -11 to -7, includes CRC32 and footer validation");
+            Console.WriteLine("• ZIP: Standard ZIP decompression with automatic size detection");
+            Console.WriteLine("• Final validation: SHA1 hash of decompressed data vs. chunk filename");
+            Console.WriteLine();
+
+            Console.WriteLine("WORKFLOW RECOMMENDATIONS:");
+            Console.WriteLine("1. Download with -raw mode to create archives:");
+            Console.WriteLine("   depotdownloader -app 4000 -depot 4001 -raw");
+            Console.WriteLine();
+            Console.WriteLine("2. Validate the archive integrity:");
+            Console.WriteLine("   depotdownloader validate-depot depot/4001 -verbose");
+            Console.WriteLine();
+            Console.WriteLine("3. For critical data, use -validate-chunks during download:");
+            Console.WriteLine("   depotdownloader -app 4000 -depot 4001 -raw -validate-chunks");
+            Console.WriteLine();
+
+            Console.WriteLine("ERROR CODES:");
+            Console.WriteLine("• 0 = All validations passed");
+            Console.WriteLine("• 1 = Validation failures detected");
+            Console.WriteLine();
+
+            Console.WriteLine("For general help: depotdownloader --help");
         }
 
         private static OperationMode DetermineOperationMode(uint appId, string manifestCsvPath, string workshopCsvPath, bool hasWorkshopIds)

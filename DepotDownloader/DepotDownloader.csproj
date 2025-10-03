@@ -27,6 +27,8 @@
     </PackageReference>
     <PackageReference Include="protobuf-net" Version="3.2.52" />
     <PackageReference Include="QRCoder" Version="1.6.0" />
+    <PackageReference Include="SevenZip" Version="19.0.0" />
     <PackageReference Include="SteamKit2" Version="3.3.0" />
+    <PackageReference Include="ZstdSharp.Port" Version="0.8.5" />
   </ItemGroup>
 </Project>
