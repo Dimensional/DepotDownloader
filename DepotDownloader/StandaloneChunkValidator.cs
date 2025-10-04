@@ -13,9 +13,12 @@ namespace DepotDownloader
 {
     /// <summary>
     /// Standalone tool for validating depot chunks without requiring Steam connection
+    /// Supports validation of both loose chunk files and chunkstore sets
     /// </summary>
     public static class StandaloneChunkValidator
     {
+        #region Loose File Validation (Existing Functionality)
+
         /// <summary>
         /// Validate all chunks in a depot directory structure
         /// </summary>
@@ -178,6 +181,261 @@ namespace DepotDownloader
             // Use dynamic size detection (uncompressedLength parameter is ignored)
             return await ChunkValidator.ValidateRawChunkAsync(chunkFilePath, depotKey, 0);
         }
+
+        #endregion
+
+        #region Chunkstore Validation (New Functionality)
+
+        /// <summary>
+        /// Validates all chunks in a chunkstore
+        /// </summary>
+        /// <param name="chunkstorePath">Path to chunkstore folder</param>
+        /// <param name="depotId">Depot ID (optional - will auto-detect if only one depot exists)</param>
+        /// <param name="depotKeyPath">Path to depot key file (optional - will look for .depotkey files)</param>
+        /// <param name="verbose">Show detailed output for each chunk</param>
+        /// <param name="maxThreads">Maximum number of threads to use for validation (0 = auto-detect)</param>
+        /// <returns>Validation summary</returns>
+        public static async Task<ValidationSummary> ValidateChunkstoreAsync(
+            string chunkstorePath,
+            uint? depotId = null,
+            string depotKeyPath = null,
+            bool verbose = false,
+            int maxThreads = 0)
+        {
+            var summary = new ValidationSummary();
+
+            if (!Directory.Exists(chunkstorePath))
+            {
+                Console.WriteLine($"Error: Chunkstore directory not found: {chunkstorePath}");
+                return summary;
+            }
+
+            try
+            {
+                // Load depot key
+                byte[] depotKey = null;
+                if (!string.IsNullOrEmpty(depotKeyPath))
+                {
+                    if (!File.Exists(depotKeyPath))
+                    {
+                        Console.WriteLine($"Error: Depot key file not found: {depotKeyPath}");
+                        return summary;
+                    }
+                    depotKey = await File.ReadAllBytesAsync(depotKeyPath);
+                    Console.WriteLine($"Using depot key: {Path.GetFileName(depotKeyPath)}");
+                }
+                else
+                {
+                    // Look for depot key files in the chunkstore directory
+                    var depotKeyFiles = Directory.GetFiles(chunkstorePath, "*.depotkey");
+                    if (depotKeyFiles.Length > 0)
+                    {
+                        depotKey = await File.ReadAllBytesAsync(depotKeyFiles[0]);
+                        Console.WriteLine($"Auto-detected depot key: {Path.GetFileName(depotKeyFiles[0])}");
+                    }
+                }
+
+                // Initialize chunkstore
+                using var chunkstore = new Chunkstore(chunkstorePath, depotId, depotKey);
+                var stats = chunkstore.GetStats();
+
+                Console.WriteLine($"Chunkstore loaded: {stats}");
+
+                if (stats.TotalChunks == 0)
+                {
+                    Console.WriteLine("No chunks found in chunkstore");
+                    return summary;
+                }
+
+                summary.TotalChunks = stats.TotalChunks;
+
+                // Determine thread count
+                if (maxThreads <= 0)
+                {
+                    var cpuCores = Environment.ProcessorCount;
+                    maxThreads = Math.Min(cpuCores * 2, 32);
+                    Console.WriteLine($"Auto-detected thread count: {maxThreads} (CPU cores: {cpuCores}, ratio: {(double)maxThreads / cpuCores:F1}x)");
+                }
+                else
+                {
+                    Console.WriteLine($"Using custom thread count: {maxThreads}");
+                }
+
+                Console.WriteLine($"Validating {stats.TotalChunks:N0} chunks from chunkstore using {maxThreads} threads");
+
+                // Validate all chunks in parallel
+                var progressCount = 0;
+                var results = await ChunkValidator.ValidateAllChunkstoreChunksAsync(
+                    chunkstore,
+                    depotKey,
+                    maxThreads,
+                    progress: (validated, total) =>
+                    {
+                        var newCount = Interlocked.Exchange(ref progressCount, validated);
+                        if (validated % 100 == 0 || validated == total || validated - newCount >= 50)
+                        {
+                            Console.WriteLine($"Progress: {validated:N0}/{total:N0} chunks validated ({(validated * 100.0 / total):F1}%)");
+                        }
+                    });
+
+                // Process results
+                foreach (var kvp in results)
+                {
+                    var chunkId = kvp.Key;
+                    var result = kvp.Value;
+
+                    if (result.IsValid)
+                    {
+                        summary.ValidChunks++;
+                        if (verbose)
+                        {
+                            Console.WriteLine($"✓ {chunkId} - Valid ({result.DecompressedSize} bytes)");
+                        }
+                    }
+                    else
+                    {
+                        summary.InvalidChunks++;
+                        Console.WriteLine($"✗ {chunkId} - {result.ErrorMessage}");
+                    }
+                }
+
+                return summary;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error validating chunkstore: {ex.Message}");
+                summary.ErrorChunks = 1; // Mark as having errors
+                return summary;
+            }
+        }
+
+        /// <summary>
+        /// Validates specific chunks in a chunkstore
+        /// </summary>
+        /// <param name="chunkstorePath">Path to chunkstore folder</param>
+        /// <param name="chunkShaList">List of chunk SHA1 hashes to validate</param>
+        /// <param name="depotId">Depot ID (optional - will auto-detect if only one depot exists)</param>
+        /// <param name="depotKeyPath">Path to depot key file (optional - will look for .depotkey files)</param>
+        /// <param name="verbose">Show detailed output for each chunk</param>
+        /// <param name="maxThreads">Maximum number of threads to use for validation (0 = auto-detect)</param>
+        /// <returns>Validation summary</returns>
+        public static async Task<ValidationSummary> ValidateChunkstoreChunksAsync(
+            string chunkstorePath,
+            IEnumerable<string> chunkShaList,
+            uint? depotId = null,
+            string depotKeyPath = null,
+            bool verbose = false,
+            int maxThreads = 0)
+        {
+            var summary = new ValidationSummary();
+            var chunks = chunkShaList.ToList();
+            summary.TotalChunks = chunks.Count;
+
+            if (!Directory.Exists(chunkstorePath))
+            {
+                Console.WriteLine($"Error: Chunkstore directory not found: {chunkstorePath}");
+                return summary;
+            }
+
+            if (chunks.Count == 0)
+            {
+                Console.WriteLine("No chunks specified for validation");
+                return summary;
+            }
+
+            try
+            {
+                // Load depot key
+                byte[] depotKey = null;
+                if (!string.IsNullOrEmpty(depotKeyPath))
+                {
+                    if (!File.Exists(depotKeyPath))
+                    {
+                        Console.WriteLine($"Error: Depot key file not found: {depotKeyPath}");
+                        return summary;
+                    }
+                    depotKey = await File.ReadAllBytesAsync(depotKeyPath);
+                    Console.WriteLine($"Using depot key: {Path.GetFileName(depotKeyPath)}");
+                }
+                else
+                {
+                    // Look for depot key files in the chunkstore directory
+                    var depotKeyFiles = Directory.GetFiles(chunkstorePath, "*.depotkey");
+                    if (depotKeyFiles.Length > 0)
+                    {
+                        depotKey = await File.ReadAllBytesAsync(depotKeyFiles[0]);
+                        Console.WriteLine($"Auto-detected depot key: {Path.GetFileName(depotKeyFiles[0])}");
+                    }
+                }
+
+                // Initialize chunkstore
+                using var chunkstore = new Chunkstore(chunkstorePath, depotId, depotKey);
+                var stats = chunkstore.GetStats();
+
+                Console.WriteLine($"Chunkstore loaded: {stats}");
+
+                // Determine thread count
+                if (maxThreads <= 0)
+                {
+                    var cpuCores = Environment.ProcessorCount;
+                    maxThreads = Math.Min(cpuCores * 2, 32);
+                    Console.WriteLine($"Auto-detected thread count: {maxThreads} (CPU cores: {cpuCores}, ratio: {(double)maxThreads / cpuCores:F1}x)");
+                }
+                else
+                {
+                    Console.WriteLine($"Using custom thread count: {maxThreads}");
+                }
+
+                Console.WriteLine($"Validating {chunks.Count:N0} specified chunks from chunkstore using {maxThreads} threads");
+
+                // Validate specified chunks in parallel
+                var progressCount = 0;
+                var results = await ChunkValidator.ValidateChunkstoreChunksAsync(
+                    chunkstore,
+                    chunks,
+                    depotKey,
+                    maxThreads,
+                    progress: (validated, total) =>
+                    {
+                        var newCount = Interlocked.Exchange(ref progressCount, validated);
+                        if (validated % 100 == 0 || validated == total || validated - newCount >= 50)
+                        {
+                            Console.WriteLine($"Progress: {validated:N0}/{total:N0} chunks validated ({(validated * 100.0 / total):F1}%)");
+                        }
+                    });
+
+                // Process results
+                foreach (var kvp in results)
+                {
+                    var chunkId = kvp.Key;
+                    var result = kvp.Value;
+
+                    if (result.IsValid)
+                    {
+                        summary.ValidChunks++;
+                        if (verbose)
+                        {
+                            Console.WriteLine($"✓ {chunkId} - Valid ({result.DecompressedSize} bytes)");
+                        }
+                    }
+                    else
+                    {
+                        summary.InvalidChunks++;
+                        Console.WriteLine($"✗ {chunkId} - {result.ErrorMessage}");
+                    }
+                }
+
+                return summary;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error validating chunkstore chunks: {ex.Message}");
+                summary.ErrorChunks = 1; // Mark as having errors
+                return summary;
+            }
+        }
+
+        #endregion
     }
 
     /// <summary>

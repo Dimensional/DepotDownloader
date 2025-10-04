@@ -2,9 +2,12 @@
 // in file 'LICENSE', which is part of this source code package.
 
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.IO.Compression;
+using System.Linq;
 using System.Security.Cryptography;
+using System.Threading;
 using System.Threading.Tasks;
 using SteamKit2;
 using SteamKit2.CDN;
@@ -15,9 +18,12 @@ namespace DepotDownloader
 {
     /// <summary>
     /// Standalone chunk validation utility that can work with or without Steam session
+    /// Supports validation of both loose chunk files and chunkstore sets
     /// </summary>
     public static class ChunkValidator
     {
+        #region Loose File Validation (Existing Functionality)
+
         /// <summary>
         /// Validates a raw chunk file against its filename (which is the SHA1 of the decrypted/decompressed content)
         /// This implementation mirrors the Python depot_validator.py approach exactly
@@ -68,6 +74,243 @@ namespace DepotDownloader
                 };
             }
         }
+
+        /// <summary>
+        /// Validates a raw chunk file using manifest chunk data
+        /// </summary>
+        /// <param name="chunkFilePath">Path to the raw chunk file</param>
+        /// <param name="chunkData">Chunk data from manifest</param>
+        /// <param name="depotKey">Depot key for decryption</param>
+        /// <returns>ValidationResult with success status and details</returns>
+        public static async Task<ValidationResult> ValidateRawChunkAsync(string chunkFilePath, DepotManifest.ChunkData chunkData, byte[] depotKey)
+        {
+            return await ValidateRawChunkAsync(chunkFilePath, depotKey, chunkData.UncompressedLength);
+        }
+
+        /// <summary>
+        /// Validates a chunk that's already decompressed (e.g., during download process)
+        /// Uses the chunk ID from the manifest as the expected SHA1
+        /// </summary>
+        /// <param name="decompressedData">The decompressed chunk data</param>
+        /// <param name="chunkData">Chunk data from manifest containing the expected SHA1</param>
+        /// <returns>ValidationResult with success status and details</returns>
+        public static ValidationResult ValidateDecompressedChunk(ReadOnlySpan<byte> decompressedData, DepotManifest.ChunkData chunkData)
+        {
+            try
+            {
+                var actualSha1 = Convert.ToHexString(SHA1.HashData(decompressedData)).ToLowerInvariant();
+                var expectedSha1 = Convert.ToHexString(chunkData.ChunkID).ToLowerInvariant();
+
+                var isValid = actualSha1 == expectedSha1;
+
+                return new ValidationResult
+                {
+                    IsValid = isValid,
+                    ActualSha1 = actualSha1,
+                    ExpectedSha1 = expectedSha1,
+                    DecompressedSize = decompressedData.Length,
+                    ErrorMessage = isValid ? null : $"SHA1 mismatch: expected {expectedSha1}, got {actualSha1}"
+                };
+            }
+            catch (Exception ex)
+            {
+                return new ValidationResult
+                {
+                    IsValid = false,
+                    ErrorMessage = $"Validation failed: {ex.Message}"
+                };
+            }
+        }
+
+        /// <summary>
+        /// Validates a chunk that's already decompressed using a hex string chunk ID
+        /// </summary>
+        /// <param name="decompressedData">The decompressed chunk data</param>
+        /// <param name="expectedChunkId">Expected SHA1 hash (hex string)</param>
+        /// <returns>ValidationResult with success status and details</returns>
+        public static ValidationResult ValidateDecompressedChunk(ReadOnlySpan<byte> decompressedData, string expectedChunkId)
+        {
+            try
+            {
+                var actualSha1 = Convert.ToHexString(SHA1.HashData(decompressedData)).ToLowerInvariant();
+                var expectedSha1 = expectedChunkId.ToLowerInvariant();
+
+                var isValid = actualSha1 == expectedSha1;
+
+                return new ValidationResult
+                {
+                    IsValid = isValid,
+                    ActualSha1 = actualSha1,
+                    ExpectedSha1 = expectedSha1,
+                    DecompressedSize = decompressedData.Length,
+                    ErrorMessage = isValid ? null : $"SHA1 mismatch: expected {expectedSha1}, got {actualSha1}"
+                };
+            }
+            catch (Exception ex)
+            {
+                return new ValidationResult
+                {
+                    IsValid = false,
+                    ErrorMessage = $"Validation failed: {ex.Message}"
+                };
+            }
+        }
+
+        #endregion
+
+        #region Chunkstore Validation (New Functionality)
+
+        /// <summary>
+        /// Validates a single chunk from a chunkstore by its SHA1 hash
+        /// </summary>
+        /// <param name="chunkstore">The chunkstore instance to read from</param>
+        /// <param name="chunkSha">SHA1 hash of the chunk to validate (as byte array)</param>
+        /// <param name="depotKey">Depot key for decryption (optional if chunkstore is not encrypted)</param>
+        /// <returns>ValidationResult with success status and details</returns>
+        public static ValidationResult ValidateChunkstoreChunk(Chunkstore chunkstore, byte[] chunkSha, byte[] depotKey = null)
+        {
+            if (chunkstore == null)
+            {
+                return new ValidationResult
+                {
+                    IsValid = false,
+                    ErrorMessage = "Chunkstore instance is required"
+                };
+            }
+
+            try
+            {
+                var expectedChunkId = Convert.ToHexString(chunkSha).ToLowerInvariant();
+
+                // Check if chunk exists in chunkstore
+                if (!chunkstore.ChunkExists(chunkSha))
+                {
+                    return new ValidationResult
+                    {
+                        IsValid = false,
+                        ErrorMessage = $"Chunk {expectedChunkId} not found in chunkstore"
+                    };
+                }
+
+                // Get raw chunk data from chunkstore
+                var rawChunkData = chunkstore.GetChunk(chunkSha, process: false);
+
+                // Validate the chunk
+                return ProcessChunkLikePython(rawChunkData, depotKey, expectedChunkId);
+            }
+            catch (Exception ex)
+            {
+                return new ValidationResult
+                {
+                    IsValid = false,
+                    ErrorMessage = $"Chunkstore validation failed: {ex.Message}"
+                };
+            }
+        }
+
+        /// <summary>
+        /// Validates a single chunk from a chunkstore by its SHA1 hash (hex string)
+        /// </summary>
+        /// <param name="chunkstore">The chunkstore instance to read from</param>
+        /// <param name="chunkShaHex">SHA1 hash of the chunk to validate (as hex string)</param>
+        /// <param name="depotKey">Depot key for decryption (optional if chunkstore is not encrypted)</param>
+        /// <returns>ValidationResult with success status and details</returns>
+        public static ValidationResult ValidateChunkstoreChunk(Chunkstore chunkstore, string chunkShaHex, byte[] depotKey = null)
+        {
+            try
+            {
+                var chunkSha = Convert.FromHexString(chunkShaHex);
+                return ValidateChunkstoreChunk(chunkstore, chunkSha, depotKey);
+            }
+            catch (Exception ex)
+            {
+                return new ValidationResult
+                {
+                    IsValid = false,
+                    ErrorMessage = $"Invalid hex string: {ex.Message}"
+                };
+            }
+        }
+
+        /// <summary>
+        /// Validates multiple chunks from a chunkstore in parallel
+        /// </summary>
+        /// <param name="chunkstore">The chunkstore instance to read from</param>
+        /// <param name="chunkShaList">List of SHA1 hashes to validate (as hex strings)</param>
+        /// <param name="depotKey">Depot key for decryption (optional if chunkstore is not encrypted)</param>
+        /// <param name="maxParallelism">Maximum number of parallel validation operations (0 = auto-detect)</param>
+        /// <param name="progress">Optional progress callback (validated count, total count)</param>
+        /// <returns>Dictionary mapping chunk SHA1 to validation results</returns>
+        public static async Task<Dictionary<string, ValidationResult>> ValidateChunkstoreChunksAsync(
+            Chunkstore chunkstore,
+            IEnumerable<string> chunkShaList,
+            byte[] depotKey = null,
+            int maxParallelism = 0,
+            Action<int, int> progress = null)
+        {
+            if (chunkstore == null)
+            {
+                throw new ArgumentNullException(nameof(chunkstore));
+            }
+
+            if (maxParallelism <= 0)
+            {
+                maxParallelism = Math.Max(1, Environment.ProcessorCount - 1);
+            }
+
+            var results = new Dictionary<string, ValidationResult>();
+            var chunks = chunkShaList.ToList();
+            var validatedCount = 0;
+            var lockObj = new object();
+
+            var options = new ParallelOptions { MaxDegreeOfParallelism = maxParallelism };
+
+            await Parallel.ForEachAsync(chunks, options, async (chunkShaHex, ct) =>
+            {
+                await Task.Run(() =>
+                {
+                    var result = ValidateChunkstoreChunk(chunkstore, chunkShaHex, depotKey);
+
+                    lock (lockObj)
+                    {
+                        results[chunkShaHex.ToLowerInvariant()] = result;
+                        validatedCount++;
+                        progress?.Invoke(validatedCount, chunks.Count);
+                    }
+                }, ct);
+            });
+
+            return results;
+        }
+
+        /// <summary>
+        /// Validates all chunks in a chunkstore
+        /// </summary>
+        /// <param name="chunkstore">The chunkstore instance to validate</param>
+        /// <param name="depotKey">Depot key for decryption (optional if chunkstore is not encrypted)</param>
+        /// <param name="maxParallelism">Maximum number of parallel validation operations (0 = auto-detect)</param>
+        /// <param name="progress">Optional progress callback (validated count, total count)</param>
+        /// <returns>Dictionary mapping chunk SHA1 to validation results</returns>
+        public static async Task<Dictionary<string, ValidationResult>> ValidateAllChunkstoreChunksAsync(
+            Chunkstore chunkstore,
+            byte[] depotKey = null,
+            int maxParallelism = 0,
+            Action<int, int> progress = null)
+        {
+            if (chunkstore == null)
+            {
+                throw new ArgumentNullException(nameof(chunkstore));
+            }
+
+            // Get all chunk SHA1s from the chunkstore
+            var allChunks = chunkstore.EnumerateChunks().Select(c => c.Sha).ToList();
+
+            return await ValidateChunkstoreChunksAsync(chunkstore, allChunks, depotKey, maxParallelism, progress);
+        }
+
+        #endregion
+
+        #region Shared Processing Logic
 
         /// <summary>
         /// Process a chunk exactly like the Python depot_validator.py
@@ -265,86 +508,7 @@ namespace DepotDownloader
             }
         }
 
-        /// <summary>
-        /// Validates a raw chunk file using manifest chunk data
-        /// </summary>
-        /// <param name="chunkFilePath">Path to the raw chunk file</param>
-        /// <param name="chunkData">Chunk data from manifest</param>
-        /// <param name="depotKey">Depot key for decryption</param>
-        /// <returns>ValidationResult with success status and details</returns>
-        public static async Task<ValidationResult> ValidateRawChunkAsync(string chunkFilePath, DepotManifest.ChunkData chunkData, byte[] depotKey)
-        {
-            return await ValidateRawChunkAsync(chunkFilePath, depotKey, chunkData.UncompressedLength);
-        }
-
-        /// <summary>
-        /// Validates a chunk that's already decompressed (e.g., during download process)
-        /// Uses the chunk ID from the manifest as the expected SHA1
-        /// </summary>
-        /// <param name="decompressedData">The decompressed chunk data</param>
-        /// <param name="chunkData">Chunk data from manifest containing the expected SHA1</param>
-        /// <returns>ValidationResult with success status and details</returns>
-        public static ValidationResult ValidateDecompressedChunk(ReadOnlySpan<byte> decompressedData, DepotManifest.ChunkData chunkData)
-        {
-            try
-            {
-                var actualSha1 = Convert.ToHexString(SHA1.HashData(decompressedData)).ToLowerInvariant();
-                var expectedSha1 = Convert.ToHexString(chunkData.ChunkID).ToLowerInvariant();
-
-                var isValid = actualSha1 == expectedSha1;
-
-                return new ValidationResult
-                {
-                    IsValid = isValid,
-                    ActualSha1 = actualSha1,
-                    ExpectedSha1 = expectedSha1,
-                    DecompressedSize = decompressedData.Length,
-                    ErrorMessage = isValid ? null : $"SHA1 mismatch: expected {expectedSha1}, got {actualSha1}"
-                };
-            }
-            catch (Exception ex)
-            {
-                return new ValidationResult
-                {
-                    IsValid = false,
-                    ErrorMessage = $"Validation failed: {ex.Message}"
-                };
-            }
-        }
-
-        /// <summary>
-        /// Validates a chunk that's already decompressed using a hex string chunk ID
-        /// </summary>
-        /// <param name="decompressedData">The decompressed chunk data</param>
-        /// <param name="expectedChunkId">Expected SHA1 hash (hex string)</param>
-        /// <returns>ValidationResult with success status and details</returns>
-        public static ValidationResult ValidateDecompressedChunk(ReadOnlySpan<byte> decompressedData, string expectedChunkId)
-        {
-            try
-            {
-                var actualSha1 = Convert.ToHexString(SHA1.HashData(decompressedData)).ToLowerInvariant();
-                var expectedSha1 = expectedChunkId.ToLowerInvariant();
-
-                var isValid = actualSha1 == expectedSha1;
-
-                return new ValidationResult
-                {
-                    IsValid = isValid,
-                    ActualSha1 = actualSha1,
-                    ExpectedSha1 = expectedSha1,
-                    DecompressedSize = decompressedData.Length,
-                    ErrorMessage = isValid ? null : $"SHA1 mismatch: expected {expectedSha1}, got {actualSha1}"
-                };
-            }
-            catch (Exception ex)
-            {
-                return new ValidationResult
-                {
-                    IsValid = false,
-                    ErrorMessage = $"Validation failed: {ex.Message}"
-                };
-            }
-        }
+        #endregion
     }
 
     /// <summary>
