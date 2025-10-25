@@ -324,7 +324,7 @@ namespace DepotDownloader
 
         private static async Task<int> ProcessManifestCsvDownload(string[] args, string manifestCsvPath, bool rawMode, bool rawDebugJson, string rawOutput, bool rawRespectFileFilters, bool rawVerifyChunkSha1, bool rawNoSkipExisting, bool rawDryRun, string username, string password)
         {
-            PrintUnconsumedArgs(args);
+            // PrintUnconsumedArgs(args);
 
             if (InitializeSteam(username, password))
             {
@@ -588,6 +588,8 @@ namespace DepotDownloader
             var arch = GetParameter<string>(args, "-osarch");
             var language = GetParameter<string>(args, "-language");
             var lv = HasParameter(args, "-lowviolence");
+
+            PrintUnconsumedArgs(args);
 
             // Group CSV data by AppID
             var csvGroups = ReadManifestCsv(manifestCsvPath)
