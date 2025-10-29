@@ -39,6 +39,9 @@ namespace DepotDownloader
                     case "download":
                         return await DownloadCommand.RunAsync(args[1..]);
 
+                    case "list-depots": // NEW
+                        return await ListDepotsCommand.RunAsync(args[1..]);
+
                     case "validate-depot":
                     case "validate-chunk":
                     case "validate-chunkstore":
@@ -70,7 +73,7 @@ namespace DepotDownloader
                 }
             }
 
-            // Legacy mode: Check if this looks like old-style arguments
+            // Legacy mode ...
             if (HasLegacyDownloadArgs(args))
             {
                 Console.WriteLine("Warning: Using legacy argument format. Consider using the new 'download' sub-command:");
@@ -80,7 +83,6 @@ namespace DepotDownloader
                 return await DownloadCommand.RunLegacyAsync(args);
             }
 
-            // If we get here, it's an unrecognized command
             Console.WriteLine($"Unknown command: {args[0]}");
             Console.WriteLine("Use 'depotdownloader help' for usage information.");
             return 1;
@@ -101,6 +103,10 @@ namespace DepotDownloader
                     DownloadCommand.PrintUsage();
                     return 0;
 
+                case "list-depots": // NEW
+                    ListDepotsCommand.PrintUsage();
+                    return 0;
+
                 case "validate-depot":
                 case "validate-chunk":
                 case "validate-chunkstore":
@@ -119,7 +125,7 @@ namespace DepotDownloader
 
                 default:
                     Console.WriteLine($"Unknown sub-command: {subCommand}");
-                    Console.WriteLine("Available sub-commands: download, validation, reconstruct, chunkstore");
+                    Console.WriteLine("Available sub-commands: download, list-depots, validation, reconstruct, chunkstore");
                     return 1;
             }
         }
@@ -134,6 +140,7 @@ namespace DepotDownloader
             Console.WriteLine();
             Console.WriteLine("COMMANDS:");
             Console.WriteLine("  download                     Download Steam content (apps, depots, workshop items)");
+            Console.WriteLine("  list-depots                  List branches per depot from a CSV (no download)"); // NEW
             Console.WriteLine("  validate-depot               Validate all chunks in a depot directory (offline)");
             Console.WriteLine("  validate-chunk               Validate a single chunk file (offline)");
             Console.WriteLine("  validate-chunkstore          Validate all chunks in a chunkstore (offline)");
@@ -148,6 +155,7 @@ namespace DepotDownloader
             Console.WriteLine();
             Console.WriteLine("EXAMPLES:");
             Console.WriteLine("  depotdownloader download -app 4000 -depot 4001 -raw");
+            Console.WriteLine("  depotdownloader list-depots -manifest-csv manifests.csv"); // NEW example
             Console.WriteLine("  depotdownloader validate-depot depot/4001 -verbose");
             Console.WriteLine("  depotdownloader download -workshop 123456 789012");
             Console.WriteLine();
