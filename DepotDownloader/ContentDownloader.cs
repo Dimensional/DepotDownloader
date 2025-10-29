@@ -1767,13 +1767,29 @@ namespace DepotDownloader
 
             await cdnPool.UpdateServerList();
 
-            var cts = new CancellationTokenSource();
-
+            // IMPORTANT: make cancellation per-depot so one failure won't cancel the entire app or CSV batch
             foreach (var depot in infos)
             {
-                // Keep session alive between depot downloads
-                //await KeepSessionAlive(depot.AppId);
-                await ArchiveDepotRawAsync(cts, depot, outputRoot, options, workshopId, workshopName);
+                using var cts = new CancellationTokenSource();
+                try
+                {
+                    await ArchiveDepotRawAsync(cts, depot, outputRoot, options, workshopId, workshopName);
+                }
+                catch (ContentDownloaderException ex)
+                {
+                    Console.WriteLine("Warning: Skipping depot {0} manifest {1}: {2}", depot.DepotId, depot.ManifestId, ex.Message);
+                    // continue with next manifest
+                }
+                catch (OperationCanceledException ex)
+                {
+                    Console.WriteLine("Warning: Operation cancelled for depot {0} manifest {1}: {2}", depot.DepotId, depot.ManifestId, ex.Message);
+                    // continue with next manifest
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine("Warning: Unexpected error archiving depot {0} manifest {1}: {2}", depot.DepotId, depot.ManifestId, ex.Message);
+                    // continue with next manifest
+                }
             }
         }
 
@@ -2162,10 +2178,14 @@ namespace DepotDownloader
             } while (parsed == null || zipBytes == null || payloadBytes == null);
 
             if (parsed == null || zipBytes == null || payloadBytes == null)
+            //{
+            //    Console.WriteLine("\nUnable to download manifest {0} for depot {1}", depot.ManifestId, depot.DepotId);
+            //    cts.Cancel();
+            //    cts.Token.ThrowIfCancellationRequested();
+            //}
             {
-                Console.WriteLine("\nUnable to download manifest {0} for depot {1}", depot.ManifestId, depot.DepotId);
-                cts.Cancel();
-                cts.Token.ThrowIfCancellationRequested();
+                // Do NOT cancel shared operations; fail this manifest only
+                throw new ContentDownloaderException($"Unable to download manifest {depot.ManifestId} for depot {depot.DepotId}");
             }
 
             return new RawManifestResult
