@@ -331,9 +331,9 @@ namespace DepotDownloader
             return privateBeta.DepotSection;
         }
 
-        public async Task<PublishedFileDetails> GetPublishedFileDetails(uint appId, PublishedFileID pubFile)
+        public async Task<PublishedFileDetails> GetPublishedFileDetails(PublishedFileID pubFile)
         {
-            var pubFileRequest = new CPublishedFile_GetDetails_Request { appid = appId };
+            var pubFileRequest = new CPublishedFile_GetDetails_Request();
             pubFileRequest.publishedfileids.Add(pubFile);
 
             var details = await steamPublishedFile.GetDetails(pubFileRequest);

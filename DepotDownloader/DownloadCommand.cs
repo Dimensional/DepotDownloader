@@ -258,11 +258,11 @@ namespace DepotDownloader
                             {
                                 if (rawMode)
                                 {
-                                    await ContentDownloader.DownloadWorkshopItemRawAsync(0, workshopId, rawOptions).ConfigureAwait(false);
+                                    await ContentDownloader.DownloadWorkshopItemRawAsync(workshopId, rawOptions).ConfigureAwait(false);
                                 }
                                 else
                                 {
-                                    await ContentDownloader.DownloadWorkshopItemAsync(0, workshopId).ConfigureAwait(false);
+                                    await ContentDownloader.DownloadWorkshopItemAsync(workshopId).ConfigureAwait(false);
                                 }
                             }
                             catch (Exception ex)
@@ -281,11 +281,11 @@ namespace DepotDownloader
                             {
                                 if (rawMode)
                                 {
-                                    await ContentDownloader.DownloadWorkshopItemRawAsync(0, workshopId, rawOptions).ConfigureAwait(false);
+                                    await ContentDownloader.DownloadWorkshopItemRawAsync(workshopId, rawOptions).ConfigureAwait(false);
                                 }
                                 else
                                 {
-                                    await ContentDownloader.DownloadWorkshopItemAsync(0, workshopId).ConfigureAwait(false);
+                                    await ContentDownloader.DownloadWorkshopItemAsync(workshopId).ConfigureAwait(false);
                                 }
                             }
                             catch (Exception ex)

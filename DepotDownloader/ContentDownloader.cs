@@ -17,6 +17,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using SteamKit2;
 using SteamKit2.CDN;
+using SteamKit2.Internal;
 
 namespace DepotDownloader
 {
@@ -340,14 +341,14 @@ namespace DepotDownloader
             steam3.Disconnect();
         }
 
-        public static async Task DownloadPubfileAsync(uint appId, ulong publishedFileId)
+        public static async Task DownloadPubfileAsync(ulong publishedFileId)
         {
-            var details = await steam3.GetPublishedFileDetails(appId, publishedFileId);
+            var details = await steam3.GetPublishedFileDetails(publishedFileId);
 
             if (!string.IsNullOrEmpty(details?.file_url))
             {
                 // Ancient UGC - direct URL download to UGC folder
-                await DownloadWebFileToUGCAsync(appId, publishedFileId, details.filename, details.file_url, details.file_size.ToString());
+                await DownloadWebFileToUGCAsync(details.consumer_appid, publishedFileId, details.filename, details.file_url, details.file_size.ToString());
             }
             else if (details?.hcontent_file > 0)
             {
@@ -361,7 +362,7 @@ namespace DepotDownloader
             }
         }
 
-        public static async Task DownloadUGCAsync(uint appId, ulong ugcId)
+        public static async Task DownloadUGCAsync(ulong ugcId)
         {
             SteamCloud.UGCDetailsCallback details = null;
 
@@ -377,12 +378,12 @@ namespace DepotDownloader
             if (!string.IsNullOrEmpty(details?.URL))
             {
                 // Ancient UGC - direct URL download to UGC folder
-                await DownloadWebFileToUGCAsync(appId, ugcId, details.FileName, details.URL, details.FileSize.ToString());
+                await DownloadWebFileToUGCAsync(details.AppID, ugcId, details.FileName, details.URL, details.FileSize.ToString());
             }
             else
             {
                 // Modern UGC - manifest-based content
-                await DownloadAppAsync(appId, [(appId, ugcId)], DEFAULT_BRANCH, null, null, null, false, true, ugcId.ToString(), details?.FileName);
+                await DownloadAppAsync(details.AppID, [(details.AppID, ugcId)], DEFAULT_BRANCH, null, null, null, false, true, ugcId.ToString(), details?.FileName);
             }
         }
 
@@ -2535,14 +2536,14 @@ namespace DepotDownloader
             }
         }
 
-        public static async Task DownloadPubfileRawAsync(uint appId, ulong publishedFileId, RawDownloadOptions options)
+        public static async Task DownloadPubfileRawAsync(ulong publishedFileId, RawDownloadOptions options)
         {
-            var details = await steam3.GetPublishedFileDetails(appId, publishedFileId);
+            var details = await steam3.GetPublishedFileDetails(publishedFileId);
 
             if (!string.IsNullOrEmpty(details?.file_url))
             {
                 // Ancient UGC - direct URL download to UGC folder (raw mode doesn't change this)
-                await DownloadWebFileToUGCAsync(appId, publishedFileId, details.filename, details.file_url, details.file_size.ToString());
+                await DownloadWebFileToUGCAsync(details.consumer_appid, publishedFileId, details.title, details.file_url, details.file_size.ToString());
             }
             else if (details?.hcontent_file > 0)
             {
@@ -2556,40 +2557,40 @@ namespace DepotDownloader
             }
         }
 
-        public static async Task DownloadUGCRawAsync(uint appId, ulong ugcId, RawDownloadOptions options)
+        public static async Task DownloadUGCRawAsync(ulong ugcId, RawDownloadOptions options)
         {
-            SteamCloud.UGCDetailsCallback details = null;
+            PublishedFileDetails details = null;
 
             if (steam3.steamUser.SteamID.AccountType != EAccountType.AnonUser)
             {
-                details = await steam3.GetUGCDetails(ugcId);
+                details = await steam3.GetPublishedFileDetails(ugcId);
             }
             else
             {
                 Console.WriteLine($"Unable to query UGC details for {ugcId} from an anonymous account");
             }
 
-            if (!string.IsNullOrEmpty(details?.URL))
+            if (!string.IsNullOrEmpty(details?.file_url))
             {
                 // Ancient UGC - direct URL download to UGC folder (raw mode doesn't change this)
-                await DownloadWebFileToUGCAsync(appId, ugcId, details.FileName, details.URL, details.FileSize.ToString());
+                await DownloadWebFileToUGCAsync(details.consumer_appid, ugcId, details.title, details.file_url, details.file_size.ToString());
             }
             else
             {
                 // Modern UGC - manifest-based content, use raw archiving
-                await DownloadAppRawAsync(appId, [(appId, ugcId)], DEFAULT_BRANCH, null, null, null, false, options, ugcId.ToString(), details?.FileName);
+                await DownloadAppRawAsync(details.consumer_appid, [(details.consumer_appid, ugcId)], DEFAULT_BRANCH, null, null, null, false, options, ugcId.ToString(), details?.filename);
             }
         }
 
-        public static async Task DownloadWorkshopItemAsync(uint appId, ulong workshopId)
+        public static async Task DownloadWorkshopItemAsync(ulong workshopId)
         {
             // Try to get published file details first
             try
             {
-                var details = await steam3.GetPublishedFileDetails(appId, workshopId);
+                var details = await steam3.GetPublishedFileDetails(workshopId);
                 if (details != null)
                 {
-                    await DownloadPubfileAsync(appId, workshopId);
+                    await DownloadPubfileAsync(workshopId);
                     return;
                 }
             }
@@ -2599,18 +2600,18 @@ namespace DepotDownloader
             }
 
             // Try UGC if published file failed
-            await DownloadUGCAsync(appId, workshopId);
+            await DownloadUGCAsync(workshopId);
         }
 
-        public static async Task DownloadWorkshopItemRawAsync(uint appId, ulong workshopId, RawDownloadOptions options)
+        public static async Task DownloadWorkshopItemRawAsync(ulong workshopId, RawDownloadOptions options)
         {
             // Try to get published file details first
             try
             {
-                var details = await steam3.GetPublishedFileDetails(appId, workshopId);
+                var details = await steam3.GetPublishedFileDetails(workshopId);
                 if (details != null)
                 {
-                    await DownloadPubfileRawAsync(appId, workshopId, options);
+                    await DownloadPubfileRawAsync(workshopId, options);
                     return;
                 }
             }
@@ -2620,7 +2621,7 @@ namespace DepotDownloader
             }
 
             // Try UGC if published file failed
-            await DownloadUGCRawAsync(appId, workshopId, options);
+            await DownloadUGCRawAsync(workshopId, options);
         }
 
         // Add simple session keepalive for long operations
