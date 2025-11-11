@@ -117,7 +117,10 @@ depotdownloader download -manifest-csv manifests.csv -branch dev
 ```
 
 #### 3. Workshop Downloading
-Download Steam Workshop items.
+Download Steam Workshop items. Provide the ID directly or via a CSV file.
+Workshop ID is located in the URL of the workshop item.
+Example: https://steamcommunity.com/sharedfiles/filedetails/?id=2956730580
+ID = 2956730580
 
 ```bash
 depotdownloader download -workshop <id> [<id>...] [OPTIONS...]
