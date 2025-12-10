@@ -268,6 +268,9 @@ namespace DepotDownloader
                     Console.WriteLine($"Error: Password was invalid for branch {branch} (or the branch does not exist)");
                     return INVALID_MANIFEST_ID;
                 }
+
+                // Save the branch key to disk for potential reuse with encrypted manifests
+                await SaveBranchKeyToDiskAsync(depotId, branch);
             }
 
             // Got the password, request private depot section
@@ -2649,5 +2652,35 @@ namespace DepotDownloader
                 }
             }
         }
+
+        private static async Task SaveBranchKeyToDiskAsync(uint depotId, string branch)
+        {
+            if (!steam3.AppBetaPasswords.TryGetValue(branch, out var keyBytes))
+                return;
+
+            try
+            {
+                var depotRoot = Path.Combine("depot", depotId.ToString());
+                Directory.CreateDirectory(depotRoot);
+
+                var branchKeyName = $"{SanitizeFilename(branch)}.branchkey";
+                var branchKeyPath = Path.Combine(depotRoot, branchKeyName);
+
+                await File.WriteAllBytesAsync(branchKeyPath, keyBytes);
+                Console.WriteLine("Saved branch key for '{0}' to {1}", branch, branchKeyName);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine("Warning: Failed to save branch key for '{0}': {1}", branch, ex.Message);
+            }
+        }
+
+        private static string SanitizeFilename(string name)
+        {
+            foreach (var ch in Path.GetInvalidFileNameChars())
+                name = name.Replace(ch, '_');
+            return name;
+        }
+
     }
 }
