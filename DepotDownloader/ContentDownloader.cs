@@ -1823,7 +1823,7 @@ namespace DepotDownloader
 
             if (!string.IsNullOrWhiteSpace(depot.Branch))
             {
-                var branchKeyName = $"{Sanitize(depot.Branch)}_Password.branchkey";
+                var branchKeyName = $"{Sanitize(depot.Branch)}.branchkey";
                 var branchKeyPath = Path.Combine(depotRoot, branchKeyName);
                 if (File.Exists(branchKeyPath) && !steam3.AppBetaPasswords.ContainsKey(depot.Branch))
                 {
@@ -1848,7 +1848,7 @@ namespace DepotDownloader
                     await steam3.CheckAppBetaPassword(depot.AppId, Config.BetaPassword);
                     if (steam3.AppBetaPasswords.TryGetValue(depot.Branch, out var keyBytes))
                     {
-                        var branchKeyName = $"{Sanitize(depot.Branch)}_Password.branchkey";
+                        var branchKeyName = $"{Sanitize(depot.Branch)}.branchkey";
                         var branchKeyPath = Path.Combine(depotRoot, branchKeyName);
                         await File.WriteAllBytesAsync(branchKeyPath, keyBytes, cts.Token);
                         Console.WriteLine("Saved branch key for '{0}' to {1}", depot.Branch, branchKeyName);
@@ -2465,7 +2465,7 @@ namespace DepotDownloader
 
                 // Branch key file lives at raw depot root: depot/{depotId}/
                 var depotRoot = Path.Combine("depot", depotId.ToString());
-                var branchKeyName = $"{Sanitize(branch)}_Password.branchkey";
+                var branchKeyName = $"{Sanitize(branch)}.branchkey";
                 var branchKeyPath = Path.Combine(depotRoot, branchKeyName);
                 if (File.Exists(branchKeyPath))
                 {
@@ -2503,7 +2503,7 @@ namespace DepotDownloader
 
                 if (!steam3.AppBetaPasswords.TryGetValue(branch, out var keyBytes))
                 {
-                    throw new ContentDownloaderException($"No branch key available for '{branch}'. Provide -branchpassword or place {Sanitize(branch)}_Password.branchkey next to the depot.");
+                    throw new ContentDownloaderException($"No branch key available for '{branch}'. Provide -branchpassword or place {Sanitize(branch)}.branchkey next to the depot.");
                 }
 
                 // Encrypted manifest IDs are hex strings, decrypt with AES-256-ECB using branch key

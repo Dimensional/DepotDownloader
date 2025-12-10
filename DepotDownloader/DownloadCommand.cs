@@ -446,10 +446,10 @@ namespace DepotDownloader
                 depotManifestIds.AddRange(depotIdList.Select(depotId => (depotId, ContentDownloader.INVALID_MANIFEST_ID)));
             }
 
-            // Process encrypted manifest ids if provided; resolve them to decrypted gids using current -branch
+            // Parse -manifest-enc parameters before initializing Steam
+            List<(uint depotId, string enc)> encPairs = null;
             if (manifestEncList.Count > 0)
             {
-                List<(uint depotId, string enc)> encPairs;
                 if (depotIdList.Count == manifestEncList.Count)
                 {
                     encPairs = depotIdList.Zip(manifestEncList, (d, e) => (d, e)).ToList();
@@ -463,19 +463,6 @@ namespace DepotDownloader
                     Console.WriteLine("Error: -manifest-enc requires either one id for every -depot specified, or a single -depot with multiple -manifest-enc ids.");
                     return 1;
                 }
-
-                // Resolve encrypted gids to decrypted manifest ids
-                var outputRootForKeys = rawMode ? (rawOutput ?? ContentDownloader.Config.InstallDirectory) : ContentDownloader.Config.InstallDirectory;
-                try
-                {
-                    var resolved = await ContentDownloader.ResolveEncryptedManifestIdsAsync(appId, encPairs, branch, outputRootForKeys).ConfigureAwait(false);
-                    depotManifestIds.AddRange(resolved);
-                }
-                catch (Exception ex)
-                {
-                    Console.WriteLine("Error resolving -manifest-enc ids: {0}", ex.Message);
-                    return 1;
-                }
             }
 
             PrintUnconsumedArgs(args);
@@ -484,6 +471,22 @@ namespace DepotDownloader
             {
                 try
                 {
+                    // Resolve encrypted manifest ids AFTER Steam is initialized
+                    if (encPairs != null)
+                    {
+                        var outputRootForKeys = rawMode ? (rawOutput ?? ContentDownloader.Config.InstallDirectory) : ContentDownloader.Config.InstallDirectory;
+                        try
+                        {
+                            var resolved = await ContentDownloader.ResolveEncryptedManifestIdsAsync(appId, encPairs, branch, outputRootForKeys).ConfigureAwait(false);
+                            depotManifestIds.AddRange(resolved);
+                        }
+                        catch (Exception ex)
+                        {
+                            Console.WriteLine("Error resolving -manifest-enc ids: {0}", ex.Message);
+                            return 1;
+                        }
+                    }
+
                     if (rawMode)
                     {
                         var rawOptions = new ContentDownloader.RawDownloadOptions
