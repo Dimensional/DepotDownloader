@@ -241,7 +241,8 @@ namespace DepotDownloader
             if (manifests.Children.Count == 0)
                 return INVALID_MANIFEST_ID;
 
-            var node = manifests[branch]["gid"];
+            var branchNode = manifests[branch];
+            var node = branchNode["gid"];
 
             // Non passworded branch, found the manifest
             if (node.Value != null)
@@ -252,6 +253,13 @@ namespace DepotDownloader
                 return INVALID_MANIFEST_ID;
 
             // Either the branch just doesn't exist, or it has a password
+            // Check if there's an encrypted manifest ID we can display (from public section)
+            var encryptedGidNode = branchNode["encrypted_gid_2"];
+            if (encryptedGidNode != KeyValue.Invalid && !string.IsNullOrEmpty(encryptedGidNode.Value))
+            {
+                Console.WriteLine("Depot {0} branch '{1}' has encrypted manifest ID: {2}", depotId, branch, encryptedGidNode.Value);
+            }
+
             if (string.IsNullOrEmpty(Config.BetaPassword))
             {
                 Console.WriteLine($"Branch {branch} for depot {depotId} was not found, either it does not exist or it has a password.");
@@ -288,7 +296,16 @@ namespace DepotDownloader
             if (manifests.Children.Count == 0)
                 return INVALID_MANIFEST_ID;
 
-            node = manifests[branch]["gid"];
+            branchNode = manifests[branch];
+
+            // Display encrypted manifest ID from private section if available
+            encryptedGidNode = branchNode["encrypted_gid_2"];
+            if (encryptedGidNode != KeyValue.Invalid && !string.IsNullOrEmpty(encryptedGidNode.Value))
+            {
+                Console.WriteLine("Depot {0} branch '{1}' has encrypted manifest ID: {2}", depotId, branch, encryptedGidNode.Value);
+            }
+
+            node = branchNode["gid"];
 
             if (node.Value == null)
                 return INVALID_MANIFEST_ID;
@@ -2474,7 +2491,6 @@ namespace DepotDownloader
                         var keyBytes = await File.ReadAllBytesAsync(branchKeyPath);
                         steam3.AppBetaPasswords[branch] = keyBytes;
                         Console.WriteLine("Loaded branch key for '{0}' from {1}", branch, branchKeyName);
-                        return;
                     }
                     catch (Exception ex)
                     {
@@ -2665,6 +2681,13 @@ namespace DepotDownloader
 
                 var branchKeyName = $"{SanitizeFilename(branch)}.branchkey";
                 var branchKeyPath = Path.Combine(depotRoot, branchKeyName);
+
+                // Skip if branch key already exists
+                if (File.Exists(branchKeyPath))
+                {
+                    Console.WriteLine("Branch key for '{0}' already exists at {1}", branch, branchKeyName);
+                    return;
+                }
 
                 await File.WriteAllBytesAsync(branchKeyPath, keyBytes);
                 Console.WriteLine("Saved branch key for '{0}' to {1}", branch, branchKeyName);
