@@ -9,22 +9,24 @@ This program must be run from a console, it has no GUI.
 
 ### Directly from GitHub
 
-Download a binary from [the releases page](https://github.com/SteamRE/DepotDownloader/releases/latest).
+~~Download a binary from [the releases page](https://github.com/SteamRE/DepotDownloader/releases/latest).~~
 
 ### via Windows Package Manager CLI (aka winget)
 
-On Windows, [winget](https://github.com/microsoft/winget-cli) users can download and install
+~~On Windows, [winget](https://github.com/microsoft/winget-cli) users can download and install
 the latest Terminal release by installing the `SteamRE.DepotDownloader`
-package:
+package:~~
 
+**NOT FOR THIS FORK**
 ```powershell
 winget install --exact --id SteamRE.DepotDownloader
 ```
 
 ### via Homebrew
 
-On macOS, [Homebrew](https://brew.sh) users can download and install the latest release by running the following commands:
+~~On macOS, [Homebrew](https://brew.sh) users can download and install the latest release by running the following commands:~~
 
+**NOT FOR THIS FORK**
 ```shell
 brew tap steamre/tools
 brew install depotdownloader
