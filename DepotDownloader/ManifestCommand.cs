@@ -1,0 +1,999 @@
+// This file is subject to the terms and conditions defined
+// in file 'LICENSE', which is part of this source code package.
+
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.IO.Compression;
+using System.Linq;
+using System.Security.Cryptography;
+using System.Text.Json;
+using System.Threading.Tasks;
+using SteamKit2;
+
+namespace DepotDownloader
+{
+    /// <summary>
+    /// Manifest command handler for offline manifest operations
+    /// </summary>
+    public static class ManifestCommand
+    {
+        // JSON model matching the debug format from BuildManifestDebugModel
+        private class DebugManifestJson
+        {
+            public uint depot_id { get; set; }
+            public ulong gid { get; set; }
+            public DateTime creation_time { get; set; }
+            public bool filenames_encrypted { get; set; }
+            public int version { get; set; }
+            public ulong total_uncompressed_size { get; set; }
+            public ulong total_compressed_size { get; set; }
+            public List<FileMapping> mappings { get; set; }
+
+            public class FileMapping
+            {
+                public string encryptedName { get; set; }
+                public string decryptedName { get; set; }
+                public ulong size { get; set; }
+                public int flags { get; set; }
+                public string sha_content { get; set; }
+                public string sha_filename { get; set; }
+                public List<ChunkInfo> chunks { get; set; }
+            }
+
+            public class ChunkInfo
+            {
+                public string sha { get; set; }
+                public uint crc { get; set; }
+                public ulong offset { get; set; }
+                public uint cb_compressed { get; set; }
+                public uint cb_original { get; set; }
+            }
+        }
+
+        // Unified manifest representation for comparison
+        private class ManifestData
+        {
+            public uint DepotId { get; set; }
+            public ulong ManifestId { get; set; }
+            public DateTime CreationTime { get; set; }
+            public ulong TotalUncompressedSize { get; set; }
+            public ulong TotalCompressedSize { get; set; }
+            public List<FileEntry> Files { get; set; }
+
+            public class FileEntry
+            {
+                public string FileName { get; set; }
+                public ulong Size { get; set; }
+                public string Hash { get; set; }
+                public int Flags { get; set; }
+                public List<ChunkEntry> Chunks { get; set; }
+            }
+
+            public class ChunkEntry
+            {
+                public string ChunkId { get; set; }
+                public uint Checksum { get; set; }
+                public ulong Offset { get; set; }
+                public uint CompressedLength { get; set; }
+                public uint UncompressedLength { get; set; }
+            }
+        }
+
+        /// <summary>
+        /// Load a manifest from any supported format and convert to unified representation
+        /// </summary>
+        private static async Task<ManifestData> LoadManifestFromAnyFormat(string filePath, byte[] depotKey = null)
+        {
+            var extension = Path.GetExtension(filePath).ToLowerInvariant();
+
+            // JSON format
+            if (extension == ".json")
+            {
+                var jsonText = await File.ReadAllTextAsync(filePath);
+                var debugJson = JsonSerializer.Deserialize<DebugManifestJson>(jsonText);
+
+                return new ManifestData
+                {
+                    DepotId = debugJson.depot_id,
+                    ManifestId = debugJson.gid,
+                    CreationTime = debugJson.creation_time,
+                    TotalUncompressedSize = debugJson.total_uncompressed_size,
+                    TotalCompressedSize = debugJson.total_compressed_size,
+                    Files = debugJson.mappings.Select(m => new ManifestData.FileEntry
+                    {
+                        FileName = m.decryptedName,
+                        Size = m.size,
+                        Hash = m.sha_content,
+                        Flags = m.flags,
+                        Chunks = m.chunks?.Select(c => new ManifestData.ChunkEntry
+                        {
+                            ChunkId = c.sha,
+                            Checksum = c.crc,
+                            Offset = c.offset,
+                            CompressedLength = c.cb_compressed,
+                            UncompressedLength = c.cb_original
+                        }).ToList() ?? new List<ManifestData.ChunkEntry>()
+                    }).ToList()
+                };
+            }
+
+            // Compressed manifest format (.manif4, .manif5)
+            if (extension == ".manif4" || extension == ".manif5")
+            {
+                if (depotKey == null || depotKey.Length == 0)
+                {
+                    throw new Exception("Depot key is required to decrypt .manif4/.manif5 files. Use -depotkey or ensure depot key file exists.");
+                }
+
+                var zipBytes = await File.ReadAllBytesAsync(filePath);
+                var manifest = ParseManifestZipBytes(zipBytes, depotKey);
+
+                return ConvertDepotManifestToData(manifest);
+            }
+
+            // Decrypted binary manifest format (.manifest)
+            if (extension == ".manifest")
+            {
+                var manifest = DepotManifest.LoadFromFile(filePath);
+                return ConvertDepotManifestToData(manifest);
+            }
+
+            throw new Exception($"Unsupported manifest format: {extension}. Supported: .json, .manifest, .manif4, .manif5");
+        }
+
+        /// <summary>
+        /// Parse compressed manifest zip bytes (same as ContentDownloader logic)
+        /// </summary>
+        private static DepotManifest ParseManifestZipBytes(byte[] zipBytes, byte[] depotKey)
+        {
+            byte[] payloadBytes;
+
+            using (var msZip = new MemoryStream(zipBytes, writable: false))
+            using (var zip = new ZipArchive(msZip, ZipArchiveMode.Read, leaveOpen: false))
+            {
+                if (zip.Entries.Count == 0)
+                    throw new InvalidDataException("Manifest zip did not contain any entries");
+
+                using var entryStream = zip.Entries[0].Open();
+                using var msPayload = new MemoryStream();
+                entryStream.CopyTo(msPayload);
+                payloadBytes = msPayload.ToArray();
+            }
+
+            DepotManifest parsed;
+            using (var ms = new MemoryStream(payloadBytes, writable: false))
+            {
+                parsed = DepotManifest.Deserialize(ms);
+            }
+
+            if (depotKey != null && depotKey.Length > 0)
+            {
+                try
+                {
+                    parsed.DecryptFilenames(depotKey);
+                }
+                catch (Exception ex)
+                {
+                    throw new Exception($"Failed to decrypt filenames: {ex.Message}");
+                }
+            }
+
+            return parsed;
+        }
+
+        /// <summary>
+        /// Convert DepotManifest to our unified format
+        /// </summary>
+        private static ManifestData ConvertDepotManifestToData(DepotManifest manifest)
+        {
+            return new ManifestData
+            {
+                DepotId = manifest.DepotID,
+                ManifestId = manifest.ManifestGID,
+                CreationTime = manifest.CreationTime,
+                TotalUncompressedSize = manifest.TotalUncompressedSize,
+                TotalCompressedSize = manifest.TotalCompressedSize,
+                Files = manifest.Files.Select(f => new ManifestData.FileEntry
+                {
+                    FileName = f.FileName,
+                    Size = f.TotalSize,
+                    Hash = f.FileHash != null ? BitConverter.ToString(f.FileHash).Replace("-", "").ToLowerInvariant() : null,
+                    Flags = (int)f.Flags,
+                    Chunks = f.Chunks.Select(c => new ManifestData.ChunkEntry
+                    {
+                        ChunkId = BitConverter.ToString(c.ChunkID).Replace("-", "").ToLowerInvariant(),
+                        Checksum = c.Checksum,
+                        Offset = c.Offset,
+                        CompressedLength = c.CompressedLength,
+                        UncompressedLength = c.UncompressedLength
+                    }).ToList()
+                }).ToList()
+            };
+        }
+
+        /// <summary>
+        /// Run manifest command with sub-command syntax
+        /// </summary>
+        public static async Task<int> RunAsync(string[] args)
+        {
+            if (args.Length == 0)
+            {
+                PrintUsage();
+                return 1;
+            }
+
+            var operation = args[0].ToLowerInvariant();
+
+            try
+            {
+                switch (operation)
+                {
+                    case "extract":
+                        return await ExtractCommand(args[1..]);
+
+                    case "diff":
+                    case "compare":
+                        return await DiffCommand(args[1..]);
+
+                    default:
+                        Console.WriteLine($"Unknown manifest operation: {operation}");
+                        Console.WriteLine("Available operations: extract, diff");
+                        Console.WriteLine("Use 'depotdownloader help manifest' for detailed usage.");
+                        return 1;
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error: {ex.Message}");
+                return 1;
+            }
+        }
+
+        private static async Task<int> ExtractCommand(string[] args)
+        {
+            if (args.Length == 0)
+            {
+                Console.WriteLine("Usage: depotdownloader manifest extract <manifest-file> [OPTIONS...]");
+                Console.WriteLine();
+                Console.WriteLine("Extracts encrypted/binary manifests to readable JSON format.");
+                Console.WriteLine();
+                Console.WriteLine("OPTIONS:");
+                Console.WriteLine("  -manifest <file>         Manifest file path (alternative to positional)");
+                Console.WriteLine("  -depot <id>              Depot ID (for .manif4/.manif5 key lookup)");
+                Console.WriteLine("  -depotkey <hex>          Depot decryption key in hex (for .manif4/.manif5)");
+                Console.WriteLine("  -depotkey-file <path>    Path to depot key file (for .manif4/.manif5)");
+                Console.WriteLine("  -output <file>           Output JSON file path (default: <manifest-file>.json)");
+                Console.WriteLine();
+                Console.WriteLine("SUPPORTED INPUT FORMATS:");
+                Console.WriteLine("  .manifest       - Decrypted binary manifest");
+                Console.WriteLine("  .manif4/.manif5 - Compressed encrypted manifest (requires depot key)");
+                Console.WriteLine();
+                Console.WriteLine("EXAMPLES:");
+                Console.WriteLine("  depotdownloader manifest extract 848452_123456.manifest -output debug.json");
+                Console.WriteLine("  depotdownloader manifest extract 123456.manif5 -depot 848452");
+                Console.WriteLine("  depotdownloader manifest extract 123456.manif5 -depotkey ABCD1234...");
+                Console.WriteLine("  depotdownloader manifest extract 123456.manif5 -depotkey-file my-keys/848452.key");
+                return 1;
+            }
+
+            string manifestFile = null;
+            string outputFile = null;
+            uint? depotId = null;
+            string depotKeyHex = null;
+            string depotKeyFile = null;
+
+            // Check for positional argument first
+            if (!args[0].StartsWith('-'))
+            {
+                manifestFile = args[0];
+            }
+
+            // Parse named arguments
+            for (int i = 0; i < args.Length; i++)
+            {
+                switch (args[i].ToLowerInvariant())
+                {
+                    case "-manifest":
+                        if (i + 1 < args.Length)
+                        {
+                            manifestFile = args[i + 1];
+                            i++;
+                        }
+                        break;
+                    case "-output":
+                        if (i + 1 < args.Length)
+                        {
+                            outputFile = args[i + 1];
+                            i++;
+                        }
+                        break;
+                    case "-depot":
+                        if (i + 1 < args.Length && uint.TryParse(args[i + 1], out var depot))
+                        {
+                            depotId = depot;
+                            i++;
+                        }
+                        break;
+                    case "-depotkey":
+                        if (i + 1 < args.Length)
+                        {
+                            depotKeyHex = args[i + 1];
+                            i++;
+                        }
+                        break;
+                    case "-depotkey-file":
+                        if (i + 1 < args.Length)
+                        {
+                            depotKeyFile = args[i + 1];
+                            i++;
+                        }
+                        break;
+                }
+            }
+
+            if (string.IsNullOrEmpty(manifestFile))
+            {
+                Console.WriteLine("Error: No manifest file specified");
+                return 1;
+            }
+
+            if (!File.Exists(manifestFile))
+            {
+                Console.WriteLine($"Error: Manifest file not found: {manifestFile}");
+                return 1;
+            }
+
+            // Load depot key if needed for .manif4/.manif5 files
+            byte[] depotKey = null;
+            var extension = Path.GetExtension(manifestFile).ToLowerInvariant();
+            if (extension == ".manif4" || extension == ".manif5")
+            {
+                // Priority: 1) -depotkey (hex string), 2) -depotkey-file (custom path), 3) auto-detect + standard path
+                if (!string.IsNullOrEmpty(depotKeyHex))
+                {
+                    try
+                    {
+                        depotKey = Convert.FromHexString(depotKeyHex);
+                        Console.WriteLine("Using provided depot key (hex)");
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine($"Error: Invalid depot key hex: {ex.Message}");
+                        return 1;
+                    }
+                }
+                else if (!string.IsNullOrEmpty(depotKeyFile))
+                {
+                    if (File.Exists(depotKeyFile))
+                    {
+                        try
+                        {
+                            depotKey = await File.ReadAllBytesAsync(depotKeyFile);
+                            Console.WriteLine($"Loaded depot key from: {depotKeyFile}");
+                        }
+                        catch (Exception ex)
+                        {
+                            Console.WriteLine($"Error reading depot key file: {ex.Message}");
+                            return 1;
+                        }
+                    }
+                    else
+                    {
+                        Console.WriteLine($"Error: Depot key file not found: {depotKeyFile}");
+                        return 1;
+                    }
+                }
+                else
+                {
+                    // Try to auto-detect depot ID from file path (e.g., depot/848452/manifest/...)
+                    if (!depotId.HasValue)
+                    {
+                        var fullPath = Path.GetFullPath(manifestFile);
+                        var pathParts = fullPath.Split(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+
+                        // Look for "depot" folder followed by a numeric ID
+                        for (int i = 0; i < pathParts.Length - 1; i++)
+                        {
+                            if (pathParts[i].Equals("depot", StringComparison.OrdinalIgnoreCase) && 
+                                uint.TryParse(pathParts[i + 1], out var detectedDepotId))
+                            {
+                                depotId = detectedDepotId;
+                                Console.WriteLine($"Auto-detected depot ID from path: {depotId}");
+                                break;
+                            }
+                        }
+                    }
+
+                    if (depotId.HasValue)
+                    {
+                        var depotKeyPath = Path.Combine("depot", depotId.Value.ToString(), $"{depotId.Value}.depotkey");
+                        if (File.Exists(depotKeyPath))
+                        {
+                            try
+                            {
+                                depotKey = await File.ReadAllBytesAsync(depotKeyPath);
+                                Console.WriteLine($"Loaded depot key from: {depotKeyPath}");
+                            }
+                            catch (Exception ex)
+                            {
+                                Console.WriteLine($"Error reading depot key: {ex.Message}");
+                                return 1;
+                            }
+                        }
+                        else
+                        {
+                            Console.WriteLine($"Error: Depot key file not found: {depotKeyPath}");
+                            Console.WriteLine("Provide depot key using -depotkey <hex>, -depotkey-file <path>, or ensure depot key file exists");
+                            return 1;
+                        }
+                    }
+                    else
+                    {
+                        Console.WriteLine("Error: Could not determine depot ID from file path.");
+                        Console.WriteLine(".manif4/.manif5 files require -depot <id>, -depotkey <hex>, or -depotkey-file <path>");
+                        return 1;
+                    }
+                }
+            }
+
+            // Default output file
+            if (string.IsNullOrEmpty(outputFile))
+            {
+                outputFile = Path.ChangeExtension(manifestFile, ".extracted.json");
+            }
+
+            Console.WriteLine($"Loading manifest from: {manifestFile}");
+
+            // Load the manifest
+            ManifestData manifest;
+            try
+            {
+                manifest = await LoadManifestFromAnyFormat(manifestFile, depotKey);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error loading manifest: {ex.Message}");
+                return 1;
+            }
+
+            Console.WriteLine($"Manifest ID: {manifest.ManifestId}");
+            Console.WriteLine($"Depot ID: {manifest.DepotId}");
+            Console.WriteLine($"Creation Time: {manifest.CreationTime}");
+            Console.WriteLine($"Total Files: {manifest.Files.Count}");
+
+            // Build JSON structure
+            var manifestData = new
+            {
+                ManifestId = manifest.ManifestId,
+                DepotId = manifest.DepotId,
+                CreationTime = manifest.CreationTime,
+                TotalUncompressedSize = manifest.TotalUncompressedSize,
+                TotalCompressedSize = manifest.TotalCompressedSize,
+                TotalFiles = manifest.Files.Count,
+                Files = manifest.Files.Select(f => new
+                {
+                    FileName = f.FileName,
+                    Size = f.Size,
+                    Flags = f.Flags,
+                    Hash = f.Hash,
+                    ChunkCount = f.Chunks.Count,
+                    Chunks = f.Chunks.Select(c => new
+                    {
+                        ChunkId = c.ChunkId,
+                        Checksum = c.Checksum,
+                        Offset = c.Offset,
+                        CompressedLength = c.CompressedLength,
+                        UncompressedLength = c.UncompressedLength
+                    }).ToList()
+                }).ToList()
+            };
+
+            // Serialize to JSON (always prettified)
+            var options = new JsonSerializerOptions
+            {
+                WriteIndented = true,
+                PropertyNamingPolicy = JsonNamingPolicy.CamelCase
+            };
+
+            await File.WriteAllTextAsync(outputFile, JsonSerializer.Serialize(manifestData, options));
+
+            Console.WriteLine($"Manifest extracted to: {outputFile}");
+            Console.WriteLine("Done!");
+
+            return 0;
+        }
+
+        private static async Task<int> DiffCommand(string[] args)
+        {
+            if (args.Length < 2 && !args.Any(a => a.Equals("-old", StringComparison.OrdinalIgnoreCase)))
+            {
+                Console.WriteLine("Usage: depotdownloader manifest diff <old-manifest> <new-manifest> [OPTIONS...]");
+                Console.WriteLine("   or: depotdownloader manifest diff -old <file> -new <file> [OPTIONS...]");
+                Console.WriteLine();
+                Console.WriteLine("Compares two manifests and displays differences to console.");
+                Console.WriteLine();
+                Console.WriteLine("OPTIONS:");
+                Console.WriteLine("  -old <file>              Old/original manifest file");
+                Console.WriteLine("  -new <file>              New/updated manifest file");
+                Console.WriteLine("  -depot <id>              Depot ID (for .manif4/.manif5 key lookup)");
+                Console.WriteLine("  -depotkey <hex>          Depot decryption key in hex (for .manif4/.manif5)");
+                Console.WriteLine("  -depotkey-file <path>    Path to depot key file (for .manif4/.manif5)");
+                Console.WriteLine("  -verbose, -v             Show detailed list of all file changes");
+                Console.WriteLine("  -output <file>           Save detailed diff as JSON file (optional)");
+                Console.WriteLine();
+                Console.WriteLine("SUPPORTED INPUT FORMATS:");
+                Console.WriteLine("  .json           - Extracted debug JSON");
+                Console.WriteLine("  .manifest       - Decrypted binary manifest");
+                Console.WriteLine("  .manif4/.manif5 - Compressed encrypted manifest (requires depot key)");
+                Console.WriteLine();
+                Console.WriteLine("EXAMPLES:");
+                Console.WriteLine("  depotdownloader manifest diff old.json new.json");
+                Console.WriteLine("  depotdownloader manifest diff old.json new.json -verbose");
+                Console.WriteLine("  depotdownloader manifest diff v1.manif5 v2.manif5 -depot 848452");
+                Console.WriteLine("  depotdownloader manifest diff -old v1.manif5 -new v2.manif5 -depotkey ABCD1234... -output changes.json");
+                Console.WriteLine("  depotdownloader manifest diff v1.manif5 v2.manif5 -depotkey-file my-keys/848452.key");
+                return 1;
+            }
+
+            string oldManifestFile = null;
+            string newManifestFile = null;
+            string outputFile = null;
+            uint? depotId = null;
+            string depotKeyHex = null;
+            string depotKeyFile = null;
+            bool verbose = false;
+
+            // Check for positional arguments first
+            int positionalIndex = 0;
+            for (int i = 0; i < args.Length && positionalIndex < 2; i++)
+            {
+                if (!args[i].StartsWith('-'))
+                {
+                    if (positionalIndex == 0)
+                        oldManifestFile = args[i];
+                    else if (positionalIndex == 1)
+                        newManifestFile = args[i];
+                    positionalIndex++;
+                }
+            }
+
+            // Parse named arguments
+            for (int i = 0; i < args.Length; i++)
+            {
+                switch (args[i].ToLowerInvariant())
+                {
+                    case "-old":
+                        if (i + 1 < args.Length)
+                        {
+                            oldManifestFile = args[i + 1];
+                            i++;
+                        }
+                        break;
+                    case "-new":
+                        if (i + 1 < args.Length)
+                        {
+                            newManifestFile = args[i + 1];
+                            i++;
+                        }
+                        break;
+                    case "-output":
+                        if (i + 1 < args.Length)
+                        {
+                            outputFile = args[i + 1];
+                            i++;
+                        }
+                        break;
+                    case "-depot":
+                        if (i + 1 < args.Length && uint.TryParse(args[i + 1], out var depot))
+                        {
+                            depotId = depot;
+                            i++;
+                        }
+                        break;
+                    case "-depotkey":
+                        if (i + 1 < args.Length)
+                        {
+                            depotKeyHex = args[i + 1];
+                            i++;
+                        }
+                        break;
+                    case "-depotkey-file":
+                        if (i + 1 < args.Length)
+                        {
+                            depotKeyFile = args[i + 1];
+                            i++;
+                        }
+                        break;
+                    case "-verbose":
+                    case "-v":
+                        verbose = true;
+                        break;
+                }
+            }
+
+            if (string.IsNullOrEmpty(oldManifestFile) || string.IsNullOrEmpty(newManifestFile))
+            {
+                Console.WriteLine("Error: Both old and new manifest files must be specified");
+                return 1;
+            }
+
+            if (!File.Exists(oldManifestFile))
+            {
+                Console.WriteLine($"Error: Old manifest file not found: {oldManifestFile}");
+                return 1;
+            }
+
+            if (!File.Exists(newManifestFile))
+            {
+                Console.WriteLine($"Error: New manifest file not found: {newManifestFile}");
+                return 1;
+            }
+
+            // Load depot key if needed for .manif4/.manif5 files
+            byte[] depotKey = null;
+            var oldExt = Path.GetExtension(oldManifestFile).ToLowerInvariant();
+            var newExt = Path.GetExtension(newManifestFile).ToLowerInvariant();
+            bool needsKey = oldExt == ".manif4" || oldExt == ".manif5" || newExt == ".manif4" || newExt == ".manif5";
+
+            if (needsKey)
+            {
+                // Priority: 1) -depotkey (hex string), 2) -depotkey-file (custom path), 3) auto-detect + standard path
+                if (!string.IsNullOrEmpty(depotKeyHex))
+                {
+                    try
+                    {
+                        depotKey = Convert.FromHexString(depotKeyHex);
+                        Console.WriteLine("Using provided depot key (hex)");
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine($"Error: Invalid depot key hex: {ex.Message}");
+                        return 1;
+                    }
+                }
+                else if (!string.IsNullOrEmpty(depotKeyFile))
+                {
+                    if (File.Exists(depotKeyFile))
+                    {
+                        try
+                        {
+                            depotKey = await File.ReadAllBytesAsync(depotKeyFile);
+                            Console.WriteLine($"Loaded depot key from: {depotKeyFile}");
+                        }
+                        catch (Exception ex)
+                        {
+                            Console.WriteLine($"Error reading depot key file: {ex.Message}");
+                            return 1;
+                        }
+                    }
+                    else
+                    {
+                        Console.WriteLine($"Error: Depot key file not found: {depotKeyFile}");
+                        return 1;
+                    }
+                }
+                else
+                {
+                    // Try to auto-detect depot ID from file paths (e.g., depot/848452/manifest/...)
+                    if (!depotId.HasValue)
+                    {
+                        // Check old manifest path first
+                        var fullPath = Path.GetFullPath(oldManifestFile);
+                        var pathParts = fullPath.Split(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+
+                        // Look for "depot" folder followed by a numeric ID
+                        for (int i = 0; i < pathParts.Length - 1; i++)
+                        {
+                            if (pathParts[i].Equals("depot", StringComparison.OrdinalIgnoreCase) && 
+                                uint.TryParse(pathParts[i + 1], out var detectedDepotId))
+                            {
+                                depotId = detectedDepotId;
+                                Console.WriteLine($"Auto-detected depot ID from path: {depotId}");
+                                break;
+                            }
+                        }
+
+                        // If not found in old path, check new manifest path
+                        if (!depotId.HasValue)
+                        {
+                            fullPath = Path.GetFullPath(newManifestFile);
+                            pathParts = fullPath.Split(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+
+                            for (int i = 0; i < pathParts.Length - 1; i++)
+                            {
+                                if (pathParts[i].Equals("depot", StringComparison.OrdinalIgnoreCase) && 
+                                    uint.TryParse(pathParts[i + 1], out var detectedDepotId))
+                                {
+                                    depotId = detectedDepotId;
+                                    Console.WriteLine($"Auto-detected depot ID from path: {depotId}");
+                                    break;
+                                }
+                            }
+                        }
+                    }
+
+                    if (depotId.HasValue)
+                    {
+                        var depotKeyPath = Path.Combine("depot", depotId.Value.ToString(), $"{depotId.Value}.depotkey");
+                        if (File.Exists(depotKeyPath))
+                        {
+                            try
+                            {
+                                depotKey = await File.ReadAllBytesAsync(depotKeyPath);
+                                Console.WriteLine($"Loaded depot key from: {depotKeyPath}");
+                            }
+                            catch (Exception ex)
+                            {
+                                Console.WriteLine($"Error reading depot key: {ex.Message}");
+                                return 1;
+                            }
+                        }
+                        else
+                        {
+                            Console.WriteLine($"Error: Depot key file not found: {depotKeyPath}");
+                            Console.WriteLine("Provide depot key using -depotkey <hex>, -depotkey-file <path>, or ensure depot key file exists");
+                            return 1;
+                        }
+                    }
+                    else
+                    {
+                        Console.WriteLine("Error: Could not determine depot ID from file paths.");
+                        Console.WriteLine(".manif4/.manif5 files require -depot <id>, -depotkey <hex>, or -depotkey-file <path>");
+                        return 1;
+                    }
+                }
+            }
+
+            Console.WriteLine($"Loading old manifest from: {oldManifestFile}");
+            ManifestData oldManifest;
+            try
+            {
+                oldManifest = await LoadManifestFromAnyFormat(oldManifestFile, depotKey);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error loading old manifest: {ex.Message}");
+                return 1;
+            }
+
+            Console.WriteLine($"Loading new manifest from: {newManifestFile}");
+            ManifestData newManifest;
+            try
+            {
+                newManifest = await LoadManifestFromAnyFormat(newManifestFile, depotKey);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error loading new manifest: {ex.Message}");
+                return 1;
+            }
+
+            Console.WriteLine();
+            Console.WriteLine($"Old Manifest ID: {oldManifest.ManifestId} ({oldManifest.Files.Count} files)");
+            Console.WriteLine($"New Manifest ID: {newManifest.ManifestId} ({newManifest.Files.Count} files)");
+            Console.WriteLine("Calculating differences...");
+
+            // Build file lookup dictionaries
+            var oldFiles = oldManifest.Files.ToDictionary(f => f.FileName, f => f);
+            var newFiles = newManifest.Files.ToDictionary(f => f.FileName, f => f);
+
+            // Find added, removed, and modified files
+            var addedFiles = newFiles.Keys.Except(oldFiles.Keys).ToList();
+            var removedFiles = oldFiles.Keys.Except(newFiles.Keys).ToList();
+            var commonFiles = oldFiles.Keys.Intersect(newFiles.Keys).ToList();
+
+            var modifiedFiles = new List<string>();
+            var unchangedFiles = new List<string>();
+
+            foreach (var fileName in commonFiles)
+            {
+                var oldFile = oldFiles[fileName];
+                var newFile = newFiles[fileName];
+
+                // Compare file hash or size to detect changes
+                bool isModified = oldFile.Size != newFile.Size ||
+                                  oldFile.Hash != newFile.Hash;
+
+                if (isModified)
+                    modifiedFiles.Add(fileName);
+                else
+                    unchangedFiles.Add(fileName);
+            }
+
+            Console.WriteLine();
+            Console.WriteLine($"Added:     {addedFiles.Count} files");
+            Console.WriteLine($"Removed:   {removedFiles.Count} files");
+            Console.WriteLine($"Modified:  {modifiedFiles.Count} files");
+            Console.WriteLine($"Unchanged: {unchangedFiles.Count} files");
+
+            // Show verbose output if requested
+            if (verbose)
+            {
+                if (addedFiles.Count > 0)
+                {
+                    Console.WriteLine();
+                    Console.WriteLine($"ADDED FILES ({addedFiles.Count}):");
+                    foreach (var fileName in addedFiles.OrderBy(f => f))
+                    {
+                        var file = newFiles[fileName];
+                        Console.WriteLine($"  + {fileName} ({file.Size:N0} bytes)");
+                    }
+                }
+
+                if (removedFiles.Count > 0)
+                {
+                    Console.WriteLine();
+                    Console.WriteLine($"REMOVED FILES ({removedFiles.Count}):");
+                    foreach (var fileName in removedFiles.OrderBy(f => f))
+                    {
+                        var file = oldFiles[fileName];
+                        Console.WriteLine($"  - {fileName} ({file.Size:N0} bytes)");
+                    }
+                }
+
+                if (modifiedFiles.Count > 0)
+                {
+                    Console.WriteLine();
+                    Console.WriteLine($"MODIFIED FILES ({modifiedFiles.Count}):");
+                    foreach (var fileName in modifiedFiles.OrderBy(f => f))
+                    {
+                        var oldFile = oldFiles[fileName];
+                        var newFile = newFiles[fileName];
+                        var sizeDelta = (long)newFile.Size - (long)oldFile.Size;
+                        var sizeChange = sizeDelta >= 0 ? $"+{sizeDelta:N0}" : $"{sizeDelta:N0}";
+                        Console.WriteLine($"  * {fileName} ({oldFile.Size:N0} -> {newFile.Size:N0} bytes, {sizeChange})");
+                    }
+                }
+            }
+
+            // Save to file only if -output was specified
+            if (!string.IsNullOrEmpty(outputFile))
+            {
+                // Build diff structure
+                var diffData = new
+                {
+                    DepotId = depotId ?? oldManifest.DepotId,
+                    OldManifest = new
+                    {
+                        ManifestId = oldManifest.ManifestId,
+                        CreationTime = oldManifest.CreationTime,
+                        TotalFiles = oldManifest.Files.Count,
+                        TotalUncompressedSize = oldManifest.TotalUncompressedSize,
+                        TotalCompressedSize = oldManifest.TotalCompressedSize
+                    },
+                    NewManifest = new
+                    {
+                        ManifestId = newManifest.ManifestId,
+                        CreationTime = newManifest.CreationTime,
+                        TotalFiles = newManifest.Files.Count,
+                        TotalUncompressedSize = newManifest.TotalUncompressedSize,
+                        TotalCompressedSize = newManifest.TotalCompressedSize
+                    },
+                    Summary = new
+                    {
+                        AddedCount = addedFiles.Count,
+                        RemovedCount = removedFiles.Count,
+                        ModifiedCount = modifiedFiles.Count,
+                        UnchangedCount = unchangedFiles.Count,
+                        TotalSizeChange = (long)newManifest.TotalUncompressedSize - (long)oldManifest.TotalUncompressedSize
+                    },
+                    AddedFiles = addedFiles.Select(fileName =>
+                    {
+                        var file = newFiles[fileName];
+                        return new
+                        {
+                            FileName = fileName,
+                            Size = file.Size,
+                            Hash = file.Hash
+                        };
+                    }).ToList(),
+                    RemovedFiles = removedFiles.Select(fileName =>
+                    {
+                        var file = oldFiles[fileName];
+                        return new
+                        {
+                            FileName = fileName,
+                            Size = file.Size,
+                            Hash = file.Hash
+                        };
+                    }).ToList(),
+                    ModifiedFiles = modifiedFiles.Select(fileName =>
+                    {
+                        var oldFile = oldFiles[fileName];
+                        var newFile = newFiles[fileName];
+                        return new
+                        {
+                            FileName = fileName,
+                            OldSize = oldFile.Size,
+                            NewSize = newFile.Size,
+                            SizeDelta = (long)newFile.Size - (long)oldFile.Size,
+                            OldHash = oldFile.Hash,
+                            NewHash = newFile.Hash
+                        };
+                    }).ToList()
+                };
+
+                // Serialize to JSON (always prettified)
+                var options = new JsonSerializerOptions
+                {
+                    WriteIndented = true,
+                    PropertyNamingPolicy = JsonNamingPolicy.CamelCase
+                };
+
+                await File.WriteAllTextAsync(outputFile, JsonSerializer.Serialize(diffData, options));
+                Console.WriteLine();
+                Console.WriteLine($"Detailed diff saved to: {outputFile}");
+            }
+
+            Console.WriteLine();
+            Console.WriteLine("Done!");
+
+            return 0;
+        }
+
+        public static void PrintUsage()
+        {
+            Console.WriteLine();
+            Console.WriteLine("Manifest Command - Offline manifest analysis and comparison");
+            Console.WriteLine();
+            Console.WriteLine("USAGE:");
+            Console.WriteLine("  depotdownloader manifest <operation> [OPTIONS...]");
+            Console.WriteLine();
+            Console.WriteLine("OPERATIONS:");
+            Console.WriteLine("  extract              Extract encrypted/binary manifests to readable JSON");
+            Console.WriteLine("  diff, compare        Compare two manifests and show differences (console output)");
+            Console.WriteLine();
+            Console.WriteLine("SUPPORTED FORMATS:");
+            Console.WriteLine("  .json               Extracted debug JSON (for diff only)");
+            Console.WriteLine("  .manifest           Decrypted binary manifest");
+            Console.WriteLine("  .manif4/.manif5     Compressed encrypted manifest (requires depot key)");
+            Console.WriteLine();
+            Console.WriteLine("EXTRACT USAGE:");
+            Console.WriteLine("  depotdownloader manifest extract <manifest-file> [OPTIONS...]");
+            Console.WriteLine();
+            Console.WriteLine("  Converts encrypted/binary manifests to readable JSON format.");
+            Console.WriteLine();
+            Console.WriteLine("  OPTIONS:");
+            Console.WriteLine("    -depot <id>          Depot ID (for .manif4/.manif5 key lookup)");
+            Console.WriteLine("    -depotkey <hex>      Depot key in hex (for .manif4/.manif5)");
+            Console.WriteLine("    -depotkey-file <path> Path to custom depot key file");
+            Console.WriteLine("    -output <file>       Output JSON file (default: <manifest>.json)");
+            Console.WriteLine();
+            Console.WriteLine("DIFF USAGE:");
+            Console.WriteLine("  depotdownloader manifest diff <old-manifest> <new-manifest> [OPTIONS...]");
+            Console.WriteLine();
+            Console.WriteLine("  Compares two manifests and displays differences to console.");
+            Console.WriteLine();
+            Console.WriteLine("  OPTIONS:");
+            Console.WriteLine("    -depot <id>          Depot ID (for .manif4/.manif5 key lookup)");
+            Console.WriteLine("    -depotkey <hex>      Depot key in hex (for .manif4/.manif5)");
+            Console.WriteLine("    -depotkey-file <path> Path to custom depot key file");
+            Console.WriteLine("    -verbose, -v         Show detailed list of all file changes");
+            Console.WriteLine("    -output <file>       Save detailed diff as JSON file (optional)");
+            Console.WriteLine();
+            Console.WriteLine("DEPOT KEY:");
+            Console.WriteLine("  For .manif4/.manif5 files, depot key is loaded from: depot/<depot-id>/<depot-id>.depotkey");
+            Console.WriteLine("  Or provide it directly using -depotkey <hex> or -depotkey-file <path>");
+            Console.WriteLine();
+            Console.WriteLine("EXAMPLES:");
+            Console.WriteLine("  # Extract encrypted manifest to JSON");
+            Console.WriteLine("  depotdownloader manifest extract 123456.manif5 -depot 848452");
+            Console.WriteLine();
+            Console.WriteLine("  # Extract using custom depot key file location");
+            Console.WriteLine("  depotdownloader manifest extract 123456.manif5 -depotkey-file my-keys/848452.key");
+            Console.WriteLine();
+            Console.WriteLine("  # Extract decrypted binary manifest");
+            Console.WriteLine("  depotdownloader manifest extract 848452_123456.manifest -output debug.json");
+            Console.WriteLine();
+            Console.WriteLine("  # Compare two manifests (console output)");
+            Console.WriteLine("  depotdownloader manifest diff old.json new.json");
+            Console.WriteLine();
+            Console.WriteLine("  # Compare with verbose output showing all file changes");
+            Console.WriteLine("  depotdownloader manifest diff old.json new.json -verbose");
+            Console.WriteLine();
+            Console.WriteLine("  # Compare encrypted manifests and save detailed diff to file");
+            Console.WriteLine("  depotdownloader manifest diff v1.manif5 v2.manif5 -depot 848452 -output changes.json");
+        }
+    }
+}

@@ -42,6 +42,9 @@ namespace DepotDownloader
                     case "list-depots": // NEW
                         return await ListDepotsCommand.RunAsync(args[1..]);
 
+                    case "manifest":
+                        return await ManifestCommand.RunAsync(args[1..]);
+
                     case "validate-depot":
                     case "validate-chunk":
                     case "validate-chunkstore":
@@ -107,6 +110,10 @@ namespace DepotDownloader
                     ListDepotsCommand.PrintUsage();
                     return 0;
 
+                case "manifest":
+                    ManifestCommand.PrintUsage();
+                    return 0;
+
                 case "validate-depot":
                 case "validate-chunk":
                 case "validate-chunkstore":
@@ -125,7 +132,7 @@ namespace DepotDownloader
 
                 default:
                     Console.WriteLine($"Unknown sub-command: {subCommand}");
-                    Console.WriteLine("Available sub-commands: download, list-depots, validation, reconstruct, chunkstore");
+                    Console.WriteLine("Available sub-commands: download, list-depots, manifest, validation, reconstruct, chunkstore");
                     return 1;
             }
         }
@@ -141,6 +148,7 @@ namespace DepotDownloader
             Console.WriteLine("COMMANDS:");
             Console.WriteLine("  download                     Download Steam content (apps, depots, workshop items)");
             Console.WriteLine("  list-depots                  List branches per depot from a CSV (no download)"); // NEW
+            Console.WriteLine("  manifest                     Extract and compare manifest files (offline)");
             Console.WriteLine("  validate-depot               Validate all chunks in a depot directory (offline)");
             Console.WriteLine("  validate-chunk               Validate a single chunk file (offline)");
             Console.WriteLine("  validate-chunkstore          Validate all chunks in a chunkstore (offline)");
@@ -155,7 +163,9 @@ namespace DepotDownloader
             Console.WriteLine();
             Console.WriteLine("EXAMPLES:");
             Console.WriteLine("  depotdownloader download -app 4000 -depot 4001 -raw");
-            Console.WriteLine("  depotdownloader list-depots -manifest-csv manifests.csv"); // NEW example
+            Console.WriteLine("  depotdownloader list-depots -manifest-csv manifests.csv");
+            Console.WriteLine("  depotdownloader manifest extract 123456.manif5 -depot 848452");
+            Console.WriteLine("  depotdownloader manifest diff old.json new.json -verbose");
             Console.WriteLine("  depotdownloader validate-depot depot/4001 -verbose");
             Console.WriteLine("  depotdownloader download -workshop 123456 789012");
             Console.WriteLine();
