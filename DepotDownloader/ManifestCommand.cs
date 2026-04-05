@@ -277,11 +277,11 @@ namespace DepotDownloader
                 return 1;
             }
 
-            string manifestFile = null;
-            string outputFile = null;
+            var manifestFile = (string)null;
+            var outputFile = (string)null;
             uint? depotId = null;
-            string depotKeyHex = null;
-            string depotKeyFile = null;
+            var depotKeyHex = (string)null;
+            var depotKeyFile = (string)null;
 
             // Check for positional argument first
             if (!args[0].StartsWith('-'))
@@ -345,7 +345,7 @@ namespace DepotDownloader
             }
 
             // Load depot key if needed for .manif4/.manif5 files
-            byte[] depotKey = null;
+            var depotKey = (byte[])null;
             var extension = Path.GetExtension(manifestFile).ToLowerInvariant();
             if (extension == ".manif4" || extension == ".manif5")
             {
@@ -393,10 +393,10 @@ namespace DepotDownloader
                         var pathParts = fullPath.Split(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
 
                         // Look for "depot" folder followed by a numeric ID
-                        for (int i = 0; i < pathParts.Length - 1; i++)
+                        for (var i = 0; i < pathParts.Length - 1; i++)
                         {
-                            if (pathParts[i].Equals("depot", StringComparison.OrdinalIgnoreCase) && 
-                                uint.TryParse(pathParts[i + 1], out var detectedDepotId))
+                            if (pathParts[i].Equals("depot", StringComparison.OrdinalIgnoreCase)
+                                && uint.TryParse(pathParts[i + 1], out var detectedDepotId))
                             {
                                 depotId = detectedDepotId;
                                 Console.WriteLine($"Auto-detected depot ID from path: {depotId}");
@@ -536,17 +536,17 @@ namespace DepotDownloader
                 return 1;
             }
 
-            string oldManifestFile = null;
-            string newManifestFile = null;
-            string outputFile = null;
+            var oldManifestFile = (string)null;
+            var newManifestFile = (string)null;
+            var outputFile = (string)null;
             uint? depotId = null;
-            string depotKeyHex = null;
-            string depotKeyFile = null;
-            bool verbose = false;
+            var depotKeyHex = (string)null;
+            var depotKeyFile = (string)null;
+            var verbose = false;
 
             // Check for positional arguments first
-            int positionalIndex = 0;
-            for (int i = 0; i < args.Length && positionalIndex < 2; i++)
+            var positionalIndex = 0;
+            for (var i = 0; i < args.Length && positionalIndex < 2; i++)
             {
                 if (!args[i].StartsWith('-'))
                 {
@@ -631,10 +631,10 @@ namespace DepotDownloader
             }
 
             // Load depot key if needed for .manif4/.manif5 files
-            byte[] depotKey = null;
+            var depotKey = (byte[])null;
             var oldExt = Path.GetExtension(oldManifestFile).ToLowerInvariant();
             var newExt = Path.GetExtension(newManifestFile).ToLowerInvariant();
-            bool needsKey = oldExt == ".manif4" || oldExt == ".manif5" || newExt == ".manif4" || newExt == ".manif5";
+            var needsKey = oldExt == ".manif4" || oldExt == ".manif5" || newExt == ".manif4" || newExt == ".manif5";
 
             if (needsKey)
             {
@@ -683,10 +683,10 @@ namespace DepotDownloader
                         var pathParts = fullPath.Split(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
 
                         // Look for "depot" folder followed by a numeric ID
-                        for (int i = 0; i < pathParts.Length - 1; i++)
+                        for (var i = 0; i < pathParts.Length - 1; i++)
                         {
-                            if (pathParts[i].Equals("depot", StringComparison.OrdinalIgnoreCase) && 
-                                uint.TryParse(pathParts[i + 1], out var detectedDepotId))
+                            if (pathParts[i].Equals("depot", StringComparison.OrdinalIgnoreCase)
+                                && uint.TryParse(pathParts[i + 1], out var detectedDepotId))
                             {
                                 depotId = detectedDepotId;
                                 Console.WriteLine($"Auto-detected depot ID from path: {depotId}");
@@ -700,10 +700,10 @@ namespace DepotDownloader
                             fullPath = Path.GetFullPath(newManifestFile);
                             pathParts = fullPath.Split(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
 
-                            for (int i = 0; i < pathParts.Length - 1; i++)
+                            for (var i = 0; i < pathParts.Length - 1; i++)
                             {
-                                if (pathParts[i].Equals("depot", StringComparison.OrdinalIgnoreCase) && 
-                                    uint.TryParse(pathParts[i + 1], out var detectedDepotId))
+                                if (pathParts[i].Equals("depot", StringComparison.OrdinalIgnoreCase)
+                                    && uint.TryParse(pathParts[i + 1], out var detectedDepotId))
                                 {
                                     depotId = detectedDepotId;
                                     Console.WriteLine($"Auto-detected depot ID from path: {depotId}");
