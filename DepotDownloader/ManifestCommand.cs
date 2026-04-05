@@ -18,7 +18,7 @@ namespace DepotDownloader
     /// </summary>
     public static class ManifestCommand
     {
-        // JSON model matching the debug format from BuildManifestDebugModel
+        // JSON model matching the debug format from BuildManifestDebugModel (for reading only)
         private class DebugManifestJson
         {
             public uint depot_id { get; set; }
@@ -57,15 +57,19 @@ namespace DepotDownloader
             public uint DepotId { get; set; }
             public ulong ManifestId { get; set; }
             public DateTime CreationTime { get; set; }
+            public bool FilenamesEncrypted { get; set; }
+            public int Version { get; set; }
             public ulong TotalUncompressedSize { get; set; }
             public ulong TotalCompressedSize { get; set; }
             public List<FileEntry> Files { get; set; }
 
             public class FileEntry
             {
+                public string EncryptedName { get; set; }
                 public string FileName { get; set; }
                 public ulong Size { get; set; }
                 public string Hash { get; set; }
+                public string FilenameHash { get; set; }
                 public int Flags { get; set; }
                 public List<ChunkEntry> Chunks { get; set; }
             }
@@ -98,13 +102,17 @@ namespace DepotDownloader
                     DepotId = debugJson.depot_id,
                     ManifestId = debugJson.gid,
                     CreationTime = debugJson.creation_time,
+                    FilenamesEncrypted = debugJson.filenames_encrypted,
+                    Version = debugJson.version,
                     TotalUncompressedSize = debugJson.total_uncompressed_size,
                     TotalCompressedSize = debugJson.total_compressed_size,
                     Files = debugJson.mappings.Select(m => new ManifestData.FileEntry
                     {
+                        EncryptedName = m.encryptedName,
                         FileName = m.decryptedName,
                         Size = m.size,
                         Hash = m.sha_content,
+                        FilenameHash = m.sha_filename,
                         Flags = m.flags,
                         Chunks = m.chunks?.Select(c => new ManifestData.ChunkEntry
                         {
@@ -127,9 +135,9 @@ namespace DepotDownloader
                 }
 
                 var zipBytes = await File.ReadAllBytesAsync(filePath);
-                var manifest = ParseManifestZipBytes(zipBytes, depotKey);
+                var result = ParseManifestZipBytes(zipBytes, depotKey);
 
-                return ConvertDepotManifestToData(manifest);
+                return ConvertDepotManifestToData(result.Manifest, result.EncryptedNames, result.Version);
             }
 
             // Decrypted binary manifest format (.manifest)
@@ -143,10 +151,23 @@ namespace DepotDownloader
         }
 
         /// <summary>
-        /// Parse compressed manifest zip bytes (same as ContentDownloader logic)
+        /// Parse result from manifest zip bytes
         /// </summary>
-        private static DepotManifest ParseManifestZipBytes(byte[] zipBytes, byte[] depotKey)
+        private class ParsedManifestResult
         {
+            public DepotManifest Manifest { get; set; }
+            public List<string> EncryptedNames { get; set; }
+            public int Version { get; set; }
+        }
+
+        /// <summary>
+        /// Parse compressed manifest zip bytes (same as ContentDownloader logic)
+        /// Captures encrypted filenames before decryption
+        /// </summary>
+        private static ParsedManifestResult ParseManifestZipBytes(byte[] zipBytes, byte[] depotKey)
+        {
+            const uint V4_MAGIC = 0x16349781;
+
             byte[] payloadBytes;
 
             using (var msZip = new MemoryStream(zipBytes, writable: false))
@@ -161,11 +182,22 @@ namespace DepotDownloader
                 payloadBytes = msPayload.ToArray();
             }
 
+            // Detect version from magic header
+            var detectedVersion = 5;
+            if (payloadBytes.Length >= 4)
+            {
+                var header = BitConverter.ToUInt32(payloadBytes, 0);
+                detectedVersion = header == V4_MAGIC ? 4 : 5;
+            }
+
             DepotManifest parsed;
             using (var ms = new MemoryStream(payloadBytes, writable: false))
             {
                 parsed = DepotManifest.Deserialize(ms);
             }
+
+            // Capture encrypted names BEFORE decryption
+            var encryptedNames = parsed.Files.Select(f => f.FileName).ToList();
 
             if (depotKey != null && depotKey.Length > 0)
             {
@@ -179,26 +211,35 @@ namespace DepotDownloader
                 }
             }
 
-            return parsed;
+            return new ParsedManifestResult
+            {
+                Manifest = parsed,
+                EncryptedNames = encryptedNames,
+                Version = detectedVersion
+            };
         }
 
         /// <summary>
-        /// Convert DepotManifest to our unified format
+        /// Convert DepotManifest to our unified format with encrypted names and filename hashes
         /// </summary>
-        private static ManifestData ConvertDepotManifestToData(DepotManifest manifest)
+        private static ManifestData ConvertDepotManifestToData(DepotManifest manifest, List<string> encryptedNames = null, int version = 5)
         {
             return new ManifestData
             {
                 DepotId = manifest.DepotID,
                 ManifestId = manifest.ManifestGID,
                 CreationTime = manifest.CreationTime,
+                FilenamesEncrypted = manifest.FilenamesEncrypted,
+                Version = version,
                 TotalUncompressedSize = manifest.TotalUncompressedSize,
                 TotalCompressedSize = manifest.TotalCompressedSize,
-                Files = manifest.Files.Select(f => new ManifestData.FileEntry
+                Files = manifest.Files.Select((f, i) => new ManifestData.FileEntry
                 {
+                    EncryptedName = (encryptedNames != null && i < encryptedNames.Count) ? encryptedNames[i] : null,
                     FileName = f.FileName,
                     Size = f.TotalSize,
                     Hash = f.FileHash != null ? BitConverter.ToString(f.FileHash).Replace("-", "").ToLowerInvariant() : null,
+                    FilenameHash = ComputeFilenameHash(f.FileName),
                     Flags = (int)f.Flags,
                     Chunks = f.Chunks.Select(c => new ManifestData.ChunkEntry
                     {
@@ -210,6 +251,21 @@ namespace DepotDownloader
                     }).ToList()
                 }).ToList()
             };
+        }
+
+        /// <summary>
+        /// Compute SHA1 hash of normalized filename (same as BuildManifestDebugModel)
+        /// </summary>
+        private static string ComputeFilenameHash(string filename)
+        {
+            if (string.IsNullOrEmpty(filename))
+                return null;
+
+            // Normalize: replace / with \ and convert to lowercase
+            var normalized = filename.Replace('/', '\\').ToLowerInvariant();
+            var bytes = System.Text.Encoding.UTF8.GetBytes(normalized);
+            var hash = SHA1.HashData(bytes);
+            return BitConverter.ToString(hash).Replace("-", "").ToLowerInvariant();
         }
 
         /// <summary>
@@ -462,38 +518,40 @@ namespace DepotDownloader
             Console.WriteLine($"Creation Time: {manifest.CreationTime}");
             Console.WriteLine($"Total Files: {manifest.Files.Count}");
 
-            // Build JSON structure
+            // Build JSON structure matching BuildManifestDebugModel format exactly
             var manifestData = new
             {
-                ManifestId = manifest.ManifestId,
-                DepotId = manifest.DepotId,
-                CreationTime = manifest.CreationTime,
-                TotalUncompressedSize = manifest.TotalUncompressedSize,
-                TotalCompressedSize = manifest.TotalCompressedSize,
-                TotalFiles = manifest.Files.Count,
-                Files = manifest.Files.Select(f => new
+                depot_id = manifest.DepotId,
+                gid = manifest.ManifestId,
+                creation_time = manifest.CreationTime,
+                filenames_encrypted = manifest.FilenamesEncrypted,
+                version = manifest.Version,
+                total_uncompressed_size = manifest.TotalUncompressedSize,
+                total_compressed_size = manifest.TotalCompressedSize,
+                mappings = manifest.Files.Select(f => new
                 {
-                    FileName = f.FileName,
-                    Size = f.Size,
-                    Flags = f.Flags,
-                    Hash = f.Hash,
-                    ChunkCount = f.Chunks.Count,
-                    Chunks = f.Chunks.Select(c => new
+                    encryptedName = f.EncryptedName,
+                    decryptedName = f.FileName,
+                    size = f.Size,
+                    flags = f.Flags,
+                    sha_content = f.Hash,
+                    sha_filename = f.FilenameHash,
+                    chunks = f.Chunks.Select(c => new
                     {
-                        ChunkId = c.ChunkId,
-                        Checksum = c.Checksum,
-                        Offset = c.Offset,
-                        CompressedLength = c.CompressedLength,
-                        UncompressedLength = c.UncompressedLength
+                        sha = c.ChunkId,
+                        crc = c.Checksum,
+                        offset = c.Offset,
+                        cb_original = c.UncompressedLength,
+                        cb_compressed = c.CompressedLength
                     }).ToList()
                 }).ToList()
             };
 
             // Serialize to JSON (always prettified)
+            // Note: Do NOT use JsonNamingPolicy.CamelCase - we already have snake_case property names
             var options = new JsonSerializerOptions
             {
-                WriteIndented = true,
-                PropertyNamingPolicy = JsonNamingPolicy.CamelCase
+                WriteIndented = true
             };
 
             await File.WriteAllTextAsync(outputFile, JsonSerializer.Serialize(manifestData, options));
