@@ -113,7 +113,8 @@ namespace DepotDownloader
         /// <param name="depotKey">Depot decryption key for encrypted chunkstores</param>
         /// <param name="isEncrypted">Whether the chunkstore contains encrypted chunks</param>
         /// <param name="maxFileSize">Maximum size per CSD file (default: 2GB)</param>
-        public Chunkstore(string folder, uint? depot = null, byte[] depotKey = null, bool? isEncrypted = null, long maxFileSize = 2L * 1024 * 1024 * 1024)
+        /// <param name="readOnly">If true, suppresses checkpoint writes (use for validation/read-only access)</param>
+        public Chunkstore(string folder, uint? depot = null, byte[] depotKey = null, bool? isEncrypted = null, long maxFileSize = 2L * 1024 * 1024 * 1024, bool readOnly = false)
         {
             this.folder = folder ?? throw new ArgumentNullException(nameof(folder));
             this.depot = depot;
@@ -127,12 +128,12 @@ namespace DepotDownloader
             }
 
             // Load existing chunkstore files
-            LoadExistingFiles();
+            LoadExistingFiles(readOnly);
         }
 
         private string CheckpointPath => Path.Combine(folder, $"{depot}_checkpoint.bin");
 
-        private void LoadExistingFiles()
+        private void LoadExistingFiles(bool readOnly = false)
         {
             // Auto-detect depot if not specified
             if (depot == null)
@@ -244,8 +245,11 @@ namespace DepotDownloader
                 currentFileSize = new FileInfo(currentCsd).Length;
 
                 // Save checkpoint after initial load for future faster startups
-                SaveCheckpointUnsafe();
-                Console.WriteLine("Initial checkpoint saved");
+                if (!readOnly)
+                {
+                    SaveCheckpointUnsafe();
+                    Console.WriteLine("Initial checkpoint saved");
+                }
             }
         }
 
@@ -1409,6 +1413,16 @@ namespace DepotDownloader
         public IEnumerable<ChunkMetadata> EnumerateChunks()
         {
             return chunkIndex.Values;
+        }
+
+        /// <summary>
+        /// Returns the path to the CSD file for the given 1-based index, or null if it doesn't exist.
+        /// </summary>
+        public string GetCsdPath(int index)
+        {
+            if (index < 1 || index > files.Count)
+                return null;
+            return files[index - 1].csdPath;
         }
 
         /// <summary>

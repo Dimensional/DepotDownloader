@@ -284,28 +284,124 @@ namespace DepotDownloader
         }
 
         /// <summary>
-        /// Validates all chunks in a chunkstore
+        /// Validates all chunks in a chunkstore, processing one CSD file at a time.
+        /// Supports resuming an interrupted validation via a checkpoint file.
         /// </summary>
         /// <param name="chunkstore">The chunkstore instance to validate</param>
         /// <param name="depotKey">Depot key for decryption (optional if chunkstore is not encrypted)</param>
         /// <param name="maxParallelism">Maximum number of parallel validation operations (0 = auto-detect)</param>
         /// <param name="progress">Optional progress callback (validated count, total count)</param>
+        /// <param name="checkpoint">Optional validation checkpoint for resume support</param>
+        /// <param name="onCsdComplete">Called after each CSD is fully validated, with the CSD index, its file checksum, and the current results dictionary</param>
         /// <returns>Dictionary mapping chunk SHA1 to validation results</returns>
         public static async Task<Dictionary<string, ValidationResult>> ValidateAllChunkstoreChunksAsync(
             Chunkstore chunkstore,
             byte[] depotKey = null,
             int maxParallelism = 0,
-            Action<int, int> progress = null)
+            Action<int, int> progress = null,
+            ValidationCheckpoint checkpoint = null,
+            Action<int, string, Dictionary<string, ValidationResult>> onCsdComplete = null)
         {
             if (chunkstore == null)
             {
                 throw new ArgumentNullException(nameof(chunkstore));
             }
 
-            // Get all chunk SHA1s from the chunkstore
-            var allChunks = chunkstore.EnumerateChunks().Select(c => c.Sha).ToList();
+            if (maxParallelism <= 0)
+            {
+                maxParallelism = Math.Max(1, Environment.ProcessorCount - 1);
+            }
 
-            return await ValidateChunkstoreChunksAsync(chunkstore, allChunks, depotKey, maxParallelism, progress);
+            // Group chunks by CSD index, preserving order within each CSD
+            var byCsd = chunkstore.EnumerateChunks()
+                .GroupBy(c => c.ChunkstoreIndex)
+                .OrderBy(g => g.Key)
+                .ToList();
+
+            var totalChunks = byCsd.Sum(g => g.Count());
+            var results = new Dictionary<string, ValidationResult>(totalChunks, StringComparer.OrdinalIgnoreCase);
+            var validatedCount = 0;
+
+            // Seed results and counter from checkpoint for already-completed CSDs
+            if (checkpoint != null)
+            {
+                validatedCount = checkpoint.TotalChunksSoFar;
+                foreach (var invalidSha in checkpoint.InvalidChunks)
+                {
+                    results[invalidSha] = new ValidationResult
+                    {
+                        IsValid = false,
+                        ErrorMessage = "Failed in previous run (loaded from checkpoint)"
+                    };
+                }
+            }
+
+            foreach (var csdGroup in byCsd)
+            {
+                var csdIndex = csdGroup.Key;
+                var csdPath = chunkstore.GetCsdPath(csdIndex);
+
+                // Check if this CSD was already validated in a prior run
+                if (checkpoint != null && checkpoint.ValidatedCsdIndices.Contains(csdIndex))
+                {
+                    if (csdPath != null && File.Exists(csdPath))
+                    {
+                        var currentChecksum = HashFileStreaming(csdPath);
+                        if (checkpoint.CsdFileChecksums.TryGetValue(csdIndex, out var savedChecksum) &&
+                            currentChecksum == savedChecksum)
+                        {
+                            Console.WriteLine($"  CSD {csdIndex}: skipping (validated in previous run, checksum matches)");
+                            progress?.Invoke(validatedCount, totalChunks);
+                            continue;
+                        }
+                        else
+                        {
+                            Console.WriteLine($"  CSD {csdIndex}: re-validating (checksum mismatch — file may have changed)");
+                        }
+                    }
+                }
+
+                Console.WriteLine($"  Validating CSD {csdIndex} ({csdGroup.Count():N0} chunks)...");
+
+                var csdChunks = csdGroup.Select(c => c.Sha).ToList();
+                var lockObj = new object();
+                var options = new ParallelOptions { MaxDegreeOfParallelism = maxParallelism };
+
+                await Parallel.ForEachAsync(csdChunks, options, async (chunkShaHex, ct) =>
+                {
+                    await Task.Run(() =>
+                    {
+                        var result = ValidateChunkstoreChunk(chunkstore, chunkShaHex, depotKey);
+                        lock (lockObj)
+                        {
+                            results[chunkShaHex.ToLowerInvariant()] = result;
+                            validatedCount++;
+                            progress?.Invoke(validatedCount, totalChunks);
+                        }
+                    }, ct);
+                });
+
+                // Notify caller that this CSD is complete (for checkpoint saving)
+                if (onCsdComplete != null)
+                {
+                    var checksum = csdPath != null && File.Exists(csdPath)
+                        ? HashFileStreaming(csdPath)
+                        : string.Empty;
+                    onCsdComplete(csdIndex, checksum, results);
+                }
+            }
+
+            return results;
+        }
+
+        /// <summary>
+        /// Computes a SHA1 hex string of a file using a streaming read.
+        /// Avoids loading the entire file (potentially 2 GB) into memory at once.
+        /// </summary>
+        private static string HashFileStreaming(string path)
+        {
+            using var fs = File.OpenRead(path);
+            return Convert.ToHexString(SHA1.HashData(fs)).ToLowerInvariant();
         }
 
         #endregion

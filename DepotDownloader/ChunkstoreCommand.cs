@@ -263,9 +263,83 @@ namespace DepotDownloader
 
         private static async Task<int> VerifyCommand(string[] args)
         {
-            Console.WriteLine("Verify command will use existing validation infrastructure");
-            Console.WriteLine("For now, use: depotdownloader validate-chunkstore <path> [options]");
-            return await Task.FromResult(1);
+            if (args.Length < 1)
+            {
+                Console.WriteLine("Usage: depotdownloader chunkstore verify <chunkstore-folder> [OPTIONS...]");
+                Console.WriteLine();
+                Console.WriteLine("OPTIONS:");
+                Console.WriteLine("  -depot <id>              Depot ID (auto-detect if only one depot)");
+                Console.WriteLine("  -key <path>              Path to depot key file");
+                Console.WriteLine("  -threads <count>         Parallel validation threads (default: auto)");
+                Console.WriteLine("  -verbose                 Show result for every chunk");
+                Console.WriteLine("  -no-resume               Ignore existing checkpoint, start fresh");
+                Console.WriteLine();
+                Console.WriteLine("EXAMPLES:");
+                Console.WriteLine("  depotdownloader chunkstore verify chunkstore/");
+                Console.WriteLine("  depotdownloader chunkstore verify chunkstore/ -depot 4001 -key depot.key");
+                return 1;
+            }
+
+            var chunkstoreFolder = args[0];
+
+            if (!Directory.Exists(chunkstoreFolder))
+            {
+                Console.WriteLine($"Error: Chunkstore folder does not exist: {chunkstoreFolder}");
+                return 1;
+            }
+
+            uint? depotId = null;
+            string depotKeyPath = null;
+            int maxThreads = 0;
+            bool verbose = false;
+            bool resume = true;
+
+            for (int i = 1; i < args.Length; i++)
+            {
+                switch (args[i].ToLowerInvariant())
+                {
+                    case "-depot":
+                        if (i + 1 < args.Length && uint.TryParse(args[i + 1], out var depot))
+                        {
+                            depotId = depot;
+                            i++;
+                        }
+                        break;
+                    case "-key":
+                        if (i + 1 < args.Length)
+                        {
+                            depotKeyPath = args[i + 1];
+                            i++;
+                        }
+                        break;
+                    case "-threads":
+                        if (i + 1 < args.Length && int.TryParse(args[i + 1], out var threads))
+                        {
+                            maxThreads = threads;
+                            i++;
+                        }
+                        break;
+                    case "-verbose":
+                        verbose = true;
+                        break;
+                    case "-no-resume":
+                        resume = false;
+                        break;
+                }
+            }
+
+            var summary = await StandaloneChunkValidator.ValidateChunkstoreAsync(
+                chunkstoreFolder, depotId, depotKeyPath, verbose, maxThreads, resume);
+
+            Console.WriteLine();
+            Console.WriteLine("=== VALIDATION SUMMARY ===");
+            Console.WriteLine($"Total:   {summary.TotalChunks:N0}");
+            Console.WriteLine($"Valid:   {summary.ValidChunks:N0}");
+            Console.WriteLine($"Invalid: {summary.InvalidChunks:N0}");
+            if (summary.ErrorChunks > 0)
+                Console.WriteLine($"Errors:  {summary.ErrorChunks:N0}");
+
+            return summary.InvalidChunks > 0 || summary.ErrorChunks > 0 ? 1 : 0;
         }
 
         private static async Task<int> RebuildCommand(string[] args)

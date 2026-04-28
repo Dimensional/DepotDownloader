@@ -200,7 +200,8 @@ namespace DepotDownloader
             uint? depotId = null,
             string depotKeyPath = null,
             bool verbose = false,
-            int maxThreads = 0)
+            int maxThreads = 0,
+            bool resume = true)
         {
             var summary = new ValidationSummary();
 
@@ -226,7 +227,6 @@ namespace DepotDownloader
                 }
                 else
                 {
-                    // Look for depot key files in the chunkstore directory
                     var depotKeyFiles = Directory.GetFiles(chunkstorePath, "*.depotkey");
                     if (depotKeyFiles.Length > 0)
                     {
@@ -236,7 +236,7 @@ namespace DepotDownloader
                 }
 
                 // Initialize chunkstore
-                using var chunkstore = new Chunkstore(chunkstorePath, depotId, depotKey);
+                using var chunkstore = new Chunkstore(chunkstorePath, depotId, depotKey, readOnly: true);
                 var stats = chunkstore.GetStats();
 
                 Console.WriteLine($"Chunkstore loaded: {stats}");
@@ -248,6 +248,27 @@ namespace DepotDownloader
                 }
 
                 summary.TotalChunks = stats.TotalChunks;
+
+                // Load or create validation checkpoint
+                var checkpointPath = ValidationCheckpoint.GetPath(chunkstorePath, stats.DepotId);
+                ValidationCheckpoint checkpoint = null;
+
+                if (resume && File.Exists(checkpointPath))
+                {
+                    try
+                    {
+                        checkpoint = ValidationCheckpoint.LoadFromFile(checkpointPath);
+                        Console.WriteLine($"Resuming validation from checkpoint: {checkpoint.ValidatedCsdIndices.Count} CSD(s) already validated, " +
+                                          $"{checkpoint.TotalChunksSoFar:N0}/{stats.TotalChunks:N0} chunks processed");
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine($"Warning: Could not load validation checkpoint ({ex.Message}), starting fresh");
+                        checkpoint = null;
+                    }
+                }
+
+                checkpoint ??= new ValidationCheckpoint { DepotId = stats.DepotId };
 
                 // Determine thread count
                 if (maxThreads <= 0)
@@ -263,7 +284,6 @@ namespace DepotDownloader
 
                 Console.WriteLine($"Validating {stats.TotalChunks:N0} chunks from chunkstore using {maxThreads} threads");
 
-                // Validate all chunks in parallel
                 var progressCount = 0;
                 var results = await ChunkValidator.ValidateAllChunkstoreChunksAsync(
                     chunkstore,
@@ -273,30 +293,58 @@ namespace DepotDownloader
                     {
                         var newCount = Interlocked.Exchange(ref progressCount, validated);
                         if (validated % 100 == 0 || validated == total || validated - newCount >= 50)
-                        {
                             Console.WriteLine($"Progress: {validated:N0}/{total:N0} chunks validated ({(validated * 100.0 / total):F1}%)");
+                    },
+                    checkpoint: checkpoint,
+                    onCsdComplete: (csdIndex, csdChecksum, currentResults) =>
+                    {
+                        // Update checkpoint after each CSD completes
+                        if (!checkpoint.ValidatedCsdIndices.Contains(csdIndex))
+                            checkpoint.ValidatedCsdIndices.Add(csdIndex);
+                        checkpoint.CsdFileChecksums[csdIndex] = csdChecksum;
+
+                        // Update running totals from the results collected so far for this CSD
+                        var csdChunks = chunkstore.EnumerateChunks()
+                            .Where(c => c.ChunkstoreIndex == csdIndex)
+                            .Select(c => c.Sha.ToLowerInvariant())
+                            .ToList();
+                        foreach (var sha in csdChunks)
+                        {
+                            checkpoint.TotalChunksSoFar++;
+                            if (currentResults.TryGetValue(sha, out var r))
+                            {
+                                if (r.IsValid)
+                                    checkpoint.ValidChunksSoFar++;
+                                else if (!checkpoint.InvalidChunks.Contains(sha))
+                                    checkpoint.InvalidChunks.Add(sha);
+                            }
                         }
+
+                        checkpoint.SaveToFile(checkpointPath);
+                        Console.WriteLine($"  Checkpoint saved (CSD {csdIndex} complete)");
                     });
 
                 // Process results
                 foreach (var kvp in results)
                 {
-                    var chunkId = kvp.Key;
-                    var result = kvp.Value;
-
-                    if (result.IsValid)
+                    if (kvp.Value.IsValid)
                     {
                         summary.ValidChunks++;
                         if (verbose)
-                        {
-                            Console.WriteLine($"✓ {chunkId} - Valid ({result.DecompressedSize} bytes)");
-                        }
+                            Console.WriteLine($"✓ {kvp.Key} - Valid ({kvp.Value.DecompressedSize} bytes)");
                     }
                     else
                     {
                         summary.InvalidChunks++;
-                        Console.WriteLine($"✗ {chunkId} - {result.ErrorMessage}");
+                        Console.WriteLine($"✗ {kvp.Key} - {kvp.Value.ErrorMessage}");
                     }
+                }
+
+                // Clear checkpoint on successful completion
+                if (File.Exists(checkpointPath))
+                {
+                    File.Delete(checkpointPath);
+                    Console.WriteLine("Validation complete — checkpoint cleared");
                 }
 
                 return summary;
@@ -304,7 +352,7 @@ namespace DepotDownloader
             catch (Exception ex)
             {
                 Console.WriteLine($"Error validating chunkstore: {ex.Message}");
-                summary.ErrorChunks = 1; // Mark as having errors
+                summary.ErrorChunks = 1;
                 return summary;
             }
         }
@@ -369,7 +417,7 @@ namespace DepotDownloader
                 }
 
                 // Initialize chunkstore
-                using var chunkstore = new Chunkstore(chunkstorePath, depotId, depotKey);
+                using var chunkstore = new Chunkstore(chunkstorePath, depotId, depotKey, readOnly: true);
                 var stats = chunkstore.GetStats();
 
                 Console.WriteLine($"Chunkstore loaded: {stats}");
