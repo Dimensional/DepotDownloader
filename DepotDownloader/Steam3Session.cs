@@ -526,8 +526,11 @@ namespace DepotDownloader
                             AccountSettingsStore.Instance.GuardData.Remove(result.AccountName);
                         }
 
-                        AccountSettingsStore.Instance.LoginTokens[result.AccountName] = result.RefreshToken;
-                        AccountSettingsStore.Save();
+                        if (ContentDownloader.Config.RememberPassword)
+                        {
+                            AccountSettingsStore.Instance.LoginTokens[result.AccountName] = result.RefreshToken;
+                            AccountSettingsStore.Save();
+                        }
                     }
                     catch (TaskCanceledException)
                     {
