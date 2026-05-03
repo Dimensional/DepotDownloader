@@ -14,6 +14,7 @@ using System.Reflection;
 using System.Security.Cryptography;
 using System.Text.Json;
 using System.Threading;
+using System.Threading.Channels;
 using System.Threading.Tasks;
 using SteamKit2;
 using SteamKit2.CDN;
@@ -27,6 +28,8 @@ namespace DepotDownloader
 
     static class ContentDownloader
     {
+        #region Constants and Fields
+
         public const uint INVALID_APP_ID = uint.MaxValue;
         public const uint INVALID_DEPOT_ID = uint.MaxValue;
         public const ulong INVALID_MANIFEST_ID = ulong.MaxValue;
@@ -41,6 +44,10 @@ namespace DepotDownloader
         private const string CONFIG_DIR = ".DepotDownloader";
         private static readonly string STAGING_DIR = Path.Combine(CONFIG_DIR, "staging");
 
+        #endregion
+
+        #region Nested Types
+
         private sealed class DepotDownloadInfo(
             uint depotid, uint appId, ulong manifestId, string branch,
             string installDir, byte[] depotKey)
@@ -52,6 +59,10 @@ namespace DepotDownloader
             public string InstallDir { get; } = installDir;
             public byte[] DepotKey { get; } = depotKey;
         }
+
+        #endregion
+
+        #region Steam3 / Account Helpers
 
         static bool CreateDirectories(uint depotId, uint depotVersion, out string installDir)
         {
@@ -361,6 +372,10 @@ namespace DepotDownloader
             steam3.Disconnect();
         }
 
+        #endregion
+
+        #region Workshop and UGC
+
         public static async Task DownloadPubfileAsync(ulong publishedFileId)
         {
             var details = await steam3.GetPublishedFileDetails(publishedFileId);
@@ -535,6 +550,10 @@ namespace DepotDownloader
                 Console.WriteLine("Warning: Could not save UGC download record: {0}", ex.Message);
             }
         }
+
+        #endregion
+
+        #region Standard Download
 
         private static async Task DownloadWebFile(uint appId, string fileName, string url)
         {
@@ -824,12 +843,15 @@ namespace DepotDownloader
             public ulong depotBytesUncompressed;
         }
 
+        private sealed record ChunkRetryEntry(DepotManifest.ChunkData Chunk, int Failures);
+
         private class ChunkProgressTracker
         {
             public ulong Total;
             public ulong Downloaded;
             public ulong Skipped;
-            public ulong Completed => Downloaded + Skipped;
+            public ulong Failed;
+            public ulong Completed => Downloaded + Skipped + Failed;
             private readonly object _lockObject = new object();
             private DateTime _lastUpdate = DateTime.MinValue;
 
@@ -842,6 +864,12 @@ namespace DepotDownloader
             public void IncrementSkipped()
             {
                 Interlocked.Increment(ref Skipped);
+                UpdateProgress();
+            }
+
+            public void IncrementFailed()
+            {
+                Interlocked.Increment(ref Failed);
                 UpdateProgress();
             }
 
@@ -864,7 +892,7 @@ namespace DepotDownloader
                         (now - _lastUpdate).TotalSeconds >= 2)
                     {
                         var percentage = Total > 0 ? (completed * 100.0) / Total : 0;
-                        Console.Write($"\rProgress: {completed}/{Total} chunks ({percentage:F1}%) - {Downloaded} downloaded, {Skipped} skipped");
+                        Console.Write($"\rProgress: {completed}/{Total} chunks ({percentage:F1}%) - {Downloaded} downloaded, {Skipped} skipped, {Failed} failed");
                         _lastUpdate = now;
 
                         // Only add newline if we're done
@@ -880,8 +908,8 @@ namespace DepotDownloader
             {
                 // Clear the progress line and show final stats
                 Console.Write("\r" + new string(' ', 80) + "\r"); // Clear line
-                Console.WriteLine("Depot {0} - {1}/{2} chunks processed ({3} downloaded, {4} skipped)",
-                    depotId, Completed, Total, Downloaded, Skipped);
+                Console.WriteLine("Depot {0} - {1}/{2} chunks processed ({3} downloaded, {4} skipped, {5} failed)",
+                    depotId, Completed, Total, Downloaded, Skipped, Failed);
             }
         }
 
@@ -1631,7 +1659,9 @@ namespace DepotDownloader
             }
         }
 
-        // ---------------------- RAW ARCHIVE SUPPORT ----------------------
+        #endregion
+
+        #region Raw Download
 
         public sealed class RawDownloadOptions
         {
@@ -1967,11 +1997,7 @@ namespace DepotDownloader
                 }
             }
 
-            var parallelOptions = new ParallelOptions
-            {
-                MaxDegreeOfParallelism = Config.MaxDownloads,
-                CancellationToken = cts.Token
-            };
+            const int MaxChunkRetries = 15;
 
             var progressTracker = new ChunkProgressTracker
             {
@@ -1981,13 +2007,63 @@ namespace DepotDownloader
             Console.WriteLine("Depot {0} - processing {1} chunks...", depot.DepotId, progressTracker.Total);
             Ansi.Progress(Ansi.ProgressState.Default, 0);
 
-            await Parallel.ForEachAsync(chunks, parallelOptions, async (chunk, token) =>
+            // Sliding retry queue: workers pull one entry at a time. On failure the chunk is
+            // re-enqueued at the back with an incremented failure count. Once a chunk reaches
+            // MaxChunkRetries failures it is permanently abandoned. The channel is marked
+            // complete only after every entry has either succeeded or exhausted its retries,
+            // so all worker slots stay busy with forward-progressing work.
+            var channel = Channel.CreateUnbounded<ChunkRetryEntry>(new UnboundedChannelOptions
             {
-                await DownloadChunkToArchiveAsync(cts, depot, chunk, chunksDir, options, progressTracker);
+                SingleWriter = false,
+                SingleReader = false,
             });
+
+            foreach (var chunk in chunks)
+                await channel.Writer.WriteAsync(new ChunkRetryEntry(chunk, 0), cts.Token);
+
+            var pending = chunks.Count;
+
+            var workerTasks = Enumerable.Range(0, Config.MaxDownloads).Select(_ => Task.Run(async () =>
+            {
+                await foreach (var entry in channel.Reader.ReadAllAsync(cts.Token))
+                {
+                    cts.Token.ThrowIfCancellationRequested();
+
+                    var succeeded = await TryDownloadChunkToArchiveAsync(cts, depot, entry.Chunk, chunksDir, options, progressTracker);
+
+                    if (succeeded)
+                    {
+                        // Decrement and close channel when all work is done
+                        if (Interlocked.Decrement(ref pending) == 0)
+                            channel.Writer.Complete();
+                    }
+                    else
+                    {
+                        var nextFailures = entry.Failures + 1;
+                        if (nextFailures >= MaxChunkRetries)
+                        {
+                            var chunkID = Convert.ToHexString(entry.Chunk.ChunkID).ToLowerInvariant();
+                            Console.WriteLine("Chunk {0} failed {1} times and will not be retried.", chunkID, nextFailures);
+                            progressTracker.IncrementFailed();
+                            if (Interlocked.Decrement(ref pending) == 0)
+                                channel.Writer.Complete();
+                        }
+                        else
+                        {
+                            // Back to the end of the queue for another attempt later
+                            await channel.Writer.WriteAsync(new ChunkRetryEntry(entry.Chunk, nextFailures), cts.Token);
+                        }
+                    }
+                }
+            }, cts.Token)).ToArray();
+
+            await Task.WhenAll(workerTasks);
 
             Ansi.Progress(Ansi.ProgressState.Hidden);
             progressTracker.ShowFinalStats(depot.DepotId);
+
+            if (progressTracker.Failed > 0)
+                Console.WriteLine("Warning: {0} chunk(s) could not be downloaded for depot {1} after {2} retries.", progressTracker.Failed, depot.DepotId, MaxChunkRetries);
 
             Console.WriteLine("Depot {0} - raw archive complete", depot.DepotId);
         }
@@ -2310,7 +2386,10 @@ namespace DepotDownloader
             };
         }
 
-        private static async Task DownloadChunkToArchiveAsync(
+        // Single-attempt chunk download. Returns true on success, false if the caller should
+        // re-enqueue the chunk for a later retry. Only returns false for transient errors;
+        // permanent errors (auth failure) still cancel the CTS as before.
+        private static async Task<bool> TryDownloadChunkToArchiveAsync(
             CancellationTokenSource cts,
             DepotDownloadInfo depot,
             DepotManifest.ChunkData chunk,
@@ -2334,132 +2413,109 @@ namespace DepotDownloader
                         if (shaHex == chunkID)
                         {
                             progressTracker.IncrementSkipped();
-                            return;
+                            return true;
                         }
                     }
                     else
                     {
                         progressTracker.IncrementSkipped();
-                        return;
+                        return true;
                     }
                 }
             }
 
-            var written = 0;
             var buffer = ArrayPool<byte>.Shared.Rent((int)chunk.CompressedLength);
-
             try
             {
-                do
-                {
-                    cts.Token.ThrowIfCancellationRequested();
-
-                    Server connection = null;
-                    try
-                    {
-                        connection = cdnPool.GetConnection();
-
-                        string cdnToken = null;
-                        if (steam3.CDNAuthTokens.TryGetValue((depot.DepotId, connection.Host), out var authTokenCallbackPromise))
-                        {
-                            var result = await authTokenCallbackPromise.Task;
-                            cdnToken = result.Token;
-                        }
-
-                        // ADD DELAY HERE - after connection but before request
-                        // This distributes timing across parallel downloads
-                        // await Task.Delay(Random.Shared.Next(100, 800), cts.Token);
-
-                        DebugLog.WriteLine("ContentDownloader", "Downloading chunk {0} from {1} with {2}", chunkID, connection, cdnPool.ProxyServer != null ? cdnPool.ProxyServer : "no proxy");
-                        written = await cdnPool.CDNClient.DownloadDepotChunkAsync(
-                            depot.DepotId,
-                            chunk,
-                            connection,
-                            buffer,
-                            null, // Pass null depot key to get raw compressed data
-                            cdnPool.ProxyServer,
-                            cdnToken).ConfigureAwait(false);
-
-                        cdnPool.ReturnConnection(connection);
-
-                        break;
-                    }
-                    catch (TaskCanceledException)
-                    {
-                        Console.WriteLine("Connection timeout downloading chunk {0}", chunkID);
-                        cdnPool.ReturnBrokenConnection(connection);
-                    }
-                    catch (SteamKitWebRequestException e)
-                    {
-
-                        if (e.StatusCode == HttpStatusCode.Forbidden &&
-                            (!steam3.CDNAuthTokens.TryGetValue((depot.DepotId, connection.Host), out var authTokenCallbackPromise) || !authTokenCallbackPromise.Task.IsCompleted))
-                        {
-                            await steam3.RequestCDNAuthToken(depot.AppId, depot.DepotId, connection);
-
-                            cdnPool.ReturnConnection(connection);
-
-                            continue;
-                        }
-
-                        cdnPool.ReturnBrokenConnection(connection);
-
-                        if (e.StatusCode == HttpStatusCode.Unauthorized || e.StatusCode == HttpStatusCode.Forbidden)
-                        {
-                            Console.WriteLine("Encountered {2} for chunk {0}. Aborting.", chunkID, (int)e.StatusCode);
-                            break;
-                        }
-
-                        // ADD EXPONENTIAL BACKOFF FOR ERRORS
-                        if (e.StatusCode == HttpStatusCode.ServiceUnavailable ||
-                            e.StatusCode == HttpStatusCode.NotFound)
-                        {
-                            var delay = Random.Shared.Next(500, 2000);
-                            await Task.Delay(delay, cts.Token);
-                        }
-
-                        Console.WriteLine("Encountered error downloading chunk {0}: {1}", chunkID, e.StatusCode);
-                    }
-                    catch (OperationCanceledException)
-                    {
-                        break;
-                    }
-                    catch (Exception e)
-                    {
-                        cdnPool.ReturnBrokenConnection(connection);
-                        Console.WriteLine("Encountered unexpected error downloading chunk {0}: {1}", chunkID, e.Message);
-                    }
-                } while (written == 0);
-
-                if (written == 0)
-                {
-                    Console.WriteLine("Failed to download chunk {0} for depot {1}. Aborting.", chunkID, depot.DepotId);
-                    cts.Cancel();
-                }
-
                 cts.Token.ThrowIfCancellationRequested();
 
-                using var fs = File.Open(chunkPath, FileMode.Create, FileAccess.Write, FileShare.Read);
-                await fs.WriteAsync(buffer.AsMemory(0, written), cts.Token);
-
-                if (options.VerifyChunkSha1)
+                Server connection = null;
+                try
                 {
-                    fs.Position = 0;
-                    var sha = SHA1.HashData(fs);
-                    var shaHex = Convert.ToHexString(sha).ToLowerInvariant();
-                    if (shaHex != chunkID)
-                    {
-                        Console.WriteLine("Warning: SHA1 mismatch for chunk {0}.", chunkID);
-                    }
-                }
+                    connection = cdnPool.GetConnection();
 
-                progressTracker.IncrementDownloaded();
+                    string cdnToken = null;
+                    if (steam3.CDNAuthTokens.TryGetValue((depot.DepotId, connection.Host), out var authTokenCallbackPromise))
+                    {
+                        var result = await authTokenCallbackPromise.Task;
+                        cdnToken = result.Token;
+                    }
+
+                    DebugLog.WriteLine("ContentDownloader", "Downloading chunk {0} from {1} with {2}", chunkID, connection, cdnPool.ProxyServer != null ? cdnPool.ProxyServer : "no proxy");
+                    var written = await cdnPool.CDNClient.DownloadDepotChunkAsync(
+                        depot.DepotId,
+                        chunk,
+                        connection,
+                        buffer,
+                        null, // Pass null depot key to get raw compressed data
+                        cdnPool.ProxyServer,
+                        cdnToken).ConfigureAwait(false);
+
+                    cdnPool.ReturnConnection(connection);
+
+                    using var fs = File.Open(chunkPath, FileMode.Create, FileAccess.Write, FileShare.Read);
+                    await fs.WriteAsync(buffer.AsMemory(0, written), cts.Token);
+
+                    if (options.VerifyChunkSha1)
+                    {
+                        fs.Position = 0;
+                        var sha = SHA1.HashData(fs);
+                        var shaHex = Convert.ToHexString(sha).ToLowerInvariant();
+                        if (shaHex != chunkID)
+                            Console.WriteLine("Warning: SHA1 mismatch for chunk {0}.", chunkID);
+                    }
+
+                    progressTracker.IncrementDownloaded();
+                    return true;
+                }
+                catch (TaskCanceledException)
+                {
+                    Console.WriteLine("Connection timeout downloading chunk {0}", chunkID);
+                    cdnPool.ReturnBrokenConnection(connection);
+                    return false;
+                }
+                catch (SteamKitWebRequestException e)
+                {
+                    if (e.StatusCode == HttpStatusCode.Forbidden &&
+                        (!steam3.CDNAuthTokens.TryGetValue((depot.DepotId, connection.Host), out var authTokenCallbackPromise2) || !authTokenCallbackPromise2.Task.IsCompleted))
+                    {
+                        await steam3.RequestCDNAuthToken(depot.AppId, depot.DepotId, connection);
+                        cdnPool.ReturnConnection(connection);
+                        return false;
+                    }
+
+                    cdnPool.ReturnBrokenConnection(connection);
+
+                    if (e.StatusCode == HttpStatusCode.Unauthorized || e.StatusCode == HttpStatusCode.Forbidden)
+                    {
+                        Console.WriteLine("Encountered {0} for chunk {1}. Aborting.", (int)e.StatusCode, chunkID);
+                        cts.Cancel();
+                        return false;
+                    }
+
+                    Console.WriteLine("Encountered error downloading chunk {0}: {1}", chunkID, e.StatusCode);
+                    return false;
+                }
+                catch (OperationCanceledException)
+                {
+                    throw;
+                }
+                catch (Exception e)
+                {
+                    cdnPool.ReturnBrokenConnection(connection);
+                    Console.WriteLine("Encountered unexpected error downloading chunk {0}: {1}", chunkID, e.Message);
+                    return false;
+                }
             }
             finally
             {
                 ArrayPool<byte>.Shared.Return(buffer);
             }
         }
+
+        #endregion
+
+        #region Utilities
 
         public static async Task<List<(uint depotId, ulong manifestId)>> ResolveEncryptedManifestIdsAsync(
             uint appId,
@@ -2704,6 +2760,8 @@ namespace DepotDownloader
                 name = name.Replace(ch, '_');
             return name;
         }
+
+        #endregion
 
     }
 }
