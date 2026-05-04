@@ -515,11 +515,6 @@ namespace DepotDownloader
                         if (result.NewGuardData != null)
                         {
                             AccountSettingsStore.Instance.GuardData[result.AccountName] = result.NewGuardData;
-
-                            if (ContentDownloader.Config.UseQrCode)
-                            {
-                                Console.WriteLine($"Success! Next time you can login with -username {result.AccountName} -remember-password instead of -qr.");
-                            }
                         }
                         else
                         {
@@ -530,6 +525,15 @@ namespace DepotDownloader
                         {
                             AccountSettingsStore.Instance.LoginTokens[result.AccountName] = result.RefreshToken;
                             AccountSettingsStore.Save();
+
+                            if (ContentDownloader.Config.UseQrCode)
+                            {
+                                Console.WriteLine($"Success! Next time you can login with -username {result.AccountName} -remember-password instead of -qr.");
+                            }
+                        }
+                        else if (ContentDownloader.Config.UseQrCode)
+                        {
+                            Console.WriteLine("Note: This session is temporary and will expire. Use -remember-password with -qr to persist your login.");
                         }
                     }
                     catch (TaskCanceledException)
