@@ -2029,13 +2029,36 @@ namespace DepotDownloader
                 {
                     cts.Token.ThrowIfCancellationRequested();
 
-                    var succeeded = await TryDownloadChunkToArchiveAsync(cts, depot, entry.Chunk, chunksDir, options, progressTracker);
+                    bool succeeded;
+                    try
+                    {
+                        succeeded = await TryDownloadChunkToArchiveAsync(cts, depot, entry.Chunk, chunksDir, options, progressTracker);
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        // CTS was cancelled (e.g. auth failure on another chunk). Count this
+                        // chunk as failed so pending reaches zero and the channel closes cleanly.
+                        var chunkID = Convert.ToHexString(entry.Chunk.ChunkID).ToLowerInvariant();
+                        Console.WriteLine("Chunk {0} abandoned due to cancellation.", chunkID);
+                        progressTracker.IncrementFailed();
+                        if (Interlocked.Decrement(ref pending) == 0)
+                            channel.Writer.TryComplete();
+                        return;
+                    }
+                    catch (Exception e)
+                    {
+                        // Unexpected escape from TryDownloadChunkToArchiveAsync — treat as failure
+                        // so the chunk is not silently dropped from the pending count.
+                        var chunkID = Convert.ToHexString(entry.Chunk.ChunkID).ToLowerInvariant();
+                        Console.WriteLine("Chunk {0} encountered unexpected worker error: {1}", chunkID, e.Message);
+                        succeeded = false;
+                    }
 
                     if (succeeded)
                     {
                         // Decrement and close channel when all work is done
                         if (Interlocked.Decrement(ref pending) == 0)
-                            channel.Writer.Complete();
+                            channel.Writer.TryComplete();
                     }
                     else
                     {
@@ -2046,18 +2069,35 @@ namespace DepotDownloader
                             Console.WriteLine("Chunk {0} failed {1} times and will not be retried.", chunkID, nextFailures);
                             progressTracker.IncrementFailed();
                             if (Interlocked.Decrement(ref pending) == 0)
-                                channel.Writer.Complete();
+                                channel.Writer.TryComplete();
                         }
                         else
                         {
-                            // Back to the end of the queue for another attempt later
-                            await channel.Writer.WriteAsync(new ChunkRetryEntry(entry.Chunk, nextFailures), cts.Token);
+                            // Back to the end of the queue for another attempt later.
+                            // If the channel is already closed (cancellation race), count as failed.
+                            if (!channel.Writer.TryWrite(new ChunkRetryEntry(entry.Chunk, nextFailures)))
+                            {
+                                var chunkID = Convert.ToHexString(entry.Chunk.ChunkID).ToLowerInvariant();
+                                Console.WriteLine("Chunk {0} could not be re-enqueued (channel closed).", chunkID);
+                                progressTracker.IncrementFailed();
+                                if (Interlocked.Decrement(ref pending) == 0)
+                                    channel.Writer.TryComplete();
+                            }
                         }
                     }
                 }
             }, cts.Token)).ToArray();
 
             await Task.WhenAll(workerTasks);
+
+            // Drain any chunks still sitting in the channel that workers never got to pick up
+            // (e.g. CTS was cancelled while entries were queued but undequeued).
+            while (channel.Reader.TryRead(out var unprocessed))
+            {
+                var chunkID = Convert.ToHexString(unprocessed.Chunk.ChunkID).ToLowerInvariant();
+                Console.WriteLine("Chunk {0} not processed (operation cancelled).", chunkID);
+                progressTracker.IncrementFailed();
+            }
 
             Ansi.Progress(Ansi.ProgressState.Hidden);
             progressTracker.ShowFinalStats(depot.DepotId);
@@ -2485,13 +2525,6 @@ namespace DepotDownloader
                     }
 
                     cdnPool.ReturnBrokenConnection(connection);
-
-                    if (e.StatusCode == HttpStatusCode.Unauthorized || e.StatusCode == HttpStatusCode.Forbidden)
-                    {
-                        Console.WriteLine("Encountered {0} for chunk {1}. Aborting.", (int)e.StatusCode, chunkID);
-                        cts.Cancel();
-                        return false;
-                    }
 
                     Console.WriteLine("Encountered error downloading chunk {0}: {1}", chunkID, e.StatusCode);
                     return false;
