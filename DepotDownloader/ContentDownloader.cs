@@ -843,7 +843,7 @@ namespace DepotDownloader
             public ulong depotBytesUncompressed;
         }
 
-        private sealed record ChunkRetryEntry(DepotManifest.ChunkData Chunk, int Failures);
+        private sealed record ChunkRetryEntry(DepotManifest.ChunkData Chunk, int Failures, DateTime RetryAfter = default);
 
         private class ChunkProgressTracker
         {
@@ -2029,6 +2029,15 @@ namespace DepotDownloader
                 {
                     cts.Token.ThrowIfCancellationRequested();
 
+                    // If this chunk was re-enqueued after a failure, wait until it is eligible
+                    // for retry so we don't immediately hammer the same CDN endpoint again.
+                    if (entry.RetryAfter != default)
+                    {
+                        var delay = entry.RetryAfter - DateTime.UtcNow;
+                        if (delay > TimeSpan.Zero)
+                            await Task.Delay(delay, cts.Token);
+                    }
+
                     bool succeeded;
                     try
                     {
@@ -2075,7 +2084,7 @@ namespace DepotDownloader
                         {
                             // Back to the end of the queue for another attempt later.
                             // If the channel is already closed (cancellation race), count as failed.
-                            if (!channel.Writer.TryWrite(new ChunkRetryEntry(entry.Chunk, nextFailures)))
+                            if (!channel.Writer.TryWrite(new ChunkRetryEntry(entry.Chunk, nextFailures, DateTime.UtcNow.AddSeconds(5))))
                             {
                                 var chunkID = Convert.ToHexString(entry.Chunk.ChunkID).ToLowerInvariant();
                                 Console.WriteLine("Chunk {0} could not be re-enqueued (channel closed).", chunkID);
