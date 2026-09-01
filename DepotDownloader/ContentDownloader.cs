@@ -4,6 +4,7 @@
 using System;
 using System.Buffers;
 using System.Collections.Concurrent;
+using System.Collections.Frozen;
 using System.Collections.Generic;
 using System.IO;
 using System.IO.Compression;
@@ -43,6 +44,16 @@ namespace DepotDownloader
         private const string DEFAULT_DOWNLOAD_DIR = "depots";
         private const string CONFIG_DIR = ".DepotDownloader";
         private static readonly string STAGING_DIR = Path.Combine(CONFIG_DIR, "staging");
+
+        private static readonly FrozenSet<EWorkshopFileType> SupportedWorkshopFileTypes = FrozenSet.ToFrozenSet(new[]
+        {
+            EWorkshopFileType.Community,
+            EWorkshopFileType.Art,
+            EWorkshopFileType.Screenshot,
+            EWorkshopFileType.Merch,
+            EWorkshopFileType.IntegratedGuide,
+            EWorkshopFileType.ControllerBinding,
+        });
 
         #endregion
 
@@ -376,24 +387,50 @@ namespace DepotDownloader
 
         #region Workshop and UGC
 
-        public static async Task DownloadPubfileAsync(ulong publishedFileId)
+        private static async Task ProcessPublishedFileAsync(ulong publishedFileId, List<(ulong PublishedFileId, PublishedFileDetails Details)> collectedFiles)
         {
             var details = await steam3.GetPublishedFileDetails(publishedFileId);
+            var fileType = (EWorkshopFileType)details.file_type;
 
-            if (!string.IsNullOrEmpty(details?.file_url))
+            if (fileType == EWorkshopFileType.Collection)
             {
-                // Ancient UGC - direct URL download to UGC folder
-                await DownloadWebFileToUGCAsync(details.consumer_appid, publishedFileId, details.filename, details.file_url, details.file_size.ToString());
+                foreach (var child in details.children)
+                {
+                    await ProcessPublishedFileAsync(child.publishedfileid, collectedFiles);
+                }
             }
-            else if (details?.hcontent_file > 0)
+            else if (SupportedWorkshopFileTypes.Contains(fileType))
             {
-                // Modern UGC - manifest-based content, use consumer_appid as depot
-                Console.WriteLine("Retrieved data for workshop item {0}: '{1}' for app {2}", publishedFileId, details.title, details.consumer_appid);
-                await DownloadAppAsync(details.consumer_appid, new List<(uint, ulong)> { (details.consumer_appid, details.hcontent_file) }, DEFAULT_BRANCH, null, null, null, false, true, publishedFileId.ToString(), details.title);
+                collectedFiles.Add((publishedFileId, details));
             }
             else
             {
-                Console.WriteLine("Unable to locate manifest ID for published file {0}", publishedFileId);
+                Console.WriteLine("Published file {0} has unsupported file type {1}. Skipping file", publishedFileId, fileType);
+            }
+        }
+
+        public static async Task DownloadPubfileAsync(ulong publishedFileId)
+        {
+            var collectedFiles = new List<(ulong PublishedFileId, PublishedFileDetails Details)>();
+            await ProcessPublishedFileAsync(publishedFileId, collectedFiles);
+
+            foreach (var (pubFileId, details) in collectedFiles)
+            {
+                if (!string.IsNullOrEmpty(details?.file_url))
+                {
+                    // Ancient UGC - direct URL download to UGC folder
+                    await DownloadWebFileToUGCAsync(details.consumer_appid, pubFileId, details.filename, details.file_url, details.file_size.ToString());
+                }
+                else if (details?.hcontent_file > 0)
+                {
+                    // Modern UGC - manifest-based content, use consumer_appid as depot
+                    Console.WriteLine("Retrieved data for workshop item {0}: '{1}' for app {2}", pubFileId, details.title, details.consumer_appid);
+                    await DownloadAppAsync(details.consumer_appid, new List<(uint, ulong)> { (details.consumer_appid, details.hcontent_file) }, DEFAULT_BRANCH, null, null, null, false, true, pubFileId.ToString(), details.title);
+                }
+                else
+                {
+                    Console.WriteLine("Unable to locate manifest ID for published file {0}", pubFileId);
+                }
             }
         }
 
