@@ -4,8 +4,10 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Text.RegularExpressions;
 using System.Threading.Tasks;
+using SteamKit2;
 
 namespace DepotDownloader
 {
@@ -41,8 +43,10 @@ namespace DepotDownloader
                 return 1;
             }
 
+            var listFiles = parser.HasFlag("-list-files", "-list");
+
             var outputDir = parser.Get<string>(null, "-output");
-            if (string.IsNullOrEmpty(outputDir))
+            if (!listFiles && string.IsNullOrEmpty(outputDir))
             {
                 Console.WriteLine("Error: -output <dir> is required");
                 return 1;
@@ -54,13 +58,14 @@ namespace DepotDownloader
             var chunksDir = parser.Get<string>(null, "-chunks");
             var chunkstoreDir = parser.Get<string>(null, "-chunkstore");
             var fileListPath = parser.Get<string>(null, "-filelist");
+            var inlineFiles = parser.Get<string>(null, "-files");
             var validate = parser.HasFlag("-validate");
             var maxThreads = parser.Get(0, "-threads");
             var failFast = parser.HasFlag("-fail-fast");
             var verbose = parser.HasFlag("-verbose", "-v");
             parser.WarnUnconsumed();
 
-            if (!string.IsNullOrEmpty(chunksDir) && !string.IsNullOrEmpty(chunkstoreDir))
+            if (!listFiles && !string.IsNullOrEmpty(chunksDir) && !string.IsNullOrEmpty(chunkstoreDir))
             {
                 Console.WriteLine("Error: -chunks and -chunkstore are mutually exclusive - pick one chunk source");
                 return 1;
@@ -68,7 +73,10 @@ namespace DepotDownloader
 
             // Resolve the depot key first (best-effort - it may turn out not to be needed, e.g.
             // a .manifest input plus an already-decrypted chunkstore, but almost every real case
-            // needs it, and .manif4/.manif5 inputs always do to decrypt filenames).
+            // needs it, and .manif4/.manif5 inputs always do to decrypt filenames - raw-saved
+            // manifests store them AES-encrypted and base64-wrapped inside the zip payload, only
+            // readable as real paths once DepotManifest.DecryptFilenames runs, which
+            // LoadDepotManifestFromAnyFormat below does for us given a key).
             byte[] depotKey = null;
             try
             {
@@ -96,6 +104,12 @@ namespace DepotDownloader
 
             depotId ??= manifest.DepotID != 0 ? manifest.DepotID : null;
 
+            if (listFiles)
+            {
+                PrintFileList(manifest, verbose);
+                return 0;
+            }
+
             IChunkSource chunkSource;
             try
             {
@@ -117,11 +131,28 @@ namespace DepotDownloader
                     Verbose = verbose
                 };
 
-                if (!string.IsNullOrEmpty(fileListPath))
+                // -filelist and -files are both "files to include" sources and combine (union) if
+                // both are given, rather than one overriding the other - -files for a quick
+                // one-off subset, -filelist for anything worth saving and reusing.
+                if (!string.IsNullOrEmpty(fileListPath) || !string.IsNullOrEmpty(inlineFiles))
                 {
-                    if (!TryParseFileList(fileListPath, out var includeFiles, out var includeRegexes))
+                    var includeFiles = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                    var includeRegexes = new List<Regex>();
+
+                    if (!string.IsNullOrEmpty(fileListPath))
                     {
-                        return 1;
+                        if (!TryMergeFileList(fileListPath, includeFiles, includeRegexes))
+                        {
+                            return 1;
+                        }
+                    }
+
+                    if (!string.IsNullOrEmpty(inlineFiles))
+                    {
+                        if (!TryMergeInlineFileList(inlineFiles, includeFiles, includeRegexes))
+                        {
+                            return 1;
+                        }
                     }
 
                     options.IncludeFiles = includeFiles;
@@ -209,17 +240,71 @@ namespace DepotDownloader
             return new LooseChunkSource(looseDir, depotKey);
         }
 
-        /// <summary>Same literal-path/"regex:"-prefix format as -filelist elsewhere in this codebase (see DownloadCommand.cs).</summary>
-        private static bool TryParseFileList(string fileListPath, out HashSet<string> includeFiles, out List<Regex> includeRegexes)
+        /// <summary>Same literal-path/"regex:"-prefix format as -filelist elsewhere in this codebase (see DownloadCommand.cs). Merges into the caller's sets rather than replacing them, so -filelist and -files can combine.</summary>
+        private static bool TryMergeFileList(string fileListPath, HashSet<string> includeFiles, List<Regex> includeRegexes)
         {
-            if (!Util.TryParseFileList(fileListPath, out includeFiles, out includeRegexes, out var error))
+            if (!Util.TryParseFileList(fileListPath, out var literals, out var regexes, out var error))
             {
                 Console.WriteLine($"Error: {error}");
                 return false;
             }
 
+            includeFiles.UnionWith(literals);
+            includeRegexes.AddRange(regexes);
             Console.WriteLine($"Using filelist: '{fileListPath}'.");
             return true;
+        }
+
+        /// <summary>Inline, ";"-separated equivalent of -filelist (see Util.TryParseInlineFileList) - merges into the caller's sets rather than replacing them.</summary>
+        private static bool TryMergeInlineFileList(string inline, HashSet<string> includeFiles, List<Regex> includeRegexes)
+        {
+            if (!Util.TryParseInlineFileList(inline, out var literals, out var regexes, out var error))
+            {
+                Console.WriteLine($"Error: {error}");
+                return false;
+            }
+
+            includeFiles.UnionWith(literals);
+            includeRegexes.AddRange(regexes);
+            return true;
+        }
+
+        /// <summary>
+        /// Lists every file recorded in the manifest and exits, without reconstructing anything -
+        /// no -output/-chunks/-chunkstore needed. Filenames come from the already-loaded manifest,
+        /// which LoadDepotManifestFromAnyFormat has already decrypted (given a depot key) if this
+        /// was a raw-saved .manif4/.manif5 - those store names AES-encrypted and base64-wrapped,
+        /// not human-readable until decrypted. Plain (non-verbose) output is one path per line,
+        /// sorted, and directly usable as a -filelist input (e.g. redirected to a file, trimmed
+        /// down by hand, then passed back in with -filelist).
+        /// </summary>
+        private static void PrintFileList(SteamKit2.DepotManifest manifest, bool verbose)
+        {
+            var files = manifest.Files
+                .Select(f => f.FileName.Replace('\\', '/'))
+                .OrderBy(name => name, StringComparer.OrdinalIgnoreCase)
+                .ToList();
+
+            if (verbose)
+            {
+                foreach (var file in manifest.Files.OrderBy(f => f.FileName.Replace('\\', '/'), StringComparer.OrdinalIgnoreCase))
+                {
+                    var kind = file.Flags.HasFlag(EDepotFileFlag.Directory) ? "dir"
+                        : file.Flags.HasFlag(EDepotFileFlag.Symlink) ? "symlink"
+                        : "file";
+                    Console.WriteLine($"{file.FileName.Replace('\\', '/')}  ({kind}, {file.TotalSize:N0} bytes, {file.Chunks.Count:N0} chunks)");
+                }
+            }
+            else
+            {
+                foreach (var name in files)
+                {
+                    Console.WriteLine(name);
+                }
+            }
+
+            Console.WriteLine();
+            Console.WriteLine($"{files.Count:N0} file(s) total.");
         }
 
         public static void PrintUsage()
@@ -235,7 +320,7 @@ namespace DepotDownloader
             Console.WriteLine();
             Console.WriteLine("OPTIONS:");
             Console.WriteLine("  -manifest <file>         Manifest file (alternative to the positional argument)");
-            Console.WriteLine("  -output <dir>            Output directory for reconstructed files (required)");
+            Console.WriteLine("  -output <dir>            Output directory for reconstructed files (required unless -list-files)");
             Console.WriteLine("  -depot <id>              Depot ID (for key lookup / chunk source auto-detect)");
             Console.WriteLine("  -depotkey <hex>          Depot key in hex");
             Console.WriteLine("  -depotkey-file <path>    Path to depot key file");
@@ -243,18 +328,32 @@ namespace DepotDownloader
             Console.WriteLine("  -chunkstore <dir>        Packed chunkstore folder (mutually exclusive with -chunks)");
             Console.WriteLine("  -filelist <file>         Only reconstruct files matching this list (literal paths");
             Console.WriteLine("                           or \"regex:<pattern>\" lines)");
+            Console.WriteLine("  -files <list>            Same as -filelist, inline: \";\"-separated literal paths and/or");
+            Console.WriteLine("                           \"regex:<pattern>\" entries. Combines with -filelist if both given.");
+            Console.WriteLine("  -list-files, -list       List every file recorded in the manifest and exit - no");
+            Console.WriteLine("                           reconstruction happens, -output/-chunks/-chunkstore aren't needed.");
+            Console.WriteLine("                           Plain output is one path per line, directly reusable as -filelist");
+            Console.WriteLine("                           input; add -verbose for type/size/chunk-count per file.");
             Console.WriteLine("  -validate                Verify each file's whole-content SHA1 after writing");
             Console.WriteLine("  -threads <count>         Max parallel file writers (default: CPU count - 1)");
             Console.WriteLine("  -fail-fast               Stop enqueuing further files after the first failure");
-            Console.WriteLine("  -verbose, -v             Show per-file progress output");
+            Console.WriteLine("  -verbose, -v             Show per-file progress output (or extra columns with -list-files)");
             Console.WriteLine();
             Console.WriteLine("Every in-scope file is always rewritten from scratch - reconstruct is safe to");
-            Console.WriteLine("re-run after an interruption, nothing partial is ever trusted or reused.");
+            Console.WriteLine("re-run after an interruption, nothing partial is ever trusted or reused. Without");
+            Console.WriteLine("-filelist/-files, every file in the manifest is in scope - from a single file up to");
+            Console.WriteLine("the whole depot is just a matter of how narrow or wide that filter is.");
+            Console.WriteLine();
+            Console.WriteLine("A raw-saved manifest (.manif4/.manif5) stores filenames AES-encrypted and");
+            Console.WriteLine("base64-wrapped, not human-readable - a depot key is required to decrypt them,");
+            Console.WriteLine("for -list-files just as much as for actually reconstructing.");
             Console.WriteLine();
             Console.WriteLine("EXAMPLES:");
             Console.WriteLine("  depotdownloader reconstruct depot/4001/manifest/123.manifest -output game/ -depot 4001");
             Console.WriteLine("  depotdownloader reconstruct depot/4001/manifest/123.manif5 -output game/ -depotkey-file depot/4001/4001.depotkey");
             Console.WriteLine("  depotdownloader reconstruct depot/4001/manifest/123.manifest -output game/ -chunkstore chunkstore/ -validate");
+            Console.WriteLine("  depotdownloader reconstruct depot/4001/manifest/123.manif5 -depotkey-file depot/4001/4001.depotkey -list-files");
+            Console.WriteLine("  depotdownloader reconstruct depot/4001/manifest/123.manifest -output game/ -files \"bin/game.exe;regex:^assets/.*\\.dds$\"");
         }
     }
 }

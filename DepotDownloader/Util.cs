@@ -236,12 +236,39 @@ namespace DepotDownloader
         public static int ResolveParallelism(int requested) =>
             requested > 0 ? requested : Math.Max(1, Environment.ProcessorCount - 1);
 
+        private const string FileListRegexPrefix = "regex:";
+
+        /// <summary>
+        /// Core of the "-filelist" entry syntax, shared by the file-based and inline parsers
+        /// below: each entry is either a literal relative path (backslashes normalized to forward
+        /// slashes) or a "regex:&lt;pattern&gt;"-prefixed regular expression (case-insensitive).
+        /// Blank/whitespace-only entries are ignored.
+        /// </summary>
+        private static void ParseFileListEntries(IEnumerable<string> entries, HashSet<string> literals, List<Regex> regexes)
+        {
+            foreach (var raw in entries)
+            {
+                var entry = raw.Trim();
+                if (entry.Length == 0)
+                    continue;
+
+                if (entry.StartsWith(FileListRegexPrefix))
+                {
+                    regexes.Add(new Regex(entry[FileListRegexPrefix.Length..], RegexOptions.Compiled | RegexOptions.IgnoreCase));
+                }
+                else
+                {
+                    literals.Add(entry.Replace('\\', '/'));
+                }
+            }
+        }
+
         /// <summary>
         /// Parses a "-filelist"-style file: non-blank lines are either literal relative paths
-        /// (backslashes normalized to forward slashes) or "regex:&lt;pattern&gt;"-prefixed regular
-        /// expressions (case-insensitive). Same format shared by "download -filelist" and
-        /// "reconstruct -filelist" - callers decide for themselves whether a parse failure should
-        /// warn-and-continue or abort, so this only reports success/failure plus a message.
+        /// or "regex:&lt;pattern&gt;"-prefixed regular expressions - see <see cref="ParseFileListEntries"/>.
+        /// Same format shared by "download -filelist" and "reconstruct -filelist" - callers decide
+        /// for themselves whether a parse failure should warn-and-continue or abort, so this only
+        /// reports success/failure plus a message.
         /// </summary>
         public static bool TryParseFileList(string path, out HashSet<string> literals, out List<Regex> regexes, out string error)
         {
@@ -255,24 +282,35 @@ namespace DepotDownloader
                 return false;
             }
 
-            const string RegexPrefix = "regex:";
+            try
+            {
+                ParseFileListEntries(File.ReadAllLines(path), literals, regexes);
+            }
+            catch (Exception ex)
+            {
+                error = ex.Message;
+                return false;
+            }
+
+            return true;
+        }
+
+        /// <summary>
+        /// Parses an inline, semicolon-separated file list - same literal-path/"regex:"-prefix
+        /// syntax as -filelist's file format (see <see cref="ParseFileListEntries"/>), one entry
+        /// per ";"-separated item instead of one per line. For a quick one-off subset that isn't
+        /// worth writing to a separate list file. Semicolon rather than comma specifically because
+        /// a regex entry legitimately contains commas (e.g. a "{2,4}" quantifier).
+        /// </summary>
+        public static bool TryParseInlineFileList(string inline, out HashSet<string> literals, out List<Regex> regexes, out string error)
+        {
+            literals = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            regexes = [];
+            error = null;
 
             try
             {
-                foreach (var entry in File.ReadAllLines(path))
-                {
-                    if (string.IsNullOrWhiteSpace(entry))
-                        continue;
-
-                    if (entry.StartsWith(RegexPrefix))
-                    {
-                        regexes.Add(new Regex(entry[RegexPrefix.Length..], RegexOptions.Compiled | RegexOptions.IgnoreCase));
-                    }
-                    else
-                    {
-                        literals.Add(entry.Replace('\\', '/'));
-                    }
-                }
+                ParseFileListEntries(inline.Split(';'), literals, regexes);
             }
             catch (Exception ex)
             {
