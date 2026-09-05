@@ -349,6 +349,88 @@ namespace DepotDownloader
             throw new Exception($"EResult {(int)details.Result} ({details.Result}) while retrieving file details for pubfile {pubFile}.");
         }
 
+        /// <summary>
+        /// PublishedFile.GetItemChanges - a per-app delta feed ("items updated since
+        /// last_time_updated", each with its new manifest_id already attached - no per-item
+        /// follow-up needed). What "workshop poll" calls on every run.
+        ///
+        /// Two access restrictions, both confirmed empirically against a real account/app (depot
+        /// 4000 - see README):
+        ///  - Anonymous login always gets EResult.AccessDenied. An authenticated login is required.
+        ///  - Even authenticated, lastTimeUpdated can't be arbitrarily old: confirmed working 96
+        ///    hours back, confirmed EResult.Ignored 7 days back (with num_items_max varied down to
+        ///    50, ruling out a result-size cap - this is a hard elapsed-time cutoff). The exact
+        ///    boundary within that range, and whether it's fixed or scales with an app's own
+        ///    churn, is not pinned down - treat Ignored as "watermark too stale, re-bootstrap this
+        ///    app" rather than a transient failure worth retrying as-is.
+        /// The Result is returned to the caller unwrapped (not thrown on non-OK) specifically so
+        /// "workshop poll" can branch on Ignored vs. a real error.
+        /// </summary>
+        public async Task<(EResult Result, CPublishedFile_GetItemChanges_Response Body)> GetItemChanges(uint appId, uint lastTimeUpdated, uint numItemsMax = 50000)
+        {
+            var request = new CPublishedFile_GetItemChanges_Request
+            {
+                appid = appId,
+                last_time_updated = lastTimeUpdated,
+                num_items_max = numItemsMax,
+            };
+
+            var response = await steamPublishedFile.GetItemChanges(request);
+
+            return (response.Result, response.Body);
+        }
+
+        /// <summary>
+        /// PublishedFile.QueryFiles - the same backend the workshop browse page itself calls.
+        /// Confirmed working under anonymous login (unlike GetItemChanges). With
+        /// query_type=k_PublishedFileQueryType_RankedByLastUpdatedDate (21) and return_details,
+        /// this is what "workshop bootstrap" pages through to build the initial catalog - each
+        /// returned PublishedFileDetails already carries hcontent_file/time_updated/title, so no
+        /// per-item follow-up call is needed. cursor "*" starts a new query; pass back
+        /// Body.next_cursor to continue.
+        /// </summary>
+        public async Task<(EResult Result, CPublishedFile_QueryFiles_Response Body)> QueryFiles(uint appId, string cursor, uint numPerPage, uint queryType = 21)
+        {
+            var request = new CPublishedFile_QueryFiles_Request
+            {
+                query_type = queryType,
+                appid = appId,
+                numperpage = numPerPage,
+                cursor = cursor,
+                return_details = true,
+            };
+
+            var response = await steamPublishedFile.QueryFiles(request);
+
+            return (response.Result, response.Body);
+        }
+
+        /// <summary>
+        /// PublishedFile.GetChangeHistory - a single item's full changelog: every historical
+        /// manifest_id with its timestamp and (when the author wrote one) a description.
+        /// Confirmed working anonymously for BOTH chunk-based items and genuinely ancient
+        /// (2012-era) direct-URL ones - the latter just report only the entries that ever really
+        /// happened (often exactly one, their original upload). What "workshop download -history"
+        /// walks to find every version worth archiving, rather than only whatever's current.
+        /// One caveat that matters for ancient items specifically: an entry here is only a
+        /// timestamp + content handle, never a URL - Steam's GetDetails only ever exposes the
+        /// CURRENT file_url, so a historical ancient entry is discoverable/loggable but not
+        /// necessarily re-downloadable (see README). Paginate with startIndex/count (default page
+        /// size 100) - most items have far fewer changes than that, but this doesn't assume it.
+        /// </summary>
+        public async Task<(EResult Result, CPublishedFile_GetChangeHistory_Response Body)> GetChangeHistory(ulong publishedFileId, uint startIndex = 0, uint count = 100)
+        {
+            var request = new CPublishedFile_GetChangeHistory_Request
+            {
+                publishedfileid = publishedFileId,
+                startindex = startIndex,
+                count = count,
+            };
+
+            var response = await steamPublishedFile.GetChangeHistory(request);
+
+            return (response.Result, response.Body);
+        }
 
         public async Task<SteamCloud.UGCDetailsCallback> GetUGCDetails(UGCHandle ugcHandle)
         {

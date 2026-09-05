@@ -99,13 +99,25 @@ namespace DepotDownloader
         public static async Task DownloadPubfileRawAsync(ulong publishedFileId, RawDownloadOptions options)
         {
             var details = await steam3.GetPublishedFileDetails(publishedFileId);
+            await DownloadPubfileRawAsync(publishedFileId, details, options);
+        }
 
+        /// <summary>
+        /// Same as the single-argument overload, but for a caller that already has this item's
+        /// PublishedFileDetails on hand (bootstrap's QueryFiles page, or poll's reclassification
+        /// fetch) - avoids a redundant GetPublishedFileDetails round-trip per item, which matters
+        /// at the scale "workshop bootstrap -manifests-only" operates at.
+        /// </summary>
+        public static async Task DownloadPubfileRawAsync(ulong publishedFileId, PublishedFileDetails details, RawDownloadOptions options)
+        {
             if (!string.IsNullOrEmpty(details?.file_url))
             {
-                // Ancient UGC - direct URL download to UGC folder (raw mode doesn't change this -
-                // there's no raw/processed distinction for a direct-URL file the way there is for
-                // depot chunks, so this is intentionally identical to DownloadPubfileAsync above)
-                await DownloadWebFileToUGCAsync(details.consumer_appid, publishedFileId, details.title, details.filename, details.file_url, details.file_size.ToString(), details.time_updated);
+                // Ancient UGC - direct URL download to UGC folder. options.DryRun ("-raw-dry-run"/
+                // "-manifests-only" from the workshop tracker) still applies here even though
+                // there's no manifest/chunk split for a direct-URL file the way there is for depot
+                // chunks - see DownloadWebFileToUGCAsync's dryRun handling for what it means here
+                // (log the item's current metadata without fetching its content).
+                await DownloadWebFileToUGCAsync(details.consumer_appid, publishedFileId, details.title, details.filename, details.file_url, details.file_size.ToString(), details.time_updated, options.DryRun);
             }
             else if (details?.hcontent_file > 0)
             {
@@ -135,9 +147,9 @@ namespace DepotDownloader
 
             if (!string.IsNullOrEmpty(details?.file_url))
             {
-                // Ancient UGC - direct URL download to UGC folder (raw mode doesn't change this -
-                // see the identical comment in DownloadPubfileRawAsync above)
-                await DownloadWebFileToUGCAsync(details.consumer_appid, ugcId, details.title, details.filename, details.file_url, details.file_size.ToString(), details.time_updated);
+                // Ancient UGC - direct URL download to UGC folder (see the identical comment in
+                // DownloadPubfileRawAsync above re: options.DryRun)
+                await DownloadWebFileToUGCAsync(details.consumer_appid, ugcId, details.title, details.filename, details.file_url, details.file_size.ToString(), details.time_updated, options.DryRun);
             }
             else if (details != null)
             {
@@ -148,56 +160,6 @@ namespace DepotDownloader
             {
                 Console.WriteLine($"Unable to locate UGC details for {ugcId}");
             }
-        }
-
-        public static async Task DownloadWorkshopItemAsync(ulong workshopId)
-        {
-            // Try to get published file details first - only the lookup itself falls back to UGC
-            // on failure; a real download error below must propagate, not be masked by a confusing
-            // secondary UGC-path failure on an id that legitimately is a published file.
-            PublishedFileDetails details = null;
-            try
-            {
-                details = await steam3.GetPublishedFileDetails(workshopId);
-            }
-            catch
-            {
-                // Fall back to UGC
-            }
-
-            if (details != null)
-            {
-                await DownloadPubfileAsync(workshopId);
-                return;
-            }
-
-            // Try UGC if published file lookup failed
-            await DownloadUGCAsync(workshopId);
-        }
-
-        public static async Task DownloadWorkshopItemRawAsync(ulong workshopId, RawDownloadOptions options)
-        {
-            // Try to get published file details first - only the lookup itself falls back to UGC
-            // on failure; a real download error below must propagate, not be masked by a confusing
-            // secondary UGC-path failure on an id that legitimately is a published file.
-            PublishedFileDetails details = null;
-            try
-            {
-                details = await steam3.GetPublishedFileDetails(workshopId);
-            }
-            catch
-            {
-                // Fall back to UGC
-            }
-
-            if (details != null)
-            {
-                await DownloadPubfileRawAsync(workshopId, options);
-                return;
-            }
-
-            // Try UGC if published file lookup failed
-            await DownloadUGCRawAsync(workshopId, options);
         }
 
         // One version of an ancient (direct-URL) UGC item, as recorded in its per-item sidecar.
@@ -284,7 +246,7 @@ namespace DepotDownloader
         // library) later. Both come from the same PublishedFileDetails lookup where available;
         // the older SteamCloud.UGCDetailsCallback fallback has no title or update-timestamp, so
         // callers pass null/0 for those and this still works, just without update-detection.
-        private static async Task DownloadWebFileToUGCAsync(uint appId, ulong workshopId, string title, string internalFileName, string url, string fileSize, uint timeUpdated)
+        private static async Task DownloadWebFileToUGCAsync(uint appId, ulong workshopId, string title, string internalFileName, string url, string fileSize, uint timeUpdated, bool dryRun = false)
         {
             var itemDir = Path.Combine("ugc", appId.ToString(), workshopId.ToString());
             Directory.CreateDirectory(itemDir);
@@ -303,6 +265,39 @@ namespace DepotDownloader
                 latest.DownloadedAt = DateTime.Now.ToString("O");
                 SaveUgcHistory(sidecarPath, history);
                 RecordUGCDownload(workshopId, url, title, internalFileName, destPath, appId, "exists", fileSize, timeUpdated);
+                return;
+            }
+
+            if (dryRun)
+            {
+                // No manifest/chunk split exists for a direct-URL file the way there is for depot
+                // chunks - the closest equivalent to "-raw-dry-run" here is recording the item's
+                // current metadata (title/filename/URL/reported size/TimeUpdated) without actually
+                // fetching its content, so a workshop-tracker "manifests-only" pass still leaves a
+                // real, inspectable record of every ancient item it saw, not just the ones it
+                // fully downloaded. latest.TimeUpdated == timeUpdated but the file itself missing
+                // (destPath not found above) still falls through to here and logs again - that's
+                // deliberate, since dry-run mode never actually writes destPath in the first place.
+                Console.WriteLine("Dry run: logging UGC item {0} ('{1}') - metadata recorded, content not downloaded", workshopId, title ?? internalFileName ?? "Unknown");
+
+                if (latest == null || latest.TimeUpdated != timeUpdated)
+                {
+                    history.Add(new UgcVersionRecord
+                    {
+                        TimeUpdated = timeUpdated,
+                        Title = title,
+                        Filename = internalFileName,
+                        FileUrl = url,
+                        RelativePath = null,
+                        FileSize = fileSize, // as reported by Steam - never verified against actual bytes in dry-run mode
+                        Sha1 = null,
+                        Status = "logged",
+                        DownloadedAt = DateTime.Now.ToString("O"),
+                    });
+                    SaveUgcHistory(sidecarPath, history);
+                }
+
+                RecordUGCDownload(workshopId, url, title, internalFileName, destPath: null, appId, "logged", fileSize, timeUpdated);
                 return;
             }
 

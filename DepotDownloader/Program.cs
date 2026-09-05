@@ -57,6 +57,9 @@ namespace DepotDownloader
                     case "chunkstore":
                         return await ChunkstoreCommand.RunAsync(args[1..]);
 
+                    case "workshop":
+                        return await WorkshopCommand.RunAsync(args[1..]);
+
                     case "help":
                     case "--help":
                     case "-h":
@@ -94,6 +97,11 @@ namespace DepotDownloader
         private static bool HasLegacyDownloadArgs(string[] args)
         {
             // Check if args contain typical download parameters
+            // -workshop/-workshop-csv are kept here even though "download" no longer accepts them -
+            // this only decides whether legacy (no-subcommand) syntax gets routed into
+            // DownloadCommand, which then prints the "moved to workshop command" redirect message.
+            // Without this, e.g. "depotdownloader -workshop 123" would fall through to a bare
+            // "Unknown command: -workshop" instead of that more useful redirect.
             var downloadParams = new[] { "-app", "-manifest-csv", "-workshop", "-workshop-csv", "-username", "-depot" };
             return args.Any(arg => downloadParams.Contains(arg, StringComparer.OrdinalIgnoreCase));
         }
@@ -130,9 +138,13 @@ namespace DepotDownloader
                     ChunkstoreCommand.PrintUsage();
                     return 0;
 
+                case "workshop":
+                    WorkshopCommand.PrintUsage();
+                    return 0;
+
                 default:
                     Console.WriteLine($"Unknown sub-command: {subCommand}");
-                    Console.WriteLine("Available sub-commands: download, list-depots, manifest, validation, reconstruct, chunkstore");
+                    Console.WriteLine("Available sub-commands: download, list-depots, manifest, validation, reconstruct, chunkstore, workshop");
                     return 1;
             }
         }
@@ -146,7 +158,7 @@ namespace DepotDownloader
             Console.WriteLine("  depotdownloader <COMMAND> [OPTIONS...]");
             Console.WriteLine();
             Console.WriteLine("COMMANDS:");
-            Console.WriteLine("  download                     Download Steam content (apps, depots, workshop items)");
+            Console.WriteLine("  download                     Download Steam content (apps, depots)");
             Console.WriteLine("  list-depots                  List branches per depot from a CSV (no download)"); // NEW
             Console.WriteLine("  manifest                     Extract, compare, and list manifest files (offline)");
             Console.WriteLine("  validate-depot               Validate all chunks in a depot directory (offline)");
@@ -155,6 +167,7 @@ namespace DepotDownloader
             Console.WriteLine("  validate-chunkstore-chunks   Validate specific chunks in a chunkstore (offline; alias for 'chunkstore verify -chunks')");
             Console.WriteLine("  reconstruct                  Rebuild installed files offline from a manifest + archived chunks");
             Console.WriteLine("  chunkstore                   Pack/unpack/verify/stats/update/rebuild on chunk storage");
+            Console.WriteLine("  workshop                     Bootstrap/poll an app's whole workshop (chunk-based + ancient UGC) for automatic update tracking");
             Console.WriteLine();
             Console.WriteLine("HELP:");
             Console.WriteLine("  help              Show this help message");
@@ -168,7 +181,9 @@ namespace DepotDownloader
             Console.WriteLine("  depotdownloader manifest diff old.json new.json -verbose");
             Console.WriteLine("  depotdownloader manifest list -depot 4000 -workshop");
             Console.WriteLine("  depotdownloader validate-depot depot/4001 -verbose");
-            Console.WriteLine("  depotdownloader download -workshop 123456 789012");
+            Console.WriteLine("  depotdownloader workshop download -workshop 123456 789012");
+            Console.WriteLine("  depotdownloader workshop bootstrap -app 4000");
+            Console.WriteLine("  depotdownloader workshop poll -app 4000 -username myaccount -remember-password");
             Console.WriteLine();
             Console.WriteLine("For detailed help on any command: depotdownloader help <command>");
             Console.WriteLine();

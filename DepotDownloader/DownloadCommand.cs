@@ -23,7 +23,6 @@ namespace DepotDownloader
             Invalid,
             App,
             ManifestCsv,
-            Workshop
         }
 
         /// <summary>
@@ -148,25 +147,22 @@ namespace DepotDownloader
 
             var appId = parser.Get(ContentDownloader.INVALID_APP_ID, "-app");
             var manifestCsvPath = parser.Get<string>(null, "-manifest-csv");
-            var workshopCsvPath = parser.Get<string>(null, "-workshop-csv");
-            var workshopIds = parser.GetList<ulong>("-workshop");
 
-            // Legacy pubfile and ugc support - redirect to workshop mode
-            var pubFile = parser.Get(ContentDownloader.INVALID_MANIFEST_ID, "-pubfile");
-            var ugcId = parser.Get(ContentDownloader.INVALID_MANIFEST_ID, "-ugc");
-            if (pubFile != ContentDownloader.INVALID_MANIFEST_ID)
+            // Old workshop-related flags all moved to the "workshop" command - matched here (not
+            // printed by name below) purely to redirect anyone still typing the old syntax.
+            if (parser.HasFlag("-workshop", "-workshop-csv", "-pubfile", "-ugc"))
             {
-                workshopIds.Add(pubFile);
-                Console.WriteLine("Note: -pubfile is deprecated, treating as workshop item {0}", pubFile);
-            }
-            if (ugcId != ContentDownloader.INVALID_MANIFEST_ID)
-            {
-                workshopIds.Add(ugcId);
-                Console.WriteLine("Note: -ugc is deprecated, treating as workshop item {0}", ugcId);
+                Console.WriteLine("Error: Workshop downloading has moved to the 'workshop' command:");
+                Console.WriteLine("  depotdownloader workshop download -workshop <id> [<id>...]   (ad-hoc, a few IDs)");
+                Console.WriteLine("  depotdownloader workshop bootstrap -app <appid>              (for anything more -");
+                Console.WriteLine("  depotdownloader workshop download -app <appid>               a tracked catalog,");
+                Console.WriteLine("                                                               not a bare ID list)");
+                Console.WriteLine("See 'depotdownloader help workshop' for details (bootstrap/poll/download/status).");
+                return 1;
             }
 
             // Determine operation mode and validate arguments
-            var operationMode = DetermineOperationMode(appId, manifestCsvPath, workshopCsvPath, workshopIds.Count > 0);
+            var operationMode = DetermineOperationMode(appId, manifestCsvPath);
             if (operationMode == OperationMode.Invalid)
             {
                 return 1;
@@ -204,100 +200,13 @@ namespace DepotDownloader
                 DryRun = rawDryRun,
             } : null;
 
-            if (operationMode == OperationMode.Workshop)
-            {
-                return await ProcessWorkshopDownload(parser, rawOptions, workshopCsvPath, workshopIds, username, password);
-            }
-            else if (operationMode == OperationMode.ManifestCsv)
+            if (operationMode == OperationMode.ManifestCsv)
             {
                 return await ProcessManifestCsvDownload(parser, manifestCsvPath, rawOptions, username, password);
             }
             else // OperationMode.App
             {
                 return await ProcessAppDownload(parser, appId, rawOptions, username, password);
-            }
-        }
-
-        private static async Task<int> ProcessWorkshopDownload(ArgParser parser, ContentDownloader.RawDownloadOptions rawOptions, string workshopCsvPath, List<ulong> workshopIds, string username, string password)
-        {
-            parser.WarnUnconsumed();
-
-            if (InitializeSteam(username, password))
-            {
-                int exitStatus = 0;
-                try
-                {
-                    if (!string.IsNullOrEmpty(workshopCsvPath))
-                    {
-                        // Process workshop CSV
-                        var workshopCsvIds = ReadWorkshopCsv(workshopCsvPath);
-                        foreach (var workshopId in workshopCsvIds)
-                        {
-                            try
-                            {
-                                if (rawOptions != null)
-                                {
-                                    await ContentDownloader.DownloadWorkshopItemRawAsync(workshopId, rawOptions).ConfigureAwait(false);
-                                }
-                                else
-                                {
-                                    await ContentDownloader.DownloadWorkshopItemAsync(workshopId).ConfigureAwait(false);
-                                }
-                            }
-                            catch (Exception ex)
-                            {
-                                Console.WriteLine("Error downloading workshop item {0}: {1}", workshopId, ex.Message);
-                                exitStatus++;
-                            }
-                        }
-                    }
-                    else
-                    {
-                        // Process individual workshop IDs
-                        foreach (var workshopId in workshopIds)
-                        {
-                            try
-                            {
-                                if (rawOptions != null)
-                                {
-                                    await ContentDownloader.DownloadWorkshopItemRawAsync(workshopId, rawOptions).ConfigureAwait(false);
-                                }
-                                else
-                                {
-                                    await ContentDownloader.DownloadWorkshopItemAsync(workshopId).ConfigureAwait(false);
-                                }
-                            }
-                            catch (Exception ex)
-                            {
-                                Console.WriteLine("Error downloading workshop item {0}: {1}", workshopId, ex.Message);
-                                exitStatus++;
-                            }
-                        }
-                    }
-                }
-                catch (Exception ex) when (
-                    ex is ContentDownloaderException
-                    || ex is OperationCanceledException)
-                {
-                    Console.WriteLine(ex.Message);
-                    return 1;
-                }
-                catch (Exception e)
-                {
-                    Console.WriteLine("Download failed to due to an unhandled exception: {0}", e.Message);
-                    throw;
-                }
-                finally
-                {
-                    ContentDownloader.ShutdownSteam3();
-                }
-
-                return exitStatus;
-            }
-            else
-            {
-                Console.WriteLine("Error: InitializeSteam failed");
-                return 1;
             }
         }
 
@@ -646,38 +555,6 @@ namespace DepotDownloader
             }
         }
 
-        private static IEnumerable<ulong> ReadWorkshopCsv(string path)
-        {
-            using var reader = new StreamReader(File.OpenRead(path));
-            var culture = CultureInfo.InvariantCulture;
-            string line;
-            bool headerSkipped = false;
-
-            while ((line = reader.ReadLine()) != null)
-            {
-                if (string.IsNullOrWhiteSpace(line))
-                    continue;
-
-                if (!headerSkipped)
-                {
-                    headerSkipped = true;
-                    // Skip header if it looks like one
-                    if (line.StartsWith("WorkshopID", StringComparison.OrdinalIgnoreCase) ||
-                        line.StartsWith("Workshop", StringComparison.OrdinalIgnoreCase))
-                        continue;
-                }
-
-                // Try to parse as workshop ID (first column or entire line)
-                var parts = line.Split(',');
-                var workshopIdStr = parts[0].Trim();
-
-                if (ulong.TryParse(workshopIdStr, NumberStyles.Integer, culture, out var workshopId))
-                {
-                    yield return workshopId;
-                }
-            }
-        }
-
         static bool InitializeSteam(string username, string password)
         {
             if (!ContentDownloader.Config.UseQrCode)
@@ -729,37 +606,34 @@ namespace DepotDownloader
             return ContentDownloader.InitializeSteam3(username, password);
         }
 
-        private static OperationMode DetermineOperationMode(uint appId, string manifestCsvPath, string workshopCsvPath, bool hasWorkshopIds)
+        private static OperationMode DetermineOperationMode(uint appId, string manifestCsvPath)
         {
             var hasApp = appId != ContentDownloader.INVALID_APP_ID;
             var hasManifestCsv = !string.IsNullOrWhiteSpace(manifestCsvPath);
-            var hasWorkshopCsv = !string.IsNullOrWhiteSpace(workshopCsvPath);
-            var hasWorkshop = hasWorkshopIds || hasWorkshopCsv;
 
             // Count how many primary modes are specified
-            var modeCount = (hasApp ? 1 : 0) + (hasManifestCsv ? 1 : 0) + (hasWorkshop ? 1 : 0);
+            var modeCount = (hasApp ? 1 : 0) + (hasManifestCsv ? 1 : 0);
 
             if (modeCount == 0)
             {
-                Console.WriteLine("Error: Must specify one of: -app, -manifest-csv, -workshop, or -workshop-csv");
+                Console.WriteLine("Error: Must specify one of: -app, -manifest-csv");
+                Console.WriteLine("(Workshop downloads have moved to the 'workshop' command - see 'depotdownloader help workshop'.)");
                 Console.WriteLine("Use 'depotdownloader help download' for usage information.");
                 return OperationMode.Invalid;
             }
 
             if (modeCount > 1)
             {
-                Console.WriteLine("Error: Cannot combine -app, -manifest-csv, and workshop modes.");
+                Console.WriteLine("Error: Cannot combine -app and -manifest-csv.");
                 Console.WriteLine("These are mutually exclusive operation modes:");
                 Console.WriteLine("  -app: Download from specific Steam application");
                 Console.WriteLine("  -manifest-csv: Download from CSV manifest data");
-                Console.WriteLine("  -workshop/-workshop-csv: Download workshop items");
                 return OperationMode.Invalid;
             }
 
             // Return the appropriate mode
             if (hasApp) return OperationMode.App;
             if (hasManifestCsv) return OperationMode.ManifestCsv;
-            if (hasWorkshop) return OperationMode.Workshop;
 
             return OperationMode.Invalid;
         }
@@ -769,16 +643,16 @@ namespace DepotDownloader
             switch (mode)
             {
                 case OperationMode.App:
-                    // App mode: Cannot use manifest CSV or workshop CSV
-                    if (parser.HasFlag("-manifest-csv") || parser.HasFlag("-manifest-csv-all") || parser.HasFlag("-workshop-csv"))
+                    // App mode: Cannot use manifest CSV
+                    if (parser.HasFlag("-manifest-csv") || parser.HasFlag("-manifest-csv-all"))
                     {
-                        Console.WriteLine("Error: -manifest-csv and -workshop-csv cannot be used with -app mode.");
+                        Console.WriteLine("Error: -manifest-csv cannot be used with -app mode.");
                         return false;
                     }
                     break;
 
                 case OperationMode.ManifestCsv:
-                    // Manifest CSV mode: Cannot use app-specific depot/manifest args or workshop args
+                    // Manifest CSV mode: Cannot use app-specific depot/manifest args
                     if (parser.HasFlag("-depot"))
                     {
                         Console.WriteLine("Error: -depot cannot be used with -manifest-csv mode.");
@@ -789,40 +663,6 @@ namespace DepotDownloader
                     {
                         Console.WriteLine("Error: -manifest cannot be used with -manifest-csv mode.");
                         Console.WriteLine("Manifest IDs should be specified in the CSV file.");
-                        return false;
-                    }
-                    if (parser.HasFlag("-workshop"))
-                    {
-                        Console.WriteLine("Error: -workshop cannot be used with -manifest-csv mode.");
-                        return false;
-                    }
-                    if (parser.HasFlag("-workshop-csv"))
-                    {
-                        Console.WriteLine("Error: -workshop-csv cannot be used with -manifest-csv mode.");
-                        return false;
-                    }
-                    break;
-
-                case OperationMode.Workshop:
-                    // Workshop mode: Cannot use app, depot, manifest, or manifest CSV args
-                    if (parser.HasFlag("-depot"))
-                    {
-                        Console.WriteLine("Error: -depot cannot be used with workshop mode.");
-                        return false;
-                    }
-                    if (parser.HasFlag("-manifest"))
-                    {
-                        Console.WriteLine("Error: -manifest cannot be used with workshop mode.");
-                        return false;
-                    }
-                    if (parser.HasFlag("-manifest-csv"))
-                    {
-                        Console.WriteLine("Error: -manifest-csv cannot be used with workshop mode.");
-                        return false;
-                    }
-                    if (parser.HasFlag("-manifest-csv-all"))
-                    {
-                        Console.WriteLine("Error: -manifest-csv-all cannot be used with workshop mode.");
                         return false;
                     }
                     break;
@@ -863,17 +703,6 @@ namespace DepotDownloader
                         }
                     }
                     break;
-
-                case OperationMode.Workshop:
-                    // Workshop mode doesn't typically have the same collision issues since each item goes to its own location
-                    // But if using workshop CSV with many items, user might want raw mode for archival
-                    var workshopCsvPath = parser.Get<string>(null, "-workshop-csv");
-                    if (!string.IsNullOrEmpty(workshopCsvPath))
-                    {
-                        // Let user decide for workshop CSV - they might want normal processing
-                        return null;
-                    }
-                    break;
             }
 
             return null; // No auto-raw needed
@@ -900,9 +729,11 @@ namespace DepotDownloader
             Console.WriteLine("                             CSV format: AppID,DepotID,ManifestID,Branch,Release Date");
             Console.WriteLine("  -manifest-csv-all        - select ALL rows per depot (auto-enables raw mode)");
             Console.WriteLine();
-            Console.WriteLine("Workshop downloading:");
-            Console.WriteLine("  -workshop <id> [<id>...] - one or more Workshop item IDs to download");
-            Console.WriteLine("  -workshop-csv <file>     - load workshop IDs from CSV file");
+            Console.WriteLine("Workshop items - moved to the 'workshop' command:");
+            Console.WriteLine("  depotdownloader workshop download -workshop <id> [<id>...]   (ad-hoc, a few IDs)");
+            Console.WriteLine("  depotdownloader workshop bootstrap -app <appid>               (tracked catalog for");
+            Console.WriteLine("  depotdownloader workshop download -app <appid>                anything CSV-sized)");
+            Console.WriteLine("  (also handles automatic update tracking - see 'depotdownloader help workshop')");
             Console.WriteLine();
             Console.WriteLine("AUTHENTICATION:");
             Console.WriteLine("  -username <user>         - Steam account username for restricted content");
@@ -953,8 +784,8 @@ namespace DepotDownloader
             Console.WriteLine("  # Download specific manifest with validation");
             Console.WriteLine("  depotdownloader download -app 4000 -depot 4001 -manifest 123456789 -validate-chunks");
             Console.WriteLine();
-            Console.WriteLine("  # Download workshop items");
-            Console.WriteLine("  depotdownloader download -workshop 123456 789012");
+            Console.WriteLine("  # Download workshop items (see 'depotdownloader help workshop')");
+            Console.WriteLine("  depotdownloader workshop download -workshop 123456 789012");
             Console.WriteLine();
             Console.WriteLine("  # Download from manifest CSV");
             Console.WriteLine("  depotdownloader download -manifest-csv manifests.csv -raw");

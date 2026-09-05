@@ -119,23 +119,16 @@ depotdownloader download -manifest-csv manifests.csv -branch dev
 ```
 
 #### 3. Workshop Downloading
-Download Steam Workshop items. Provide the ID directly or via a CSV file.
-Workshop ID is located in the URL of the workshop item.
-Example: https://steamcommunity.com/sharedfiles/filedetails/?id=2956730580
-ID = 2956730580
+
+Moved to the `workshop` command (`workshop download`), alongside automatic update tracking -
+see [Workshop Update Tracking](#workshop-update-tracking) below. `download` no longer accepts any
+workshop-related options at all; it prints a redirect to the new location. Note there's no bare
+ID-list input under `workshop download` beyond a short ad-hoc `-workshop` list, either - a list
+like that carries no tracking data, so anything larger should go through `workshop bootstrap` +
+`-app` instead (see below).
 
 ```bash
-depotdownloader download -workshop <id> [<id>...] [OPTIONS...]
-depotdownloader download -workshop-csv <file> [OPTIONS...]
-```
-
-**Examples:**
-```bash
-# Download workshop items by ID
-depotdownloader download -workshop 1885082371 770604181014286929
-
-# Download workshop items from CSV
-depotdownloader download -workshop-csv workshop_items.csv
+depotdownloader workshop download -workshop 1885082371 770604181014286929
 ```
 
 ### Authentication Options
@@ -239,6 +232,12 @@ Parameter | Description
 `-raw-verify-chunks` | Verify chunk SHA1 hashes after download
 `-raw-no-skip-existing` | Overwrite existing chunks
 `-raw-dry-run` | Download manifests only, skip chunks
+
+For a workshop item, `-raw-dry-run` now also applies to ancient/direct-URL UGC content, not just
+chunk-based depot manifests (fixed - it previously had no effect there and always did a full
+download regardless of the flag): the item's current metadata (title/filename/URL/reported size/
+`time_updated`) is logged into its `ugc/<appid>/<id>/_meta.json` sidecar and `download_records.json`
+with `"status": "logged"`, without fetching the actual file content.
 
 **Note:** Raw mode is automatically enabled for CSV downloads and when downloading multiple manifests to prevent file overwrites.
 
@@ -635,6 +634,162 @@ depotdownloader help reconstruct
 
 ---
 
+## Workshop Update Tracking
+
+The single place all workshop acquisition and tracking happens - replaces the old workshop-related
+`download` options (moved here as `workshop download`) and adds automatic update tracking across
+**an entire app's workshop**, covering both storage kinds:
+- **Chunk-based** items (depot ID == app ID, the modern format most current workshop content uses)
+- **Ancient UGC** items (direct-URL content, some dating back to 2012) - these still show up in the
+  same `QueryFiles`/`GetItemChanges` sweep as everything else, so there's no separate walk needed,
+  but they need different handling to archive correctly (see below).
+
+Built on SteamKit2 unified-messages calls, not the public Steamworks Web API:
+
+- **`PublishedFile.QueryFiles`** - the same backend the workshop browse page itself uses. Works
+  anonymously. Used by `bootstrap` to walk an entire app's workshop once.
+- **`PublishedFile.GetItemChanges`** - a per-app delta feed: "everything changed since this
+  timestamp," each entry already carrying its new content handle. Used by `poll`. **Requires an
+  authenticated login - anonymous is confirmed to always return `EResult.AccessDenied`.**
+- **`PublishedFile.GetChangeHistory`** - one item's full changelog (every historical content
+  handle + timestamp). Works anonymously, for both kinds. Used by `download -history`.
+
+```bash
+depotdownloader workshop bootstrap -app <appid> [OPTIONS...]
+depotdownloader workshop download -app <appid> [OPTIONS...]
+depotdownloader workshop download -workshop <id> [<id>...] [OPTIONS...]
+depotdownloader workshop poll -app <appid> [OPTIONS...]
+depotdownloader workshop status -app <appid> [-output <dir>]
+```
+
+**Bootstrap** (one-time per app, resumable): pages through the entire workshop via `QueryFiles`
+and records every item's current content handle/title/update time into `depot/<appid>/workshop_catalog.bin`,
+classifying each one chunk-based vs. ancient-UGC as it goes (same `file_url`-present check
+`workshop download` itself uses - confirmed empirically that a genuinely ancient item's
+`hcontent_file` field is still populated, but it's just the CDN handle embedded in its `file_url`,
+not a depot manifest ID; the classification is what keeps this from confusing the two). **Catalog-
+only by default** - it records metadata, it does not download any manifest/chunk/UGC content;
+that's `download`'s job (`-manifests-only` below is the opt-in exception, for prefetching manifests
+during the same walk). Expensive for a large workshop regardless - depot 4000 (Garry's Mod) alone
+reports **~2 million items** - but safe to interrupt and re-run; it resumes from its last saved
+page rather than restarting.
+
+**Download** - the actual content-acquisition step, in two forms:
+- **Catalog-driven** (`-app <appid>`): walks an app's existing catalog (built by `bootstrap`/`poll`)
+  and archives its items - optionally narrowed with `-only <id,id2,...>`, or capped with
+  `-max-items <n>` for a large catalog processed incrementally across several runs.
+- **Ad-hoc** (`-workshop <id>...`): specific IDs, resolved and downloaded directly - no prior
+  `bootstrap` needed, and a mixed list can span different apps, same as the old `download -workshop`
+  did. Each resolved item is also upserted into its own app's catalog as a side effect, so even a
+  one-off pull still contributes to that app's tracked state rather than being invisible to a later
+  `poll`. There's deliberately no bare-file/CSV variant of this - a list like that carries no
+  tracking data, so anything beyond a handful of IDs should go through the catalog-driven form
+  above instead (`bootstrap` once, then `download -app`).
+
+Either form archives through `DownloadPubfileRawAsync`/`DownloadAppRawAsync` - the same underlying
+dispatch a plain raw download always used - so chunk-based items land at
+`depot/<appid>/manifest/<workshopId>_<title>_<manifestId>` exactly as before, and ancient items go
+through the existing UGC direct-download path, including its own `TimeUpdated`-based per-item
+sidecar (`ugc/<appid>/<id>/_meta.json`) - so re-checking an unchanged ancient item is safe and
+cheap, not a wasted re-download.
+
+`-history` downloads **every** historical version via `GetChangeHistory`, not just current - for
+chunk-based items this is genuinely retrievable (Steam retains old depot chunk data by design; a
+404 on a very old manifest's chunks is possible - see the CDN cold-storage note elsewhere in this
+codebase - but not expected to be the norm). For ancient UGC, `-history` is necessarily best-effort:
+a `GetChangeHistory` entry there is only ever a timestamp + content handle, never a URL, and Steam's
+`GetDetails` only ever exposes the CURRENT `file_url` - so an old ancient version can be discovered
+and logged (multiple entries) but not necessarily re-downloaded; only the current version is
+actually fetched for those regardless of `-history`, with a note printed when one has more than one
+historical entry.
+
+**Poll** (cheap and repeatable - the same command serves both a manual one-off "checkup" and a
+scheduled task/cron, deliberately not two separate commands that could drift apart): asks
+`GetItemChanges` for everything changed since the catalog's watermark, then archives just those
+items the same way `download -app` would. The watermark only ever advances to what `GetItemChanges`
+itself reports back, never to "now," so a poll can't silently skip a window it never actually asked
+about.
+
+Item classification isn't assumed permanent: whether an ancient item could ever be replaced by a
+chunk-based one on some future update is unconfirmed either way, so `poll` re-classifies any
+changed item that isn't already confirmed `ChunkBased` rather than trusting a cached `Kind`
+forever - a real `ChunkBased` item skips the extra check (that direction of transition isn't a
+practical concern), but anything still `AncientUgc`/`Unknown` gets re-verified on every change
+that touches it.
+
+**⚠ `GetItemChanges`'s time window is not unlimited - confirmed empirically, not documented
+anywhere (it isn't part of the public Steamworks Web API at all):**
+- Anonymous login: always `AccessDenied`, regardless of parameters.
+- Authenticated: a `last_time_updated` **96 hours** in the past succeeded; **7 days** back was
+  rejected with `EResult.Ignored` (confirmed to not be a result-size limit - reducing
+  `num_items_max` down to 50 didn't help). The real cutoff sits somewhere in that 4-7 day range
+  and was only tested against one high-churn app (Garry's Mod) - it may be tighter, looser, or
+  scale with an app's own churn on a different app. **Poll at least every 2-3 days** to stay
+  comfortably inside the confirmed-working zone.
+- `poll` treats a rejected watermark as "re-run bootstrap," not a fatal error - it prints that
+  instruction and exits rather than retrying the same request.
+
+**Options (bootstrap):**
+- `-page-size <n>` - Items per `QueryFiles` page (default 100)
+- `-max-items <n>` - Stop after at least this many items (testing - leaves bootstrap
+  unmarked-complete so a later run continues normally)
+- `-query-type <n>` - `EPublishedFileQueryType` (default 21 = `RankedByLastUpdatedDate`)
+- `-manifests-only` (alias `-raw-dry-run`) - Also fetch each item's manifest (chunk-based) or log
+  its metadata without fetching content (ancient UGC) during this same walk, instead of leaving
+  that for a future `download`/`poll` to handle. Reuses the `PublishedFileDetails` this pass
+  already fetched from `QueryFiles`, so it doesn't cost a second lookup per item - but the
+  manifest-request round trip itself (plus `-raw`'s existing 500ms-per-new-manifest throttle) adds
+  up fast: a workshop the size of depot 4000's would take **well over a week**. Pair with
+  `-max-items` unless the workshop is genuinely small, or just use `download`/`poll` for what's
+  actually changed.
+
+**Options (download):**
+- `-history` - Every historical version, not just current (see above)
+- `-only <id,id2,...>` - Catalog-driven mode only: restrict to specific IDs
+- `-max-items <n>` - Catalog-driven mode only: stop after this many entries (resumable)
+- `-manifests-only` (alias `-raw-dry-run`) - Manifest-only for chunk-based items (no chunk data),
+  metadata-only for ancient UGC (no file content, `"status": "logged"` in its sidecar) - does real
+  work and updates records, just skips the large/expensive payload
+
+**Options (poll):**
+- `-dry-run` - Report what would be checked/downloaded - fetches nothing at all, not even a manifest
+- `-manifests-only` - Same meaning as on `download` above
+
+**Common options:** `-output <dir>`, `-username`/`-remember-password` (bootstrap and ad-hoc
+`download` can run anonymously; catalog-driven `download` inherits whatever the items themselves
+require; `poll` cannot run anonymously - see above).
+
+A brand-new item discovered only via `poll`/ad-hoc `download` (not previously seen during
+`bootstrap`) costs one extra `GetDetails` call to classify it (chunk-based vs. ancient) and learn
+its title, since `GetItemChanges` returns neither - this should be rare relative to updates on
+already-known items.
+
+### Planned: standalone poll daemon
+
+`poll` today is a single non-interactive pass with a clean exit code (0 success, 1 error, 2 =
+"watermark rejected, re-bootstrap"), specifically so it's already schedulable as-is - point cron/
+Task Scheduler/systemd timer at it for any one app today.
+
+A dedicated, separate process (not part of the main `depotdownloader` binary) is the planned real
+solution for tracking many apps at once: something that reads a small config listing tracked app
+IDs and a poll interval, then loops calling the same underlying catalog/poll logic in-process on
+its own schedule - a persistent service rather than an externally-scheduled one-shot per app. Not
+built yet; `poll` itself already carries all the logic such a daemon would call into, so building
+it is a wrapper/scheduling exercise, not a redesign.
+
+**Examples:**
+```bash
+depotdownloader workshop bootstrap -app 4000
+depotdownloader workshop bootstrap -app 4000 -max-items 500 -manifests-only  # small test slice, with manifests
+depotdownloader workshop download -app 4000                                 # current version of everything tracked
+depotdownloader workshop download -app 4000 -history -only 2956730580       # full version history, one item
+depotdownloader workshop download -workshop 123456 789012                   # ad-hoc, no bootstrap needed
+depotdownloader workshop poll -app 4000 -username myaccount -remember-password
+depotdownloader workshop status -app 4000
+```
+
+---
+
 ## Legacy Compatibility
 
 The old argument format (without sub-commands) is still supported but deprecated:
@@ -758,11 +913,12 @@ depotdownloader download -manifest-csv manifests.csv -manifest-csv-all
 ### Workshop Downloads
 
 ```bash
-# Download workshop items
-depotdownloader download -workshop 123456 789012
+# Ad-hoc, a few specific items - see the "workshop" command (Workshop Update Tracking, below)
+depotdownloader workshop download -workshop 123456 789012
 
-# Download from CSV
-depotdownloader download -workshop-csv workshop_items.csv
+# A whole app's workshop, tracked - build the catalog once, then download from it
+depotdownloader workshop bootstrap -app 4000
+depotdownloader workshop download -app 4000
 ```
 
 ### Validation
