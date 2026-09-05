@@ -745,6 +745,22 @@ bootstrap resumes. This isn't just reasoning: the same live test that confirmed 
 stability above showed an item visibly updated *during* the scan still sitting in its exact correct
 position - direct evidence that a poll-triggered update can't move anything bootstrap is walking.
 
+**`BootstrapCursor`'s own lifetime under Steam is not confirmed** - it's an opaque, server-issued
+token, and there's no documentation on whether it's a durable boundary-encoding value (the working
+assumption) or a shorter-lived cached-query handle. What IS confirmed: it survived a brand-new
+process, a fresh anonymous login, and several-hour gaps between resumes, repeatedly, across a real
+multi-hour app-4000 run - reassuring, but not the same as a confirmed overnight (12-24h+) gap. In
+case it's ever found to have genuinely stopped working, `LastRecordedCreationTime` (the lowest
+`time_created` reached so far, tracked automatically under query-type 1) exists as a recovery
+anchor - `workshop bootstrap -reset-cursor` resets `BootstrapCursor` back to `"*"` but re-enters the
+walk bounded by `date_range_created.timestamp_end = LastRecordedCreationTime` (a real `QueryFiles`
+request field), landing near where the old cursor left off instead of restarting from the newest
+item - every already-recorded item (and its history) is kept either way. Confirmed live: after a
+manual `-reset-cursor`, the next page recorded almost entirely already-known items (one boundary
+item re-confirmed, the rest genuinely new further-back items) rather than 100% newest-item
+duplicates, and the recovery anchor advanced to an *older* time than before the reset - direct
+proof it re-entered near the prior position, not from "now."
+
 **Full history is fetched by default, not just each item's current state** - both `bootstrap` and
 `poll` also call `GetChangeHistory` per item and store the complete result (every version, oldest
 first) on the catalog entry. This exists specifically because `GetItemChanges`' delta only ever
@@ -857,6 +873,7 @@ anywhere (it isn't part of the public Steamworks Web API at all):**
 - `-shallow` - Skip fetching full `GetChangeHistory` per item during this walk (see above)
 - `-backfill-batch <n>` - Items to backfill full history for per run (default 200; 0 disables) -
   see above
+- `-reset-cursor` - Recovery only, not needed for a normal resume - see above
 
 **Options (download):**
 - `-history` - Every historical version, not just current (see above)

@@ -62,6 +62,7 @@ namespace DepotDownloader
             var manifestsOnly = parser.HasFlag("-manifests-only", "-raw-dry-run");
             var shallow = parser.HasFlag("-shallow");
             var backfillBatch = parser.Get<uint>(200, "-backfill-batch");
+            var resetCursor = parser.HasFlag("-reset-cursor");
             var output = parser.Get<string>(null, "-output", "-dir");
             var username = parser.Get<string>(null, "-username", "-user");
             var password = parser.Get<string>(null, "-password", "-pass");
@@ -70,7 +71,7 @@ namespace DepotDownloader
 
             if (appId == null)
             {
-                Console.WriteLine("Usage: depotdownloader workshop bootstrap -app <appid> [-page-size 100] [-max-items N] [-manifests-only] [-shallow] [-backfill-batch 200] [-output <dir>] [-username <user> [-remember-password]]");
+                Console.WriteLine("Usage: depotdownloader workshop bootstrap -app <appid> [-page-size 100] [-max-items N] [-manifests-only] [-shallow] [-backfill-batch 200] [-reset-cursor] [-output <dir>] [-username <user> [-remember-password]]");
                 return 1;
             }
 
@@ -81,7 +82,7 @@ namespace DepotDownloader
 
             try
             {
-                return await ContentDownloader.BootstrapWorkshopCatalogAsync(appId.Value, output, pageSize, maxItems, queryType, manifestsOnly, shallow, backfillBatch);
+                return await ContentDownloader.BootstrapWorkshopCatalogAsync(appId.Value, output, pageSize, maxItems, queryType, manifestsOnly, shallow, backfillBatch, resetCursor);
             }
             finally
             {
@@ -335,6 +336,13 @@ namespace DepotDownloader
             Console.WriteLine("                     sweep). Bounded so a large backlog is worked off gradually");
             Console.WriteLine("                     across runs, not all in one - runs even after bootstrap has");
             Console.WriteLine("                     already completed, so re-running it later still makes progress.");
+            Console.WriteLine("  -reset-cursor      Recovery only - not needed for a normal resume. If the saved");
+            Console.WriteLine("                     BootstrapCursor is ever confirmed to have stopped working");
+            Console.WriteLine("                     (unconfirmed whether/when this can happen - see README), this");
+            Console.WriteLine("                     resets it to start a fresh query, bounded by the lowest");
+            Console.WriteLine("                     time_created already recorded so it re-enters near where the");
+            Console.WriteLine("                     old cursor left off instead of from the newest item. Every");
+            Console.WriteLine("                     already-recorded item is kept either way.");
             Console.WriteLine();
             Console.WriteLine("DOWNLOAD - the actual content-acquisition step, in two forms:");
             Console.WriteLine("  -app <appid>       Catalog-driven: walk an app's existing catalog (from bootstrap/");

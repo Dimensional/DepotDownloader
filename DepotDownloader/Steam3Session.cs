@@ -416,7 +416,18 @@ namespace DepotDownloader
         /// running poll after (or soon after starting) a bootstrap is a second, independent way to
         /// close any gap the chosen query_type's ranking might still leave.
         /// </summary>
-        public async Task<(EResult Result, CPublishedFile_QueryFiles_Response Body)> QueryFiles(uint appId, string cursor, uint numPerPage, uint queryType = 1)
+        /// <param name="dateRangeCreatedEnd">
+        /// Optional upper bound on time_created (the request's own date_range_created.timestamp_end
+        /// - confirmed to exist as a real request field, not something this project added). Under
+        /// query_type 1 (RankedByPublicationDate, descending), everything a correctly-continuing
+        /// cursor returns is already at-or-before wherever the walk currently is, so passing the
+        /// lowest time_created seen so far here is always a safe no-op for that case - its actual
+        /// purpose is WorkshopCatalog.LastRecordedCreationTime's recovery role: if BootstrapCursor
+        /// is ever reset back to "*" (see "workshop bootstrap -reset-cursor"), this bounds a fresh
+        /// query to re-enter the ranking near where the old cursor left off instead of from the
+        /// very newest item again.
+        /// </param>
+        public async Task<(EResult Result, CPublishedFile_QueryFiles_Response Body)> QueryFiles(uint appId, string cursor, uint numPerPage, uint queryType = 1, uint? dateRangeCreatedEnd = null)
         {
             var request = new CPublishedFile_QueryFiles_Request
             {
@@ -426,6 +437,11 @@ namespace DepotDownloader
                 cursor = cursor,
                 return_details = true,
             };
+
+            if (dateRangeCreatedEnd is > 0)
+            {
+                request.date_range_created = new CPublishedFile_QueryFiles_Request.DateRange { timestamp_end = dateRangeCreatedEnd.Value };
+            }
 
             var response = await steamPublishedFile.QueryFiles(request);
 

@@ -200,6 +200,21 @@ namespace DepotDownloader
         [ProtoMember(11)]
         public string LastPollResult { get; set; }
 
+        /// <summary>The lowest time_created seen so far this bootstrap walk - i.e. how far into
+        /// the RankedByPublicationDate ranking (descending, newest first) the walk has reached, in
+        /// terms of the one thing that's actually meaningful and durable about that ranking rather
+        /// than BootstrapCursor's opaque, unverified-lifetime token. Purely a recovery anchor:
+        /// BootstrapCursor is still what a normal resume uses, this is never read by the ordinary
+        /// path. Its only job is enabling "workshop bootstrap -reset-cursor" to re-enter the walk
+        /// close to where it left off (via date_range_created, bounded at this value) instead of
+        /// from the very newest item, if BootstrapCursor is ever confirmed to have stopped working
+        /// - not yet observed to happen, but nothing durably recorded which item was last reached
+        /// otherwise. Meaningless (left at 0) under any query-type other than
+        /// RankedByPublicationDate, since only that ranking's sort key is stable enough to bound a
+        /// re-entry point by.</summary>
+        [ProtoMember(12)]
+        public uint LastRecordedCreationTime { get; set; }
+
         public static string GetPath(string outputRoot, uint appId)
             => Path.Combine(outputRoot, "depot", appId.ToString(), "workshop_catalog.bin");
 

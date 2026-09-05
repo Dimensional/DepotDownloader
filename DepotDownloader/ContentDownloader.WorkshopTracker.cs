@@ -62,13 +62,34 @@ namespace DepotDownloader
         private static bool IsTransientNetworkException(Exception ex) =>
             ex is TaskCanceledException or OperationCanceledException or System.Net.Http.HttpRequestException;
 
-        public static async Task<int> BootstrapWorkshopCatalogAsync(uint appId, string outputRoot, uint pageSize, uint maxItems, uint queryType, bool manifestsOnly = false, bool shallow = false, uint backfillBatch = 200)
+        public static async Task<int> BootstrapWorkshopCatalogAsync(uint appId, string outputRoot, uint pageSize, uint maxItems, uint queryType, bool manifestsOnly = false, bool shallow = false, uint backfillBatch = 200, bool resetCursor = false)
         {
             outputRoot = ResolveOutputRoot(outputRoot);
             var catalogPath = WorkshopCatalog.GetPath(outputRoot, appId);
             Directory.CreateDirectory(Path.GetDirectoryName(catalogPath));
 
             var catalog = WorkshopCatalog.LoadOrCreate(catalogPath, appId);
+
+            if (resetCursor)
+            {
+                // Recovery path, not something a normal resume ever needs - BootstrapCursor's real
+                // lifetime under Steam isn't confirmed (see README), so if it's ever found to have
+                // genuinely stopped working, this re-enters the walk near where it left off instead
+                // of restarting from the newest item, using LastRecordedCreationTime as a bound
+                // (see QueryFiles' dateRangeCreatedEnd param) - every already-recorded item (and
+                // its history) is kept regardless.
+                if (catalog.BootstrapCompleted)
+                {
+                    Console.WriteLine("This catalog's bootstrap is already marked complete - there's no cursor to reset.");
+                    return 1;
+                }
+
+                catalog.BootstrapCursor = "*";
+                Console.WriteLine(catalog.LastRecordedCreationTime > 0
+                    ? $"Cursor reset - re-entering the walk bounded at time_created <= {catalog.LastRecordedCreationTime} ({DateTimeOffset.FromUnixTimeSeconds(catalog.LastRecordedCreationTime):u}). {catalog.Items.Count:N0} already-recorded items are kept."
+                    : $"Cursor reset, but no recorded creation-time anchor exists (query-type isn't RankedByPublicationDate, or nothing was recorded under it yet) - this will restart from the newest item. {catalog.Items.Count:N0} already-recorded items are still kept.");
+                catalog.Save(catalogPath);
+            }
 
             // Runs once per invocation, regardless of whether bootstrap itself is complete yet -
             // resuming an in-progress walk only fetches history for items newly reached from here
@@ -136,8 +157,15 @@ namespace DepotDownloader
             {
                 while (true)
                 {
+                    // The bound is always safe to pass alongside a normally-advancing cursor (see
+                    // QueryFiles' doc comment) - it only actually changes anything right after a
+                    // "-reset-cursor", where it's what keeps a fresh "*" query from restarting at
+                    // the newest item instead of near where the old cursor left off.
+                    var dateRangeCreatedEnd = catalog.QueryType == 1 && catalog.LastRecordedCreationTime > 0
+                        ? catalog.LastRecordedCreationTime
+                        : (uint?)null;
                     var (result, body) = await WithTransientRetryAsync("QueryFiles",
-                        () => steam3.QueryFiles(appId, catalog.BootstrapCursor, pageSize, catalog.QueryType));
+                        () => steam3.QueryFiles(appId, catalog.BootstrapCursor, pageSize, catalog.QueryType, dateRangeCreatedEnd));
 
                     if (result != EResult.OK || body == null)
                     {
@@ -176,6 +204,16 @@ namespace DepotDownloader
                             LastSeenAt = now,
                         };
                         catalog.Items[d.publishedfileid] = item;
+
+                        // Recovery anchor only - see WorkshopCatalog.LastRecordedCreationTime.
+                        // Only meaningful under the stable ranking (time_created never reorders
+                        // under it, unlike time_updated) - tracking this under query-type 21 would
+                        // record a boundary a later date_range_created-bounded re-entry can't
+                        // actually trust, so don't bother.
+                        if (catalog.QueryType == 1 && (catalog.LastRecordedCreationTime == 0 || d.time_created < catalog.LastRecordedCreationTime))
+                        {
+                            catalog.LastRecordedCreationTime = d.time_created;
+                        }
 
                         if (!shallow)
                         {
@@ -521,6 +559,11 @@ namespace DepotDownloader
             Console.WriteLine($"Bootstrap complete: {catalog.BootstrapCompleted}");
             Console.WriteLine($"Query type:         {catalog.QueryType}" +
                 (catalog.QueryType == 1 ? " (RankedByPublicationDate - stable)" : catalog.QueryType == 21 ? " (RankedByLastUpdatedDate - NOT stable under concurrent activity, see README)" : ""));
+
+            if (catalog.LastRecordedCreationTime != 0)
+            {
+                Console.WriteLine($"Recovery anchor:    time_created <= {catalog.LastRecordedCreationTime} ({DateTimeOffset.FromUnixTimeSeconds(catalog.LastRecordedCreationTime):u}) - see -reset-cursor");
+            }
 
             if (!catalog.BootstrapCompleted && catalog.BootstrapStartedAt != 0)
             {
