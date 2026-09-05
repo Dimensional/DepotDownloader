@@ -148,13 +148,13 @@ namespace DepotDownloader
             Console.WriteLine("COMMANDS:");
             Console.WriteLine("  download                     Download Steam content (apps, depots, workshop items)");
             Console.WriteLine("  list-depots                  List branches per depot from a CSV (no download)"); // NEW
-            Console.WriteLine("  manifest                     Extract and compare manifest files (offline)");
+            Console.WriteLine("  manifest                     Extract, compare, and list manifest files (offline)");
             Console.WriteLine("  validate-depot               Validate all chunks in a depot directory (offline)");
             Console.WriteLine("  validate-chunk               Validate a single chunk file (offline)");
             Console.WriteLine("  validate-chunkstore          Validate all chunks in a chunkstore (offline; alias for 'chunkstore verify')");
             Console.WriteLine("  validate-chunkstore-chunks   Validate specific chunks in a chunkstore (offline; alias for 'chunkstore verify -chunks')");
             Console.WriteLine("  reconstruct                  Rebuild installed files offline from a manifest + archived chunks");
-            Console.WriteLine("  chunkstore                   Pack/unpack/verify/stats on chunk storage (rebuild/update: [Coming Soon])");
+            Console.WriteLine("  chunkstore                   Pack/unpack/verify/stats/update/rebuild on chunk storage");
             Console.WriteLine();
             Console.WriteLine("HELP:");
             Console.WriteLine("  help              Show this help message");
@@ -166,6 +166,7 @@ namespace DepotDownloader
             Console.WriteLine("  depotdownloader list-depots -manifest-csv manifests.csv");
             Console.WriteLine("  depotdownloader manifest extract 123456.manif5 -depot 848452");
             Console.WriteLine("  depotdownloader manifest diff old.json new.json -verbose");
+            Console.WriteLine("  depotdownloader manifest list -depot 4000 -workshop");
             Console.WriteLine("  depotdownloader validate-depot depot/4001 -verbose");
             Console.WriteLine("  depotdownloader download -workshop 123456 789012");
             Console.WriteLine();

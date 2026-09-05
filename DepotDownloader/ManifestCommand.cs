@@ -181,6 +181,60 @@ namespace DepotDownloader
         }
 
         /// <summary>
+        /// Loads just enough of a manifest to read its header fields (CreationTime, ManifestGID,
+        /// DepotID, file count/total size) - filenames are never decrypted, so unlike
+        /// <see cref="LoadDepotManifestFromAnyFormat"/>, this needs no depot key at all for
+        /// .manif4/.manif5. Used by "manifest list", which only ever shows metadata, never
+        /// individual file paths.
+        /// </summary>
+        internal static async Task<DepotManifest> LoadManifestHeaderOnly(string filePath)
+        {
+            var extension = Path.GetExtension(filePath).ToLowerInvariant();
+
+            if (extension == ".manifest")
+            {
+                return DepotManifest.LoadFromFile(filePath);
+            }
+
+            if (extension == ".manif4" || extension == ".manif5")
+            {
+                var zipBytes = await File.ReadAllBytesAsync(filePath);
+                return ParseManifestZipBytes(zipBytes, depotKey: null).Manifest;
+            }
+
+            throw new Exception($"Unsupported manifest format: {extension}. Supported: .manifest, .manif4, .manif5");
+        }
+
+        /// <summary>
+        /// Best-effort detection of the "&lt;workshopId&gt;_&lt;name&gt;_&lt;manifestId&gt;"
+        /// filename convention download -raw uses for workshop items (see ArchiveDepotRawAsync).
+        /// A plain depot manifest is always saved as a bare "&lt;manifestId&gt;", so requiring
+        /// both the first AND last underscore-separated segment to be numeric (and different from
+        /// each other) reliably tells the two apart, regardless of how many underscores land in
+        /// the sanitized name in between - including zero, if the name sanitized to nothing at
+        /// all (e.g. an all-symbol title). This infers meaning from a display string, not
+        /// authoritative data - only ManifestGID from the manifest's own content should ever be
+        /// treated as the real manifest ID; this is only used to recover the workshop ID/name,
+        /// which aren't recorded anywhere inside the manifest itself.
+        /// </summary>
+        internal static bool TryParseWorkshopManifestFileName(string fileNameWithoutExtension, out ulong workshopId, out string name)
+        {
+            var parts = fileNameWithoutExtension.Split('_');
+            if (parts.Length >= 3 &&
+                ulong.TryParse(parts[0], out workshopId) &&
+                ulong.TryParse(parts[^1], out var trailingId) &&
+                workshopId != trailingId)
+            {
+                name = string.Join('_', parts[1..^1]);
+                return true;
+            }
+
+            workshopId = 0;
+            name = null;
+            return false;
+        }
+
+        /// <summary>
         /// Parse result from manifest zip bytes
         /// </summary>
         internal class ParsedManifestResult
@@ -394,9 +448,13 @@ namespace DepotDownloader
                     case "compare":
                         return await DiffCommand(args[1..]);
 
+                    case "list":
+                    case "history":
+                        return await ListCommand(args[1..]);
+
                     default:
                         Console.WriteLine($"Unknown manifest operation: {operation}");
-                        Console.WriteLine("Available operations: extract, diff");
+                        Console.WriteLine("Available operations: extract, diff, list");
                         Console.WriteLine("Use 'depotdownloader help manifest' for detailed usage.");
                         return 1;
                 }
@@ -794,6 +852,201 @@ namespace DepotDownloader
             return 0;
         }
 
+        private sealed class ManifestListEntry
+        {
+            public string FileName { get; set; }
+            public uint DepotId { get; set; }
+            public ulong ManifestId { get; set; }
+            public DateTime CreationTime { get; set; }
+            public int FileCount { get; set; }
+            public ulong TotalUncompressedSize { get; set; }
+            public ulong? WorkshopId { get; set; }
+            public string WorkshopName { get; set; }
+        }
+
+        private static async Task<int> ListCommand(string[] args)
+        {
+            if (args.Length == 0)
+            {
+                Console.WriteLine("Usage: depotdownloader manifest list <folder> [OPTIONS...]");
+                Console.WriteLine();
+                Console.WriteLine("Lists every manifest in a folder, sorted by the manifest's own recorded");
+                Console.WriteLine("creation time - a chronological history of what's been archived for a depot,");
+                Console.WriteLine("straight from data every manifest already carries. No depot key or Steam");
+                Console.WriteLine("connection needed - filenames are never decrypted, just the manifest header.");
+                Console.WriteLine();
+                Console.WriteLine("OPTIONS:");
+                Console.WriteLine("  -depot <id>          Use depot/<id>/manifest instead of a folder argument");
+                Console.WriteLine("  -workshop [<ids>]    Group by workshop item instead of one flat timeline.");
+                Console.WriteLine("                       Detected from the \"<workshopId>_<name>_<manifestId>\"");
+                Console.WriteLine("                       filename convention download -raw uses for workshop");
+                Console.WriteLine("                       content - manifests that don't match it are excluded.");
+                Console.WriteLine("                       With one or more comma-separated IDs, only those items'");
+                Console.WriteLine("                       histories are shown (plain comma - unlike reconstruct's");
+                Console.WriteLine("                       -files, these are always plain numeric IDs, never regex).");
+                Console.WriteLine("  -json                Machine-readable output instead of formatted text");
+                Console.WriteLine();
+                Console.WriteLine("EXAMPLES:");
+                Console.WriteLine("  depotdownloader manifest list depot/4001/manifest");
+                Console.WriteLine("  depotdownloader manifest list -depot 4000 -workshop");
+                Console.WriteLine("  depotdownloader manifest list -depot 4000 -workshop 2956730580,2970364333");
+                return 1;
+            }
+
+            var parser = new ArgParser(args);
+            // Every flag with a value must be resolved before the folder positional lookup -
+            // Positional(0) picks the first not-yet-consumed non-flag-looking token, so e.g.
+            // "-depot 4001" or "-workshop 2956730580" with no folder given would otherwise have
+            // Positional(0) find that still-unconsumed value token itself and wrongly treat it
+            // as a bare folder argument.
+            var depotId = parser.GetNullable<uint>("-depot", "-d");
+            var workshopMode = parser.HasFlag("-workshop");
+            var workshopFilterRaw = parser.Get<string>(null, "-workshop");
+            var json = parser.HasFlag("-json");
+            var folder = parser.Get<string>(null, "-folder") ?? parser.Positional(0);
+            parser.WarnUnconsumed();
+
+            if (string.IsNullOrEmpty(folder))
+            {
+                if (depotId == null)
+                {
+                    Console.WriteLine("Error: a folder (positional argument) or -depot <id> is required");
+                    return 1;
+                }
+
+                folder = Path.Combine("depot", depotId.Value.ToString(), "manifest");
+            }
+
+            if (!Directory.Exists(folder))
+            {
+                Console.WriteLine($"Error: Manifest folder not found: {folder}");
+                return 1;
+            }
+
+            // -workshop's ID list is optional and best-effort: anything that isn't a clean
+            // comma-separated list of numbers (including having accidentally captured an
+            // unrelated following flag, since ArgParser.Get doesn't know -workshop's value is
+            // optional) is treated the same as bare -workshop - show every detected workshop
+            // item, not filtered down to a specific one.
+            HashSet<ulong> workshopIdFilter = null;
+            if (workshopMode && !string.IsNullOrEmpty(workshopFilterRaw))
+            {
+                var parsedIds = workshopFilterRaw.Split(',')
+                    .Select(s => ulong.TryParse(s.Trim(), out var id) ? (ulong?)id : null)
+                    .Where(id => id.HasValue)
+                    .Select(id => id.Value)
+                    .ToHashSet();
+
+                if (parsedIds.Count > 0)
+                {
+                    workshopIdFilter = parsedIds;
+                }
+            }
+
+            var entries = new List<ManifestListEntry>();
+            var files = Directory.EnumerateFiles(folder, "*.manif4")
+                .Concat(Directory.EnumerateFiles(folder, "*.manif5"))
+                .Concat(Directory.EnumerateFiles(folder, "*.manifest"));
+
+            foreach (var file in files)
+            {
+                DepotManifest manifest;
+                try
+                {
+                    manifest = await LoadManifestHeaderOnly(file);
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"Warning: Skipping {Path.GetFileName(file)}: {ex.Message}");
+                    continue;
+                }
+
+                var stem = Path.GetFileNameWithoutExtension(file);
+                var isWorkshopShaped = TryParseWorkshopManifestFileName(stem, out var workshopId, out var workshopName);
+
+                entries.Add(new ManifestListEntry
+                {
+                    FileName = Path.GetFileName(file),
+                    DepotId = manifest.DepotID,
+                    ManifestId = manifest.ManifestGID,
+                    CreationTime = manifest.CreationTime,
+                    FileCount = manifest.Files.Count,
+                    TotalUncompressedSize = manifest.TotalUncompressedSize,
+                    WorkshopId = isWorkshopShaped ? workshopId : null,
+                    WorkshopName = isWorkshopShaped ? workshopName : null
+                });
+            }
+
+            if (entries.Count == 0)
+            {
+                Console.WriteLine($"No manifest files found in {folder}");
+                return 0;
+            }
+
+            if (workshopMode)
+            {
+                var groups = entries
+                    .Where(e => e.WorkshopId.HasValue && (workshopIdFilter == null || workshopIdFilter.Contains(e.WorkshopId.Value)))
+                    .GroupBy(e => e.WorkshopId.Value)
+                    .OrderBy(g => g.Key)
+                    .Select(g => new
+                    {
+                        WorkshopId = g.Key,
+                        Name = g.Select(e => e.WorkshopName).FirstOrDefault(n => !string.IsNullOrEmpty(n)),
+                        Entries = g.OrderBy(e => e.CreationTime).ToList()
+                    })
+                    .ToList();
+
+                if (groups.Count == 0)
+                {
+                    Console.WriteLine("No manifests matching the workshop naming convention were found" +
+                        (workshopIdFilter != null ? " for the given ID(s)." : "."));
+                    return 0;
+                }
+
+                if (json)
+                {
+                    Console.WriteLine(JsonSerializer.Serialize(groups, new JsonSerializerOptions { WriteIndented = true }));
+                }
+                else
+                {
+                    foreach (var group in groups)
+                    {
+                        var header = string.IsNullOrEmpty(group.Name)
+                            ? $"Workshop item {group.WorkshopId}"
+                            : $"Workshop item {group.WorkshopId} - {group.Name} (name inferred from filename)";
+                        Console.WriteLine(header);
+
+                        foreach (var e in group.Entries)
+                        {
+                            Console.WriteLine($"  {e.CreationTime:yyyy-MM-dd HH:mm:ss}  manifest={e.ManifestId}  files={e.FileCount:N0}  {e.FileName}");
+                        }
+
+                        Console.WriteLine();
+                    }
+                }
+            }
+            else
+            {
+                var sorted = entries.OrderBy(e => e.CreationTime).ToList();
+
+                if (json)
+                {
+                    Console.WriteLine(JsonSerializer.Serialize(sorted, new JsonSerializerOptions { WriteIndented = true }));
+                }
+                else
+                {
+                    foreach (var e in sorted)
+                    {
+                        var workshopNote = e.WorkshopId.HasValue ? $"  (workshop {e.WorkshopId})" : "";
+                        Console.WriteLine($"{e.CreationTime:yyyy-MM-dd HH:mm:ss}  depot={e.DepotId}  manifest={e.ManifestId}  files={e.FileCount:N0}  {e.FileName}{workshopNote}");
+                    }
+                }
+            }
+
+            return 0;
+        }
+
         public static void PrintUsage()
         {
             Console.WriteLine();
@@ -805,11 +1058,13 @@ namespace DepotDownloader
             Console.WriteLine("OPERATIONS:");
             Console.WriteLine("  extract              Extract encrypted/binary manifests to readable JSON");
             Console.WriteLine("  diff, compare        Compare two manifests and show differences (console output)");
+            Console.WriteLine("  list, history        List a folder's manifests in chronological order, optionally");
+            Console.WriteLine("                       grouped by workshop item (no depot key needed)");
             Console.WriteLine();
             Console.WriteLine("SUPPORTED FORMATS:");
             Console.WriteLine("  .json               Extracted debug JSON (for diff only)");
             Console.WriteLine("  .manifest           Decrypted binary manifest");
-            Console.WriteLine("  .manif4/.manif5     Compressed encrypted manifest (requires depot key)");
+            Console.WriteLine("  .manif4/.manif5     Compressed encrypted manifest (requires depot key, except for list)");
             Console.WriteLine();
             Console.WriteLine("EXTRACT USAGE:");
             Console.WriteLine("  depotdownloader manifest extract <manifest-file> [OPTIONS...]");
@@ -834,9 +1089,27 @@ namespace DepotDownloader
             Console.WriteLine("    -verbose, -v         Show detailed list of all file changes");
             Console.WriteLine("    -output <file>       Save detailed diff as JSON file (optional)");
             Console.WriteLine();
+            Console.WriteLine("LIST USAGE:");
+            Console.WriteLine("  depotdownloader manifest list <folder> [OPTIONS...]");
+            Console.WriteLine();
+            Console.WriteLine("  Lists every manifest in a folder sorted by its own recorded creation time -");
+            Console.WriteLine("  a chronological history of what's archived for a depot. No depot key needed:");
+            Console.WriteLine("  filenames are never decrypted, just the manifest header (CreationTime,");
+            Console.WriteLine("  ManifestGID, DepotID, file count - all present regardless of encryption).");
+            Console.WriteLine();
+            Console.WriteLine("  OPTIONS:");
+            Console.WriteLine("    -depot <id>          Use depot/<id>/manifest instead of a folder argument");
+            Console.WriteLine("    -workshop [<ids>]    Group by workshop item (detected from the");
+            Console.WriteLine("                         \"<workshopId>_<name>_<manifestId>\" filename convention");
+            Console.WriteLine("                         download -raw uses for workshop content) instead of one");
+            Console.WriteLine("                         flat timeline. Optionally filter to specific comma-");
+            Console.WriteLine("                         separated workshop IDs.");
+            Console.WriteLine("    -json                Machine-readable output instead of formatted text");
+            Console.WriteLine();
             Console.WriteLine("DEPOT KEY:");
             Console.WriteLine("  For .manif4/.manif5 files, depot key is loaded from: depot/<depot-id>/<depot-id>.depotkey");
             Console.WriteLine("  Or provide it directly using -depotkey <hex> or -depotkey-file <path>");
+            Console.WriteLine("  (not needed for list, which never reads filenames)");
             Console.WriteLine();
             Console.WriteLine("EXAMPLES:");
             Console.WriteLine("  # Extract encrypted manifest to JSON");
@@ -856,6 +1129,15 @@ namespace DepotDownloader
             Console.WriteLine();
             Console.WriteLine("  # Compare encrypted manifests and save detailed diff to file");
             Console.WriteLine("  depotdownloader manifest diff v1.manif5 v2.manif5 -depot 848452 -output changes.json");
+            Console.WriteLine();
+            Console.WriteLine("  # A depot's whole archived update history, oldest to newest");
+            Console.WriteLine("  depotdownloader manifest list -depot 4001");
+            Console.WriteLine();
+            Console.WriteLine("  # Every workshop item archived for an app, each with its own history");
+            Console.WriteLine("  depotdownloader manifest list -depot 4000 -workshop");
+            Console.WriteLine();
+            Console.WriteLine("  # Just specific workshop items' histories");
+            Console.WriteLine("  depotdownloader manifest list -depot 4000 -workshop 2956730580,2970364333");
         }
     }
 }
