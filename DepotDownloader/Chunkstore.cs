@@ -183,17 +183,32 @@ namespace DepotDownloader
                         var expectedFiles = files.Count;
                         var actualFiles = Directory.GetFiles(folder, $"{depot}_*.csm").Length;
 
-                        if (expectedFiles == actualFiles)
+                        // A count match alone doesn't prove the checkpoint reflects the CURRENT
+                        // on-disk state: an operation that finished writing everything but was
+                        // killed/crashed before reaching its own final ClearCheckpoint() call
+                        // leaves a stale-but-count-matching checkpoint behind forever, since
+                        // nothing else ever re-validates it - every later command that opens this
+                        // chunkstore (including a read-only one like verify) would otherwise trust
+                        // it silently. Cross-check the last tracked file's actual size too - one
+                        // stat call, no full CSM re-parse, but catches that case.
+                        var lastFileSizeMatches = files.Count == 0 ||
+                            (File.Exists(files[^1].csdPath) && new FileInfo(files[^1].csdPath).Length == currentFileSize);
+
+                        if (expectedFiles == actualFiles && lastFileSizeMatches)
                         {
                             Console.WriteLine("Checkpoint validated successfully");
                             return; // Checkpoint is good, skip CSM parsing
                         }
                         else
                         {
-                            Console.WriteLine($"Warning: Checkpoint file count mismatch (expected {expectedFiles}, found {actualFiles}). Rebuilding from CSM files...");
+                            var reason = expectedFiles != actualFiles
+                                ? $"file count mismatch (expected {expectedFiles}, found {actualFiles})"
+                                : "last file's size doesn't match what's on disk (stale checkpoint)";
+                            Console.WriteLine($"Warning: Checkpoint {reason}. Rebuilding from CSM files...");
                             // Fall through to rebuild from CSM
                             chunkIndex.Clear();
                             files.Clear();
+                            chunksPerFile.Clear();
                         }
                     }
                 }
@@ -202,6 +217,7 @@ namespace DepotDownloader
                     Console.WriteLine($"Warning: Failed to load checkpoint: {ex.Message}. Rebuilding from CSM files...");
                     chunkIndex.Clear();
                     files.Clear();
+                    chunksPerFile.Clear();
                 }
             }
 
@@ -832,6 +848,19 @@ namespace DepotDownloader
                     (currentCsd, currentCsm) = files[currentFileIndex - 1];
                 }
 
+                // chunksPerFile isn't part of the checkpoint (in-memory only - see its declaration
+                // comment), so it needs rebuilding here too, not just on a fresh CSM parse.
+                // Without this, a write immediately after resuming from a checkpoint (e.g. `update`
+                // appending more chunks) would index into an empty per-segment list and throw.
+                chunksPerFile.Clear();
+                for (int i = 0; i < files.Count; i++)
+                    chunksPerFile.Add([]);
+                foreach (var metadata in chunkIndex.Values)
+                {
+                    if (metadata.ChunkstoreIndex >= 1 && metadata.ChunkstoreIndex <= chunksPerFile.Count)
+                        chunksPerFile[metadata.ChunkstoreIndex - 1].Add(metadata);
+                }
+
                 return true;
             }
             catch (Exception ex)
@@ -1028,6 +1057,21 @@ namespace DepotDownloader
             if (sortedFiles.Count == 0)
             {
                 Console.WriteLine("No chunks to pack (all already processed)");
+
+                // This early return used to skip the save-then-clear below entirely, which could
+                // strand a checkpoint left over from an earlier run of this same command that
+                // finished all its real writes but was killed/crashed before reaching its own
+                // final ClearCheckpoint() call - every later command opening this chunkstore would
+                // then silently trust that stale checkpoint (see LoadExistingFiles). If we got here
+                // with a checkpoint on disk, the in-memory chunkIndex we resumed from already
+                // reflects everything on disk (nothing new was found to add), so it's safe to
+                // clear it now.
+                if (checkpointInterval > 0 && File.Exists(CheckpointPath))
+                {
+                    Console.WriteLine("Clearing checkpoint (nothing new to pack, existing chunkstore is already complete)...");
+                    ClearCheckpoint();
+                }
+
                 return;
             }
 
@@ -1211,6 +1255,22 @@ namespace DepotDownloader
             if (sortedShas.Count == 0)
             {
                 Console.WriteLine("No chunks to copy (all already copied)");
+
+                // Same reasoning as PackAsync's identical early return: this used to skip the
+                // save-then-clear below entirely, which could strand a checkpoint left over from
+                // an earlier, resumed run of this same rebuild that finished all its real copying
+                // but was killed/crashed before its own final ClearCheckpoint() call - every later
+                // command opening this chunkstore (including a read-only one like verify) would
+                // then silently trust that stale checkpoint (see LoadExistingFiles). If we got here
+                // with a checkpoint on disk, the in-memory chunkIndex we resumed from already
+                // reflects everything on disk (nothing new was found to copy), so it's safe to
+                // clear it now.
+                if (checkpointInterval > 0 && File.Exists(CheckpointPath))
+                {
+                    Console.WriteLine("Clearing checkpoint (nothing new to copy, existing chunkstore is already complete)...");
+                    ClearCheckpoint();
+                }
+
                 return;
             }
 

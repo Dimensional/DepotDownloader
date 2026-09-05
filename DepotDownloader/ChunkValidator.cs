@@ -348,11 +348,11 @@ namespace DepotDownloader
                 {
                     if (csdPath != null && File.Exists(csdPath))
                     {
-                        var currentChecksum = HashFileStreaming(csdPath);
-                        if (checkpoint.CsdFileChecksums.TryGetValue(csdIndex, out var savedChecksum) &&
-                            currentChecksum == savedChecksum)
+                        var currentFingerprint = GetCsdFingerprint(csdPath);
+                        if (checkpoint.CsdFileChecksums.TryGetValue(csdIndex, out var savedFingerprint) &&
+                            currentFingerprint == savedFingerprint)
                         {
-                            Console.WriteLine($"  CSD {csdIndex}: skipping (validated in previous run, checksum matches)");
+                            Console.WriteLine($"  CSD {csdIndex}: skipping (validated in previous run, unchanged since)");
 
                             // The checkpoint only ever records previously-INVALID chunks (kept small
                             // on purpose). Reconstruct this CSD's full result set for the final
@@ -400,10 +400,10 @@ namespace DepotDownloader
                 // Notify caller that this CSD is complete (for checkpoint saving)
                 if (onCsdComplete != null)
                 {
-                    var checksum = csdPath != null && File.Exists(csdPath)
-                        ? HashFileStreaming(csdPath)
+                    var fingerprint = csdPath != null && File.Exists(csdPath)
+                        ? GetCsdFingerprint(csdPath)
                         : string.Empty;
-                    onCsdComplete(csdIndex, checksum, results);
+                    onCsdComplete(csdIndex, fingerprint, results);
                 }
             }
 
@@ -411,13 +411,19 @@ namespace DepotDownloader
         }
 
         /// <summary>
-        /// Computes a SHA1 hex string of a file using a streaming read.
-        /// Avoids loading the entire file (potentially 2 GB) into memory at once.
+        /// Cheap (length, last-write-time) fingerprint used only to detect whether a CSD file has
+        /// changed since a previous validation run - not a content hash. Every chunk in the file
+        /// already gets a real SHA1 integrity check whenever it isn't skipped via this fingerprint
+        /// matching, so this only needs to answer "does this look like the same file", not
+        /// cryptographically prove it. A full-file SHA1 was used here previously and was
+        /// computed unconditionally after every CSD, on every run (not just when resuming) -
+        /// effectively a second full read pass over data just read chunk-by-chunk moments earlier,
+        /// and the actual cause of a real multi-CSD store pausing for a long time between CSDs.
         /// </summary>
-        private static string HashFileStreaming(string path)
+        private static string GetCsdFingerprint(string path)
         {
-            using var fs = File.OpenRead(path);
-            return Util.ToHex(SHA1.HashData(fs));
+            var fi = new FileInfo(path);
+            return $"{fi.Length}:{fi.LastWriteTimeUtc.Ticks}";
         }
 
         #endregion

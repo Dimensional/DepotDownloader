@@ -43,13 +43,25 @@ namespace DepotDownloader
         }
 
         /// <summary>
-        /// Resolves the depot key for a chunkstore: an explicit path is used if given (and must
-        /// exist), otherwise the folder is scanned for a single "*.depotkey" file. Finding nothing
-        /// is not itself a failure - an unencrypted chunkstore needs no key - only an explicitly
-        /// given but missing path is.
+        /// Resolves the depot key for a chunkstore - but only when it's actually encrypted; an
+        /// unencrypted chunkstore needs no key, and none is searched for or used even if one was
+        /// given. When encrypted, checks in order: an explicit -depotkey path (must exist if
+        /// given), a "*.depotkey" file in the same folder as the chunkstore itself, then the
+        /// default raw-download location depot/&lt;depotId&gt;/&lt;depotId&gt;.depotkey (relative
+        /// to the current directory - where ArchiveDepotRawAsync/ResolveEncryptedManifestIdsAsync
+        /// already save one, one level above where a chunkstore packed from that raw archive
+        /// typically lives). Finding nothing when one is actually needed is reported as a clear,
+        /// specific failure - the alternative is every single chunk failing individually with a
+        /// confusing "unknown compression format", which is what unencrypted-looking ciphertext
+        /// produces when decryption never happens.
         /// </summary>
-        private static async Task<(byte[] DepotKey, bool Failed)> ResolveChunkstoreDepotKeyAsync(string chunkstorePath, string depotKeyPath)
+        private static async Task<(byte[] DepotKey, bool Failed)> ResolveChunkstoreDepotKeyAsync(string chunkstorePath, string depotKeyPath, bool isEncrypted, uint depotId)
         {
+            if (!isEncrypted)
+            {
+                return (null, false);
+            }
+
             if (!string.IsNullOrEmpty(depotKeyPath))
             {
                 if (!File.Exists(depotKeyPath))
@@ -63,15 +75,27 @@ namespace DepotDownloader
                 return (depotKey, false);
             }
 
-            var depotKeyFiles = Directory.GetFiles(chunkstorePath, "*.depotkey");
-            if (depotKeyFiles.Length > 0)
+            var localKeyFiles = Directory.GetFiles(chunkstorePath, "*.depotkey");
+            if (localKeyFiles.Length > 0)
             {
-                var depotKey = await File.ReadAllBytesAsync(depotKeyFiles[0]);
-                Console.WriteLine($"Auto-detected depot key: {Path.GetFileName(depotKeyFiles[0])}");
+                var depotKey = await File.ReadAllBytesAsync(localKeyFiles[0]);
+                Console.WriteLine($"Auto-detected depot key: {Path.GetFileName(localKeyFiles[0])}");
                 return (depotKey, false);
             }
 
-            return (null, false);
+            var defaultKeyPath = Path.Combine("depot", depotId.ToString(), $"{depotId}.depotkey");
+            if (File.Exists(defaultKeyPath))
+            {
+                var depotKey = await File.ReadAllBytesAsync(defaultKeyPath);
+                Console.WriteLine($"Auto-detected depot key: {defaultKeyPath}");
+                return (depotKey, false);
+            }
+
+            Console.WriteLine($"Error: Chunkstore is encrypted but no depot key was found. Checked: " +
+                $"-depotkey (not given), {chunkstorePath} (no *.depotkey file), and {defaultKeyPath} (not found). " +
+                "Every chunk would otherwise fail with a misleading \"unknown compression format\" error. " +
+                "Specify -depotkey, or place the .depotkey file in one of the checked locations.");
+            return (null, true);
         }
 
         #endregion
@@ -288,15 +312,9 @@ namespace DepotDownloader
 
             try
             {
-                // Load depot key
-                var (depotKey, keyResolutionFailed) = await ResolveChunkstoreDepotKeyAsync(chunkstorePath, depotKeyPath);
-                if (keyResolutionFailed)
-                {
-                    return summary;
-                }
-
-                // Initialize chunkstore
-                using var chunkstore = new Chunkstore(chunkstorePath, depotId, depotKey, readOnly: true);
+                // Initialize chunkstore first, without a key - just enough to learn whether it's
+                // actually encrypted before deciding whether a depot key search is even needed.
+                using var chunkstore = new Chunkstore(chunkstorePath, depotId, depotKey: null, readOnly: true);
                 var stats = chunkstore.GetStats();
 
                 Console.WriteLine($"Chunkstore loaded: {stats}");
@@ -304,6 +322,12 @@ namespace DepotDownloader
                 if (stats.TotalChunks == 0)
                 {
                     Console.WriteLine("No chunks found in chunkstore");
+                    return summary;
+                }
+
+                var (depotKey, keyResolutionFailed) = await ResolveChunkstoreDepotKeyAsync(chunkstorePath, depotKeyPath, stats.IsEncrypted, stats.DepotId);
+                if (keyResolutionFailed)
+                {
                     return summary;
                 }
 
@@ -451,18 +475,18 @@ namespace DepotDownloader
 
             try
             {
-                // Load depot key
-                var (depotKey, keyResolutionFailed) = await ResolveChunkstoreDepotKeyAsync(chunkstorePath, depotKeyPath);
+                // Initialize chunkstore first, without a key - just enough to learn whether it's
+                // actually encrypted before deciding whether a depot key search is even needed.
+                using var chunkstore = new Chunkstore(chunkstorePath, depotId, depotKey: null, readOnly: true);
+                var stats = chunkstore.GetStats();
+
+                Console.WriteLine($"Chunkstore loaded: {stats}");
+
+                var (depotKey, keyResolutionFailed) = await ResolveChunkstoreDepotKeyAsync(chunkstorePath, depotKeyPath, stats.IsEncrypted, stats.DepotId);
                 if (keyResolutionFailed)
                 {
                     return summary;
                 }
-
-                // Initialize chunkstore
-                using var chunkstore = new Chunkstore(chunkstorePath, depotId, depotKey, readOnly: true);
-                var stats = chunkstore.GetStats();
-
-                Console.WriteLine($"Chunkstore loaded: {stats}");
 
                 // Determine thread count
                 maxThreads = ResolveValidationThreadCount(maxThreads);
