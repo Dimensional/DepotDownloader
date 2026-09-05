@@ -418,14 +418,16 @@ namespace DepotDownloader
         /// </summary>
         /// <param name="dateRangeCreatedEnd">
         /// Optional upper bound on time_created (the request's own date_range_created.timestamp_end
-        /// - confirmed to exist as a real request field, not something this project added). Under
-        /// query_type 1 (RankedByPublicationDate, descending), everything a correctly-continuing
-        /// cursor returns is already at-or-before wherever the walk currently is, so passing the
-        /// lowest time_created seen so far here is always a safe no-op for that case - its actual
-        /// purpose is WorkshopCatalog.LastRecordedCreationTime's recovery role: if BootstrapCursor
-        /// is ever reset back to "*" (see "workshop bootstrap -reset-cursor"), this bounds a fresh
-        /// query to re-enter the ranking near where the old cursor left off instead of from the
-        /// very newest item again.
+        /// - confirmed to exist as a real request field, not something this project added). Exists
+        /// purely for WorkshopCatalog.LastRecordedCreationTime's recovery role: pass it ONLY on a
+        /// fresh/reset "*" query (see "workshop bootstrap -reset-cursor") so it re-enters the
+        /// ranking near where an old cursor left off instead of from the very newest item again.
+        /// Deliberately NOT something to pass alongside an already-advancing real cursor, even
+        /// though doing so wouldn't change which items come back (a real bug found live: it
+        /// doesn't affect pagination, since the cursor already only returns items at-or-before its
+        /// own position, but it DOES change body.total - which reflects the count matching the
+        /// WHOLE query including this bound - so passing an ever-shrinking bound on every page made
+        /// the reported total shrink right along with it, misleadingly, every single page).
         /// </param>
         public async Task<(EResult Result, CPublishedFile_QueryFiles_Response Body)> QueryFiles(uint appId, string cursor, uint numPerPage, uint queryType = 1, uint? dateRangeCreatedEnd = null)
         {

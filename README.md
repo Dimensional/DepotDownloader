@@ -759,7 +759,14 @@ item - every already-recorded item (and its history) is kept either way. Confirm
 manual `-reset-cursor`, the next page recorded almost entirely already-known items (one boundary
 item re-confirmed, the rest genuinely new further-back items) rather than 100% newest-item
 duplicates, and the recovery anchor advanced to an *older* time than before the reset - direct
-proof it re-entered near the prior position, not from "now."
+proof it re-entered near the prior position, not from "now." This bound is applied ONLY on that one
+fresh/reset query, never on an already-advancing cursor's ongoing pages - an earlier version applied
+it every page (reasoning it couldn't change which items come back, which is true), missing that it
+also narrows `body.total` itself, since that reflects the count matching the whole query *including*
+this bound. Since the bound's own value keeps shrinking as the walk progresses, the reported total
+shrank right along with it every page - a real, confirmed, purely cosmetic bug (pagination itself
+was never affected, since it doesn't read `total` at all) caught from the "of ~X reported by Steam"
+line steadily counting down instead of holding roughly steady.
 
 **Full history is fetched by default, not just each item's current state** - both `bootstrap` and
 `poll` also call `GetChangeHistory` per item and store the complete result (every version, oldest

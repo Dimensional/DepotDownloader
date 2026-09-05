@@ -157,11 +157,17 @@ namespace DepotDownloader
             {
                 while (true)
                 {
-                    // The bound is always safe to pass alongside a normally-advancing cursor (see
-                    // QueryFiles' doc comment) - it only actually changes anything right after a
-                    // "-reset-cursor", where it's what keeps a fresh "*" query from restarting at
-                    // the newest item instead of near where the old cursor left off.
-                    var dateRangeCreatedEnd = catalog.QueryType == 1 && catalog.LastRecordedCreationTime > 0
+                    // Only passed on a genuinely fresh/reset entry point ("*"), not on every
+                    // ongoing page - a real bug found live: passing it on every request alongside
+                    // an already-advancing cursor doesn't change which items come back (the cursor
+                    // already only returns items at-or-before its own position), but it DOES change
+                    // body.total, which reflects the count matching the whole query INCLUDING this
+                    // bound - since LastRecordedCreationTime keeps shrinking as the walk progresses,
+                    // total shrank right along with it every page, misleadingly (confirmed: it
+                    // never affected which items were recorded, since the pagination loop below
+                    // never reads body.total at all - purely a progress-display bug, not a
+                    // correctness one, but a real one).
+                    var dateRangeCreatedEnd = catalog.QueryType == 1 && catalog.LastRecordedCreationTime > 0 && catalog.BootstrapCursor == "*"
                         ? catalog.LastRecordedCreationTime
                         : (uint?)null;
                     var (result, body) = await WithTransientRetryAsync("QueryFiles",
