@@ -585,17 +585,30 @@ depotdownloader reconstruct <manifest-file> [OPTIONS...]
 
 **Options:**
 - `-manifest <file>` - Manifest file (alternative to the positional argument)
-- `-output <dir>` - Output directory for reconstructed files (required)
+- `-output <dir>` - Output directory for reconstructed files (required unless `-list-files`)
 - `-depot <id>` - Depot ID (for key lookup / chunk source auto-detect)
 - `-depotkey <hex>` / `-depotkey-file <path>` - Depot key
 - `-chunks <dir>` - Loose chunk folder (default: auto-detect `depot/<id>/chunk`)
 - `-chunkstore <dir>` - Packed chunkstore folder (mutually exclusive with `-chunks`)
 - `-filelist <file>` - Only reconstruct files matching this list (literal paths or
   `regex:<pattern>` lines, same format as `download -filelist`)
+- `-files <list>` - Inline equivalent of `-filelist`: a `;`-separated list of literal paths
+  and/or `regex:<pattern>` entries (`;` rather than `,` since a regex can itself contain
+  commas, e.g. a `{2,4}` quantifier). Combines with `-filelist` if both are given.
+- `-list-files` (alias `-list`) - List every file recorded in the manifest and exit - no
+  reconstruction happens, so `-output`/`-chunks`/`-chunkstore` aren't needed. Plain output is
+  one path per line, sorted, directly reusable as `-filelist` input; add `-verbose` for each
+  file's type/size/chunk count.
 - `-validate` - Verify each file's whole-content SHA1 against the manifest after writing
 - `-threads <count>` - Max parallel file writers (default: CPU count - 1)
 - `-fail-fast` - Stop enqueuing further files after the first failure
-- `-verbose`, `-v` - Show per-file progress output
+- `-verbose`, `-v` - Show per-file progress output (or extra columns with `-list-files`)
+
+Without `-filelist`/`-files`, every file in the manifest is in scope - reconstructing the
+whole depot versus a single file is just a matter of how narrow that filter is. A raw-saved
+manifest (`.manif4`/`.manif5`) stores filenames AES-encrypted and base64-wrapped, not
+human-readable, until decrypted with the depot key - required for `-list-files` just as much
+as for actually reconstructing.
 
 **Examples:**
 ```bash
@@ -605,8 +618,14 @@ depotdownloader reconstruct depot/4001/manifest/123.manifest -output game/ -depo
 # From a chunkstore, with post-write validation
 depotdownloader reconstruct depot/4001/manifest/123.manifest -output game/ -chunkstore chunkstore/ -validate
 
-# Only specific files
+# Only specific files, from a saved list
 depotdownloader reconstruct depot/4001/manifest/123.manifest -output game/ -depot 4001 -filelist important_files.txt
+
+# See what's in a manifest before deciding what to reconstruct
+depotdownloader reconstruct depot/4001/manifest/123.manif5 -depotkey-file depot/4001/4001.depotkey -list-files
+
+# Just one file, without writing a filelist for it
+depotdownloader reconstruct depot/4001/manifest/123.manifest -output game/ -depot 4001 -files "bin/game.exe"
 ```
 
 For more details:
