@@ -12,8 +12,13 @@ using SteamKit2;
 namespace DepotDownloader
 {
     /// <summary>
-    /// Standalone tool for validating depot chunks without requiring Steam connection
-    /// Supports validation of both loose chunk files and chunkstore sets
+    /// The CLI-facing, offline-only orchestration layer behind validate-depot, validate-chunk,
+    /// and chunkstore verify - none of which need or use a live Steam session. Handles folder/path
+    /// resolution, depot-key file auto-detection, thread-count selection, opening a Chunkstore
+    /// instance, and printing the human-facing summary. Delegates the actual per-chunk decrypt/
+    /// decompress/SHA1-compare work to <see cref="ChunkValidator"/>, which is the shared engine
+    /// also used by the live download path - see that class's doc comment for why the two are
+    /// separate rather than one of them being redundant.
     /// </summary>
     public static class StandaloneChunkValidator
     {

@@ -12,8 +12,21 @@ using SteamKit2;
 namespace DepotDownloader
 {
     /// <summary>
-    /// Standalone chunk validation utility that can work with or without Steam session
-    /// Supports validation of both loose chunk files and chunkstore sets
+    /// The core chunk-validation engine: decrypt, decompress, and SHA1-compare a chunk against
+    /// its expected identity, in whichever shape it's available (a loose file, a chunk pulled
+    /// from a Chunkstore, or raw decompressed bytes already in memory), plus the batch/parallel
+    /// loops that validate every chunk in a chunkstore. Has no knowledge of file paths, CLI
+    /// arguments, or depot-key files - just "given these bytes, is this chunk valid".
+    ///
+    /// Despite the similar name, this is NOT the offline/no-live-session validator - that's
+    /// <see cref="StandaloneChunkValidator"/>, the CLI-facing layer for validate-depot/
+    /// validate-chunk/chunkstore verify (folder scanning, depot-key auto-detection, opening a
+    /// Chunkstore, printing summaries) which calls into these primitives to do the actual work.
+    /// This class is also called directly from the live download path
+    /// (ContentDownloader.StandardDownload.cs, when -validate is on) to check a chunk immediately
+    /// after downloading it - which is the reason this logic lives here rather than in
+    /// StandaloneChunkValidator: a live download and an offline check must never be able to
+    /// silently disagree about what "valid" means.
     /// </summary>
     public static class ChunkValidator
     {
