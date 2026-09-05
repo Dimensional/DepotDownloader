@@ -5,6 +5,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Security.Cryptography;
 using System.Text.Json;
 using System.Threading.Tasks;
 using SteamKit2;
@@ -48,7 +49,7 @@ namespace DepotDownloader
                 if (!string.IsNullOrEmpty(details?.file_url))
                 {
                     // Ancient UGC - direct URL download to UGC folder
-                    await DownloadWebFileToUGCAsync(details.consumer_appid, pubFileId, details.filename, details.file_url, details.file_size.ToString());
+                    await DownloadWebFileToUGCAsync(details.consumer_appid, pubFileId, details.title, details.filename, details.file_url, details.file_size.ToString(), details.time_updated);
                 }
                 else if (details?.hcontent_file > 0)
                 {
@@ -79,8 +80,10 @@ namespace DepotDownloader
 
             if (!string.IsNullOrEmpty(details?.URL))
             {
-                // Ancient UGC - direct URL download to UGC folder
-                await DownloadWebFileToUGCAsync(details.AppID, ugcId, details.FileName, details.URL, details.FileSize.ToString());
+                // Ancient UGC - direct URL download to UGC folder. SteamCloud.UGCDetailsCallback
+                // has no title or update-timestamp (unlike PublishedFileDetails below) - update
+                // detection just won't have a signal to work with on this fallback path.
+                await DownloadWebFileToUGCAsync(details.AppID, ugcId, title: null, details.FileName, details.URL, details.FileSize.ToString(), timeUpdated: 0);
             }
             else if (details != null)
             {
@@ -99,8 +102,10 @@ namespace DepotDownloader
 
             if (!string.IsNullOrEmpty(details?.file_url))
             {
-                // Ancient UGC - direct URL download to UGC folder (raw mode doesn't change this)
-                await DownloadWebFileToUGCAsync(details.consumer_appid, publishedFileId, details.title, details.file_url, details.file_size.ToString());
+                // Ancient UGC - direct URL download to UGC folder (raw mode doesn't change this -
+                // there's no raw/processed distinction for a direct-URL file the way there is for
+                // depot chunks, so this is intentionally identical to DownloadPubfileAsync above)
+                await DownloadWebFileToUGCAsync(details.consumer_appid, publishedFileId, details.title, details.filename, details.file_url, details.file_size.ToString(), details.time_updated);
             }
             else if (details?.hcontent_file > 0)
             {
@@ -130,8 +135,9 @@ namespace DepotDownloader
 
             if (!string.IsNullOrEmpty(details?.file_url))
             {
-                // Ancient UGC - direct URL download to UGC folder (raw mode doesn't change this)
-                await DownloadWebFileToUGCAsync(details.consumer_appid, ugcId, details.title, details.file_url, details.file_size.ToString());
+                // Ancient UGC - direct URL download to UGC folder (raw mode doesn't change this -
+                // see the identical comment in DownloadPubfileRawAsync above)
+                await DownloadWebFileToUGCAsync(details.consumer_appid, ugcId, details.title, details.filename, details.file_url, details.file_size.ToString(), details.time_updated);
             }
             else if (details != null)
             {
@@ -194,37 +200,125 @@ namespace DepotDownloader
             await DownloadUGCRawAsync(workshopId, options);
         }
 
-        private static async Task DownloadWebFileToUGCAsync(uint appId, ulong workshopId, string fileName, string url, string fileSize)
+        // One version of an ancient (direct-URL) UGC item, as recorded in its per-item sidecar.
+        // A workshop item can be updated after it's first archived, and an update is not
+        // guaranteed to keep the same internal filename - TimeUpdated (Steam's own timestamp,
+        // independent of the file's name/URL) is what actually distinguishes versions here.
+        private sealed class UgcVersionRecord
         {
-            // Create UGC directory structure organized by app ID (like Python script)
-            var ugcDir = Path.Combine("ugc", appId.ToString());
-            Directory.CreateDirectory(ugcDir);
+            public uint TimeUpdated { get; set; }
+            public string Title { get; set; }
+            public string Filename { get; set; }
+            public string FileUrl { get; set; }
+            public string RelativePath { get; set; }
+            public string FileSize { get; set; }
+            public string Sha1 { get; set; }
+            public string Status { get; set; }
+            public string DownloadedAt { get; set; }
+        }
 
-            // Sanitize workshop title for filename use (like Python script)
-            string safeFileName;
-            if (!string.IsNullOrEmpty(fileName))
+        // Sanitizes one path segment for filesystem safety without collapsing the segment
+        // boundary itself - unlike the old whole-string filter, this preserves the real
+        // directory structure an item's internal filename may contain (e.g. "creation/foo.main"
+        // stays a real subfolder, instead of becoming an unrecognizable flattened blob).
+        private static string SanitizeUgcPathSegment(string segment)
+        {
+            if (string.IsNullOrEmpty(segment))
+                return segment;
+
+            var invalid = Path.GetInvalidFileNameChars();
+            var sanitized = new string(segment.Select(c => invalid.Contains(c) ? '_' : c).ToArray());
+            return sanitized.TrimEnd('.', ' ');
+        }
+
+        private static string BuildUgcRelativePath(ulong workshopId, string internalFileName)
+        {
+            if (string.IsNullOrWhiteSpace(internalFileName))
+                return workshopId.ToString();
+
+            var segments = internalFileName.Split(['/', '\\'], StringSplitOptions.RemoveEmptyEntries)
+                .Select(SanitizeUgcPathSegment)
+                .Where(s => !string.IsNullOrEmpty(s))
+                .ToArray();
+
+            return segments.Length > 0 ? Path.Combine(segments) : workshopId.ToString();
+        }
+
+        private static List<UgcVersionRecord> LoadUgcHistory(string sidecarPath)
+        {
+            if (!File.Exists(sidecarPath))
+                return [];
+
+            try
             {
-                var safeName = string.Concat(fileName.Where(c => char.IsLetterOrDigit(c) || " -_".Contains(c))).Trim();
-                safeName = safeName.Replace(' ', '_');
-                safeFileName = $"{workshopId}_{safeName}";
+                var json = File.ReadAllText(sidecarPath);
+                return JsonSerializer.Deserialize<List<UgcVersionRecord>>(json) ?? [];
             }
-            else
+            catch (Exception ex)
             {
-                safeFileName = workshopId.ToString();
+                Console.WriteLine("Warning: Could not read UGC version history at {0}: {1}", sidecarPath, ex.Message);
+                return [];
             }
+        }
 
-            var destPath = Path.Combine(ugcDir, safeFileName);
+        private static void SaveUgcHistory(string sidecarPath, List<UgcVersionRecord> history)
+        {
+            try
+            {
+                var json = JsonSerializer.Serialize(history, new JsonSerializerOptions { WriteIndented = true });
+                var tempPath = sidecarPath + ".tmp";
+                File.WriteAllText(tempPath, json);
+                File.Move(tempPath, sidecarPath, overwrite: true);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine("Warning: Could not save UGC version history to {0}: {1}", sidecarPath, ex.Message);
+            }
+        }
 
-            // Check if file already exists
-            if (File.Exists(destPath))
+        // Downloads an "ancient" UGC item - one served from a direct file_url rather than
+        // manifest/chunk storage. title is the human-readable workshop title (purely for display
+        // and the sidecar; not guaranteed unique or stable, never used for the on-disk path).
+        // internalFileName is the item's actual stored name/relative path, used to build the real
+        // on-disk layout so the result can be recognized/restored (e.g. copied into a Steam
+        // library) later. Both come from the same PublishedFileDetails lookup where available;
+        // the older SteamCloud.UGCDetailsCallback fallback has no title or update-timestamp, so
+        // callers pass null/0 for those and this still works, just without update-detection.
+        private static async Task DownloadWebFileToUGCAsync(uint appId, ulong workshopId, string title, string internalFileName, string url, string fileSize, uint timeUpdated)
+        {
+            var itemDir = Path.Combine("ugc", appId.ToString(), workshopId.ToString());
+            Directory.CreateDirectory(itemDir);
+
+            var relativePath = BuildUgcRelativePath(workshopId, internalFileName);
+            var destPath = Path.Combine(itemDir, relativePath);
+            var sidecarPath = Path.Combine(itemDir, "_meta.json");
+
+            var history = LoadUgcHistory(sidecarPath);
+            var latest = history.Count > 0 ? history[^1] : null;
+
+            if (latest != null && latest.TimeUpdated == timeUpdated && File.Exists(destPath))
             {
                 Console.WriteLine("UGC file already exists: {0}", destPath);
-                RecordUGCDownload(workshopId, url, fileName, destPath, appId, "exists", fileSize);
+                latest.Status = "exists";
+                latest.DownloadedAt = DateTime.Now.ToString("O");
+                SaveUgcHistory(sidecarPath, history);
+                RecordUGCDownload(workshopId, url, title, internalFileName, destPath, appId, "exists", fileSize, timeUpdated);
                 return;
             }
 
-            Console.WriteLine("Downloading UGC workshop item {0}: '{1}'", workshopId, fileName ?? "Unknown");
+            if (latest != null && latest.TimeUpdated != timeUpdated)
+            {
+                Console.WriteLine(
+                    "Workshop item {0} was updated since the last download (previous file: '{1}', new file: '{2}') - keeping the previous version, saving the new one alongside it.",
+                    workshopId, latest.Filename ?? "(unknown)", internalFileName ?? "(unknown)");
+            }
+
+            Console.WriteLine("Downloading UGC workshop item {0}: '{1}'", workshopId, title ?? internalFileName ?? "Unknown");
             Console.WriteLine("URL: {0}", url);
+
+            var destDir = Path.GetDirectoryName(destPath);
+            if (!string.IsNullOrEmpty(destDir))
+                Directory.CreateDirectory(destDir);
 
             // Download to a staging path and only move it into place once the full body has been
             // written - an interrupted direct write would otherwise leave a truncated file at
@@ -234,7 +328,7 @@ namespace DepotDownloader
             try
             {
                 using var client = HttpClientFactory.CreateHttpClient();
-                Console.WriteLine("Downloading {0}", safeFileName);
+                Console.WriteLine("Downloading {0}", relativePath);
 
                 var response = await client.GetAsync(url);
                 if (!response.IsSuccessStatusCode)
@@ -249,10 +343,30 @@ namespace DepotDownloader
                     await responseStream.CopyToAsync(fileStream);
                 }
 
+                string sha1Hex;
+                using (var fs = File.OpenRead(tempPath))
+                    sha1Hex = Util.ToHex(SHA1.HashData(fs));
+
                 File.Move(tempPath, destPath, overwrite: true);
 
                 Console.WriteLine("Downloaded UGC file to {0}", destPath);
-                RecordUGCDownload(workshopId, url, fileName, destPath, appId, "downloaded", fileSize);
+
+                var actualSize = File.Exists(destPath) ? new FileInfo(destPath).Length.ToString() : fileSize;
+                history.Add(new UgcVersionRecord
+                {
+                    TimeUpdated = timeUpdated,
+                    Title = title,
+                    Filename = internalFileName,
+                    FileUrl = url,
+                    RelativePath = relativePath,
+                    FileSize = actualSize,
+                    Sha1 = sha1Hex,
+                    Status = "downloaded",
+                    DownloadedAt = DateTime.Now.ToString("O"),
+                });
+                SaveUgcHistory(sidecarPath, history);
+
+                RecordUGCDownload(workshopId, url, title, internalFileName, destPath, appId, "downloaded", actualSize, timeUpdated);
             }
             catch (Exception ex)
             {
@@ -261,9 +375,12 @@ namespace DepotDownloader
             }
         }
 
-        private static void RecordUGCDownload(ulong workshopId, string fileUrl, string title, string destPath, uint appId, string status, string fileSize)
+        // Central overview of every UGC download across all apps - kept alongside each item's own
+        // durable per-item sidecar (UgcVersionRecord/_meta.json) rather than instead of it, so a
+        // corrupted or deleted download_records.json never loses a version history that the
+        // sidecar right next to the actual file still has.
+        private static void RecordUGCDownload(ulong workshopId, string fileUrl, string title, string filename, string destPath, uint appId, string status, string fileSize, uint timeUpdated)
         {
-            // Record UGC download information to a tracking file (like Python script)
             var ugcDir = "ugc";
             Directory.CreateDirectory(ugcDir);
 
@@ -306,6 +423,8 @@ namespace DepotDownloader
             {
                 workshop_id = workshopId,
                 title = title ?? "Unknown",
+                filename = filename,
+                time_updated = timeUpdated,
                 file_url = fileUrl,
                 file_path = destPath,
                 status = status,
