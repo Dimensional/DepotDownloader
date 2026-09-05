@@ -8,6 +8,7 @@ using System.Linq;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
+using System.Text.RegularExpressions;
 using System.Threading.Tasks;
 using SteamKit2;
 
@@ -218,6 +219,79 @@ namespace DepotDownloader
 
             return bytes;
         }
+
+        /// <summary>
+        /// Lowercase hex encoding, invariant of culture - the canonical form used everywhere a
+        /// SHA1/chunk-id is printed or compared as a string in this codebase. Use this instead of
+        /// hand-rolling Convert.ToHexString(...).ToLower()/.ToLowerInvariant() or
+        /// BitConverter.ToString(...).Replace("-", "") at each call site.
+        /// </summary>
+        public static string ToHex(byte[] bytes) => Convert.ToHexString(bytes).ToLowerInvariant();
+
+        /// <summary>
+        /// The "threads unspecified" default used consistently across chunkstore/validation/
+        /// reconstruction parallelism - leaves one core free rather than oversubscribing. Pass the
+        /// user-requested value (0/negative means "unspecified"); returns it unchanged otherwise.
+        /// </summary>
+        public static int ResolveParallelism(int requested) =>
+            requested > 0 ? requested : Math.Max(1, Environment.ProcessorCount - 1);
+
+        /// <summary>
+        /// Parses a "-filelist"-style file: non-blank lines are either literal relative paths
+        /// (backslashes normalized to forward slashes) or "regex:&lt;pattern&gt;"-prefixed regular
+        /// expressions (case-insensitive). Same format shared by "download -filelist" and
+        /// "reconstruct -filelist" - callers decide for themselves whether a parse failure should
+        /// warn-and-continue or abort, so this only reports success/failure plus a message.
+        /// </summary>
+        public static bool TryParseFileList(string path, out HashSet<string> literals, out List<Regex> regexes, out string error)
+        {
+            literals = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            regexes = [];
+            error = null;
+
+            if (!File.Exists(path))
+            {
+                error = $"Filelist not found: {path}";
+                return false;
+            }
+
+            const string RegexPrefix = "regex:";
+
+            try
+            {
+                foreach (var entry in File.ReadAllLines(path))
+                {
+                    if (string.IsNullOrWhiteSpace(entry))
+                        continue;
+
+                    if (entry.StartsWith(RegexPrefix))
+                    {
+                        regexes.Add(new Regex(entry[RegexPrefix.Length..], RegexOptions.Compiled | RegexOptions.IgnoreCase));
+                    }
+                    else
+                    {
+                        literals.Add(entry.Replace('\\', '/'));
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                error = ex.Message;
+                return false;
+            }
+
+            return true;
+        }
+
+        /// <summary>
+        /// Formats a "done/total (percent%)" progress fragment, e.g. "1,234/5,000 (24.7%)" - the
+        /// count/percentage shape repeated across chunkstore pack/rebuild/unpack and validation
+        /// progress lines. Callers still supply their own leading verb/noun ("Packed ", " chunks").
+        /// </summary>
+        public static string FormatProgress(long done, long total) =>
+            $"{done:N0}/{total:N0} ({(total > 0 ? done * 100.0 / total : 0):F1}%)";
+
+        public static string FormatProgress(ulong done, ulong total) => FormatProgress((long)done, (long)total);
 
         /// <summary>
         /// Decrypts using AES/ECB/PKCS7

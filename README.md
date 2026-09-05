@@ -48,8 +48,8 @@ depotdownloader <COMMAND> [OPTIONS...]
 - **`validate-chunk`** - Validate a single chunk file (offline)
 - **`validate-chunkstore`** - Validate all chunks in a chunkstore (offline)
 - **`validate-chunkstore-chunks`** - Validate specific chunks in a chunkstore (offline)
-- **`reconstruct`** - Process raw chunks into installed files [Coming Soon]
-- **`chunkstore`** - Manage chunk storage and deduplication [Coming Soon]
+- **`reconstruct`** - Rebuild installed files offline from a manifest + archived chunks
+- **`chunkstore`** - Pack/unpack/verify/stats/update/rebuild for chunk storage
 
 For help on a specific command:
 ```
@@ -406,19 +406,161 @@ depotdownloader help validation
 
 ---
 
-## Chunkstore Command (Coming Soon)
+## Chunkstore Command
 
-Manage and organize chunk storage for efficient depot operations.
+Pack loose chunks (as produced by `download -raw`) into a chunkstore (a CSD/CSM pair) for
+efficient, deduplicated storage of a depot's chunks, and manage that storage.
 
-### Planned Operations
+A single chunkstore always holds one encryption mode - either all chunks encrypted (as
+downloaded from the CDN) or all already decrypted, never a mix; this is recorded in the
+chunkstore's own metadata and enforced when packing.
+
+### pack
+
+Create or add to a chunkstore from loose chunk files.
 
 ```bash
-depotdownloader chunkstore pack <input-folder> <output-folder> [OPTIONS...]
-depotdownloader chunkstore unpack <chunkstore-folder> <output-folder> [OPTIONS...]
-depotdownloader chunkstore stats <chunkstore-folder> [OPTIONS...]
+depotdownloader chunkstore pack <input-chunks-folder> <output-chunkstore-folder> [OPTIONS...]
+```
+
+**Options:**
+- `-depot <id>` - Depot ID (required for a new chunkstore)
+- `-encrypted` / `-decrypted` - Mark chunks as encrypted/decrypted (default: auto-detect)
+- `-max-file-size <bytes>` - Maximum size per CSD file (default: 2GB)
+- `-threads <count>` - Parallel file reads (default: CPU count - 1)
+- `-batch-size <count>` - Chunks to buffer in memory (default: 1000)
+- `-checkpoint-interval <n>` - Save checkpoint every N chunks (default: 5000)
+
+**Examples:**
+```bash
+depotdownloader chunkstore pack depot/4001/chunk/ chunkstore/ -depot 4001
+depotdownloader chunkstore pack depot/4001/chunk/ chunkstore/ -depot 4001 -decrypted
+```
+
+### unpack
+
+Extract chunks from a chunkstore back to individual loose files.
+
+```bash
+depotdownloader chunkstore unpack <chunkstore-folder> <output-chunks-folder> [OPTIONS...]
+```
+
+**Options:**
+- `-depot <id>` - Depot ID (auto-detects if only one depot)
+- `-threads <count>` - Parallel file operations (default: CPU count - 1)
+- `-overwrite` - Overwrite existing files (default: skip existing)
+
+**Examples:**
+```bash
+depotdownloader chunkstore unpack chunkstore/ extracted_chunks/
+depotdownloader chunkstore unpack chunkstore/ extracted_chunks/ -depot 4001 -threads 16
+```
+
+### verify
+
+Validate chunk integrity by reading each chunk from the CSD via the CSM's metadata,
+decrypting (if the chunkstore is encrypted) and decompressing it, and checking the result
+against its SHA1 name. This is also available under the `validate-chunkstore` /
+`validate-chunkstore-chunks` command names, which are aliases for `chunkstore verify`.
+
+```bash
 depotdownloader chunkstore verify <chunkstore-folder> [OPTIONS...]
-depotdownloader chunkstore rebuild <chunkstore-folder> [OPTIONS...]
-depotdownloader chunkstore update <chunkstore-folder> <new-chunks-folder> [OPTIONS...]
+```
+
+**Options:**
+- `-depot, -d <id>` - Depot ID (auto-detects if only one depot)
+- `-key, -k <path>` - Path to depot key file
+- `-chunks <file>` - Only verify the SHA1s listed in this file (one per line, or first
+  column of a CSV; `#` comments allowed)
+- `-threads, -t <count>` - Parallel validation threads (default: auto)
+- `-verbose, -v` - Show result for every chunk
+- `-no-resume` - Ignore existing checkpoint, start fresh
+
+**Examples:**
+```bash
+depotdownloader chunkstore verify chunkstore/
+depotdownloader chunkstore verify chunkstore/ -depot 4001 -key depot.key
+depotdownloader chunkstore verify chunkstore/ -chunks suspect_chunks.txt
+```
+
+### stats
+
+Display chunk count, file sizes, and storage metrics for a chunkstore.
+
+```bash
+depotdownloader chunkstore stats <chunkstore-folder> [OPTIONS...]
+```
+
+**Options:**
+- `-depot <id>` - Depot ID (auto-detects if only one depot)
+
+**Examples:**
+```bash
+depotdownloader chunkstore stats chunkstore/
+depotdownloader chunkstore stats chunkstore/ -depot 4001
+```
+
+### update
+
+Cheaply appends chunks from a folder to an existing chunkstore - the way to bring a store up
+to date after a game update. Only chunks not already present are added; existing CSD/CSM data
+is never touched or re-sorted, so the storage cost is proportional to what's actually new, not
+to the size of the store already on disk (a 400GB store gaining 5 new chunks costs ~5 chunks,
+not another 400GB). The result is **not** alphanumerically sorted - see `rebuild` below.
+
+```bash
+depotdownloader chunkstore update <new-chunks-folder> <existing-chunkstore-folder> [OPTIONS...]
+```
+
+**Options:**
+- `-depot <id>` - Depot ID (auto-detects if only one depot)
+- `-max-file-size <bytes>` - Maximum size per CSD file (default: 2GiB, min: 1GiB)
+- `-threads <count>` - Parallel file reads (default: CPU count - 1)
+- `-batch-size <count>` - Chunks to buffer in memory (default: 1000)
+- `-checkpoint-interval <n>` - Save checkpoint every N chunks (default: 5000)
+
+Requires an existing chunkstore at the target (use `pack` to create one first); refuses if the
+input folder contains chunks that don't match the store's own encryption mode.
+
+**Examples:**
+```bash
+depotdownloader chunkstore update depot/4001/new_chunks/ chunkstore/ -depot 4001
+```
+
+### rebuild
+
+Re-sorts every chunk in a chunkstore into a fresh, alphanumerically-ordered copy - the same
+canonical, byte-for-byte-deterministic layout a from-scratch `pack` of the same chunk set would
+produce. This is what restores that determinism after incremental `update` calls have appended
+chunks out of order (relevant e.g. for checksumming a chunkstore the way No-Intro checksums a
+canonical ROM file). Deliberately expensive: since sorted offsets can't be computed without a
+full copy, it needs up to ~2x storage transiently. The original is never modified or deleted -
+once you've confirmed the new store (e.g. with `verify`), replace the original yourself.
+
+```bash
+depotdownloader chunkstore rebuild <chunkstore-folder> <output-folder> [OPTIONS...]
+```
+
+**Options:**
+- `-depot <id>` - Depot ID (auto-detects if only one depot)
+- `-max-file-size <bytes>` - Maximum size per CSD file (default: 2GiB, min: 1GiB)
+- `-threads <count>` - Parallel chunk reads (default: CPU count - 1)
+- `-batch-size <count>` - Chunks to buffer in memory (default: 1000)
+- `-checkpoint-interval <n>` - Save checkpoint every N chunks (default: 5000)
+- `-no-resume` - Ignore an existing partial rebuild, start fresh
+- `-delete-source-as-we-go` - Delete old segments from the source as soon as every chunk they
+  hold is durably confirmed copied, instead of waiting until the whole rebuild finishes. Bounds
+  storage overhead to roughly the still-pending portion of the source rather than the whole
+  store - but this **permanently deletes parts of the source while the operation runs**, not
+  just at the end. Safe to interrupt and resume (deletion only ever happens after a checkpoint
+  confirming those chunks is durably saved, and a fresh post-write byte comparison runs before
+  anything old is removed), but it's a fundamentally different risk profile than the default
+  (which never touches the source at all) - opt in deliberately.
+
+**Examples:**
+```bash
+depotdownloader chunkstore rebuild chunkstore/ chunkstore_rebuilt/ -depot 4001
+depotdownloader chunkstore rebuild chunkstore/ chunkstore_rebuilt/ -depot 4001 -delete-source-as-we-go
 ```
 
 For more details:
@@ -428,14 +570,43 @@ depotdownloader help chunkstore
 
 ---
 
-## Reconstruct Command (Coming Soon)
+## Reconstruct Command
 
-Process raw depot chunks into installed files.
+Rebuilds installed depot files entirely offline from a saved manifest, a depot key, and
+previously-archived chunk data (loose files from `download -raw`, or a packed chunkstore).
+No Steam connection required.
 
-### Planned Usage
+Every in-scope file is always rewritten from scratch - reconstruct never trusts or reuses
+partial output, so it's always safe to re-run after an interruption.
 
 ```bash
-depotdownloader reconstruct <depot-path> [OPTIONS...]
+depotdownloader reconstruct <manifest-file> [OPTIONS...]
+```
+
+**Options:**
+- `-manifest <file>` - Manifest file (alternative to the positional argument)
+- `-output <dir>` - Output directory for reconstructed files (required)
+- `-depot <id>` - Depot ID (for key lookup / chunk source auto-detect)
+- `-depotkey <hex>` / `-depotkey-file <path>` - Depot key
+- `-chunks <dir>` - Loose chunk folder (default: auto-detect `depot/<id>/chunk`)
+- `-chunkstore <dir>` - Packed chunkstore folder (mutually exclusive with `-chunks`)
+- `-filelist <file>` - Only reconstruct files matching this list (literal paths or
+  `regex:<pattern>` lines, same format as `download -filelist`)
+- `-validate` - Verify each file's whole-content SHA1 against the manifest after writing
+- `-threads <count>` - Max parallel file writers (default: CPU count - 1)
+- `-fail-fast` - Stop enqueuing further files after the first failure
+- `-verbose`, `-v` - Show per-file progress output
+
+**Examples:**
+```bash
+# Loose chunks, auto-detecting the depot key and chunk folder
+depotdownloader reconstruct depot/4001/manifest/123.manifest -output game/ -depot 4001
+
+# From a chunkstore, with post-write validation
+depotdownloader reconstruct depot/4001/manifest/123.manifest -output game/ -chunkstore chunkstore/ -validate
+
+# Only specific files
+depotdownloader reconstruct depot/4001/manifest/123.manifest -output game/ -depot 4001 -filelist important_files.txt
 ```
 
 For more details:

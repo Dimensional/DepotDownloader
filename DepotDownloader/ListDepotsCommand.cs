@@ -41,16 +41,15 @@ namespace DepotDownloader
 
         public static int RunSync(string[] args)
         {
-            if (args.Length == 0 || HasParameter(args, "-h") || HasParameter(args, "--help") || HasParameter(args, "help"))
+            var parser = new ArgParser(args);
+
+            if (args.Length == 0 || parser.HasFlag("-h", "--help", "help"))
             {
                 return PrintUsage();
             }
 
             // Positional CSV argument (preferred)
-            var csvPath = args.FirstOrDefault(a => !a.StartsWith("-", StringComparison.Ordinal));
-
-            // Historical/optional switch support (intentionally commented for now)
-            // var csvPath = GetParameter<string>(args, "-manifest-csv");
+            var csvPath = parser.Positional(0);
 
             if (string.IsNullOrWhiteSpace(csvPath))
             {
@@ -148,47 +147,6 @@ namespace DepotDownloader
                 }
                 Console.WriteLine();
             }
-        }
-
-        // Minimal arg helpers (kept for potential future use)
-
-        private static int IndexOfParam(string[] args, string param)
-        {
-            for (var x = 0; x < args.Length; ++x)
-            {
-                if (args[x].Equals(param, StringComparison.OrdinalIgnoreCase))
-                {
-                    return x;
-                }
-            }
-            return -1;
-        }
-
-        private static bool HasParameter(string[] args, string param)
-        {
-            return IndexOfParam(args, param) > -1;
-        }
-
-        private static T GetParameter<T>(string[] args, string param, T defaultValue = default)
-        {
-            var index = IndexOfParam(args, param);
-            if (index == -1 || index == (args.Length - 1))
-                return defaultValue;
-
-            var strParam = args[index + 1];
-            try
-            {
-                var converter = System.ComponentModel.TypeDescriptor.GetConverter(typeof(T));
-                if (converter != null)
-                {
-                    return (T)converter.ConvertFromString(strParam);
-                }
-            }
-            catch
-            {
-                // fall back to default
-            }
-            return defaultValue;
         }
     }
 }

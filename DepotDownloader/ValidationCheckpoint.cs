@@ -3,7 +3,6 @@
 
 using System.Collections.Generic;
 using System.IO;
-using System.IO.Compression;
 using ProtoBuf;
 
 namespace DepotDownloader
@@ -57,21 +56,8 @@ namespace DepotDownloader
         public static string GetPath(string chunkstoreFolder, uint depotId)
             => Path.Combine(chunkstoreFolder, $"{depotId}_validation.checkpoint");
 
-        public static ValidationCheckpoint LoadFromFile(string path)
-        {
-            using var fs = File.OpenRead(path);
-            using var ds = new DeflateStream(fs, CompressionMode.Decompress);
-            return Serializer.Deserialize<ValidationCheckpoint>(ds);
-        }
+        public static ValidationCheckpoint LoadFromFile(string path) => CheckpointFile.Load<ValidationCheckpoint>(path);
 
-        public void SaveToFile(string path)
-        {
-            var tmp = path + ".tmp";
-            using (var fs = File.Create(tmp))
-            using (var ds = new DeflateStream(fs, CompressionMode.Compress))
-                Serializer.Serialize(ds, this);
-
-            File.Move(tmp, path, overwrite: true);
-        }
+        public void SaveToFile(string path) => CheckpointFile.Save(path, this);
     }
 }

@@ -17,6 +17,65 @@ namespace DepotDownloader
     /// </summary>
     public static class StandaloneChunkValidator
     {
+        #region Shared Helpers
+
+        /// <summary>
+        /// Resolves the thread count to use for validation: an explicit request is used as-is,
+        /// otherwise overprovisions relative to CPU count (validation is a mixed I/O + CPU
+        /// workload - threads spend much of their time waiting on disk, so more threads than
+        /// cores keeps CPU busy while others wait), capped to avoid excessive overhead. This is
+        /// deliberately a different formula than <see cref="Util.ResolveParallelism"/> (used for
+        /// chunkstore pack/rebuild/reconstruct, which are more write/CPU-bound) - not a missed
+        /// consolidation, both are the right default for their own kind of workload.
+        /// </summary>
+        private static int ResolveValidationThreadCount(int requested)
+        {
+            if (requested > 0)
+            {
+                Console.WriteLine($"Using custom thread count: {requested}");
+                return requested;
+            }
+
+            var cpuCores = Environment.ProcessorCount;
+            var maxThreads = Math.Min(cpuCores * 2, 32); // Cap at 32 to avoid excessive overhead
+            Console.WriteLine($"Auto-detected thread count: {maxThreads} (CPU cores: {cpuCores}, ratio: {(double)maxThreads / cpuCores:F1}x)");
+            return maxThreads;
+        }
+
+        /// <summary>
+        /// Resolves the depot key for a chunkstore: an explicit path is used if given (and must
+        /// exist), otherwise the folder is scanned for a single "*.depotkey" file. Finding nothing
+        /// is not itself a failure - an unencrypted chunkstore needs no key - only an explicitly
+        /// given but missing path is.
+        /// </summary>
+        private static async Task<(byte[] DepotKey, bool Failed)> ResolveChunkstoreDepotKeyAsync(string chunkstorePath, string depotKeyPath)
+        {
+            if (!string.IsNullOrEmpty(depotKeyPath))
+            {
+                if (!File.Exists(depotKeyPath))
+                {
+                    Console.WriteLine($"Error: Depot key file not found: {depotKeyPath}");
+                    return (null, true);
+                }
+
+                var depotKey = await File.ReadAllBytesAsync(depotKeyPath);
+                Console.WriteLine($"Using depot key: {Path.GetFileName(depotKeyPath)}");
+                return (depotKey, false);
+            }
+
+            var depotKeyFiles = Directory.GetFiles(chunkstorePath, "*.depotkey");
+            if (depotKeyFiles.Length > 0)
+            {
+                var depotKey = await File.ReadAllBytesAsync(depotKeyFiles[0]);
+                Console.WriteLine($"Auto-detected depot key: {Path.GetFileName(depotKeyFiles[0])}");
+                return (depotKey, false);
+            }
+
+            return (null, false);
+        }
+
+        #endregion
+
         #region Loose File Validation (Existing Functionality)
 
         /// <summary>
@@ -37,17 +96,6 @@ namespace DepotDownloader
                 return summary;
             }
 
-            // Look for depot key
-            var depotKeyPath = Directory.GetFiles(depotPath, "*.depotkey").FirstOrDefault();
-            if (depotKeyPath == null)
-            {
-                Console.WriteLine($"Error: No depot key found in {depotPath}");
-                return summary;
-            }
-
-            var depotKey = await File.ReadAllBytesAsync(depotKeyPath);
-            Console.WriteLine($"Using depot key: {Path.GetFileName(depotKeyPath)}");
-
             // Look for chunks directory
             var chunksDir = Path.Combine(depotPath, "chunk");
             if (!Directory.Exists(chunksDir))
@@ -62,29 +110,49 @@ namespace DepotDownloader
                 Console.WriteLine($"Note: Manifest parameter provided but not used - chunk sizes are auto-detected");
             }
 
-            // Find all chunk files
+            // Find all chunk files. Chunks never have an extension, whether still encrypted
+            // ("<sha>") or already decrypted ("<sha>_decrypted") - each file's own name is
+            // checked per-file below, so a folder can freely mix both.
             var chunkFiles = Directory.GetFiles(chunksDir, "*", SearchOption.TopDirectoryOnly)
                                      .Where(f => !Path.HasExtension(f)) // Chunk files have no extension
                                      .ToList();
 
             summary.TotalChunks = chunkFiles.Count;
 
-            // Smart thread count calculation (like Dolphin-Tools approach)
-            if (maxThreads <= 0)
+            // Mixing encrypted and already-decrypted chunks in the same loose folder is legal (unlike
+            // a chunkstore, which must be one mode or the other) - but it's still worth surfacing, since
+            // an unexpected mix in this folder is usually a sign something upstream put files here it
+            // shouldn't have. Report the breakdown up front rather than letting it pass unremarked.
+            var decryptedCount = chunkFiles.Count(f => Path.GetFileName(f).EndsWith("_decrypted", StringComparison.Ordinal));
+            var encryptedCount = chunkFiles.Count - decryptedCount;
+            if (encryptedCount > 0 && decryptedCount > 0)
             {
-                // Use overprovisioning for mixed I/O and CPU workload
-                var cpuCores = Environment.ProcessorCount;
+                Console.WriteLine($"Note: folder contains a mix of {encryptedCount} encrypted and {decryptedCount} already-decrypted chunk(s) - each is validated according to its own filename.");
+            }
 
-                // For chunk validation (mixed I/O + CPU), optimal is usually 1.5x to 2x CPU cores
-                // This allows threads to wait for I/O while others use CPU
-                maxThreads = Math.Min(cpuCores * 2, 32); // Cap at 32 to avoid excessive overhead
+            // A depot key is only needed if at least one chunk here is still encrypted; a folder
+            // of already-decrypted chunks (e.g. unpacked from a decrypted chunkstore) needs none.
+            var needsDepotKey = encryptedCount > 0;
+            byte[] depotKey = null;
 
-                Console.WriteLine($"Auto-detected thread count: {maxThreads} (CPU cores: {cpuCores}, ratio: {(double)maxThreads / cpuCores:F1}x)");
+            if (needsDepotKey)
+            {
+                var depotKeyPath = Directory.GetFiles(depotPath, "*.depotkey").FirstOrDefault();
+                if (depotKeyPath == null)
+                {
+                    Console.WriteLine($"Error: No depot key found in {depotPath}");
+                    return summary;
+                }
+
+                depotKey = await File.ReadAllBytesAsync(depotKeyPath);
+                Console.WriteLine($"Using depot key: {Path.GetFileName(depotKeyPath)}");
             }
             else
             {
-                Console.WriteLine($"Using custom thread count: {maxThreads}");
+                Console.WriteLine("All chunks are already decrypted - no depot key needed");
             }
+
+            maxThreads = ResolveValidationThreadCount(maxThreads);
 
             Console.WriteLine($"Found {chunkFiles.Count} chunk files to validate using {maxThreads} threads");
 
@@ -106,8 +174,12 @@ namespace DepotDownloader
 
                 try
                 {
+                    // A loose chunk's own name says whether it's still encrypted or already
+                    // decrypted - same "<sha>"/"<sha>_decrypted" convention chunkstores use.
+                    var isEncrypted = !chunkId.EndsWith("_decrypted", StringComparison.Ordinal);
+
                     // ChunkValidator is thread-safe - safe to call concurrently
-                    var result = await ChunkValidator.ValidateRawChunkAsync(chunkFile, depotKey, 0);
+                    var result = await ChunkValidator.ValidateRawChunkAsync(chunkFile, depotKey, isEncrypted, 0);
 
                     if (result.IsValid)
                     {
@@ -178,8 +250,11 @@ namespace DepotDownloader
 
             var depotKey = await File.ReadAllBytesAsync(depotKeyPath);
 
+            // A loose chunk's own name says whether it's still encrypted or already decrypted.
+            var isEncrypted = !Path.GetFileName(chunkFilePath).EndsWith("_decrypted", StringComparison.Ordinal);
+
             // Use dynamic size detection (uncompressedLength parameter is ignored)
-            return await ChunkValidator.ValidateRawChunkAsync(chunkFilePath, depotKey, 0);
+            return await ChunkValidator.ValidateRawChunkAsync(chunkFilePath, depotKey, isEncrypted, 0);
         }
 
         #endregion
@@ -214,25 +289,10 @@ namespace DepotDownloader
             try
             {
                 // Load depot key
-                byte[] depotKey = null;
-                if (!string.IsNullOrEmpty(depotKeyPath))
+                var (depotKey, keyResolutionFailed) = await ResolveChunkstoreDepotKeyAsync(chunkstorePath, depotKeyPath);
+                if (keyResolutionFailed)
                 {
-                    if (!File.Exists(depotKeyPath))
-                    {
-                        Console.WriteLine($"Error: Depot key file not found: {depotKeyPath}");
-                        return summary;
-                    }
-                    depotKey = await File.ReadAllBytesAsync(depotKeyPath);
-                    Console.WriteLine($"Using depot key: {Path.GetFileName(depotKeyPath)}");
-                }
-                else
-                {
-                    var depotKeyFiles = Directory.GetFiles(chunkstorePath, "*.depotkey");
-                    if (depotKeyFiles.Length > 0)
-                    {
-                        depotKey = await File.ReadAllBytesAsync(depotKeyFiles[0]);
-                        Console.WriteLine($"Auto-detected depot key: {Path.GetFileName(depotKeyFiles[0])}");
-                    }
+                    return summary;
                 }
 
                 // Initialize chunkstore
@@ -271,16 +331,7 @@ namespace DepotDownloader
                 checkpoint ??= new ValidationCheckpoint { DepotId = stats.DepotId };
 
                 // Determine thread count
-                if (maxThreads <= 0)
-                {
-                    var cpuCores = Environment.ProcessorCount;
-                    maxThreads = Math.Min(cpuCores * 2, 32);
-                    Console.WriteLine($"Auto-detected thread count: {maxThreads} (CPU cores: {cpuCores}, ratio: {(double)maxThreads / cpuCores:F1}x)");
-                }
-                else
-                {
-                    Console.WriteLine($"Using custom thread count: {maxThreads}");
-                }
+                maxThreads = ResolveValidationThreadCount(maxThreads);
 
                 Console.WriteLine($"Validating {stats.TotalChunks:N0} chunks from chunkstore using {maxThreads} threads");
 
@@ -293,7 +344,7 @@ namespace DepotDownloader
                     {
                         var newCount = Interlocked.Exchange(ref progressCount, validated);
                         if (validated % 100 == 0 || validated == total || validated - newCount >= 50)
-                            Console.WriteLine($"Progress: {validated:N0}/{total:N0} chunks validated ({(validated * 100.0 / total):F1}%)");
+                            Console.WriteLine($"Progress: {Util.FormatProgress(validated, total)} chunks validated");
                     },
                     checkpoint: checkpoint,
                     onCsdComplete: (csdIndex, csdChecksum, currentResults) =>
@@ -331,7 +382,14 @@ namespace DepotDownloader
                     {
                         summary.ValidChunks++;
                         if (verbose)
-                            Console.WriteLine($"✓ {kvp.Key} - Valid ({kvp.Value.DecompressedSize} bytes)");
+                        {
+                            // A chunk from a checksum-matched, checkpoint-skipped CSD is reconstructed
+                            // as IsValid=true without re-decompressing it (that's the whole point of
+                            // skipping), so DecompressedSize is left at its unset default here -
+                            // print that honestly rather than a misleading "(0 bytes)".
+                            var sizeNote = kvp.Value.DecompressedSize > 0 ? $"({kvp.Value.DecompressedSize} bytes)" : "(from checkpoint, not re-read this run)";
+                            Console.WriteLine($"✓ {kvp.Key} - Valid {sizeNote}");
+                        }
                     }
                     else
                     {
@@ -394,26 +452,10 @@ namespace DepotDownloader
             try
             {
                 // Load depot key
-                byte[] depotKey = null;
-                if (!string.IsNullOrEmpty(depotKeyPath))
+                var (depotKey, keyResolutionFailed) = await ResolveChunkstoreDepotKeyAsync(chunkstorePath, depotKeyPath);
+                if (keyResolutionFailed)
                 {
-                    if (!File.Exists(depotKeyPath))
-                    {
-                        Console.WriteLine($"Error: Depot key file not found: {depotKeyPath}");
-                        return summary;
-                    }
-                    depotKey = await File.ReadAllBytesAsync(depotKeyPath);
-                    Console.WriteLine($"Using depot key: {Path.GetFileName(depotKeyPath)}");
-                }
-                else
-                {
-                    // Look for depot key files in the chunkstore directory
-                    var depotKeyFiles = Directory.GetFiles(chunkstorePath, "*.depotkey");
-                    if (depotKeyFiles.Length > 0)
-                    {
-                        depotKey = await File.ReadAllBytesAsync(depotKeyFiles[0]);
-                        Console.WriteLine($"Auto-detected depot key: {Path.GetFileName(depotKeyFiles[0])}");
-                    }
+                    return summary;
                 }
 
                 // Initialize chunkstore
@@ -423,16 +465,7 @@ namespace DepotDownloader
                 Console.WriteLine($"Chunkstore loaded: {stats}");
 
                 // Determine thread count
-                if (maxThreads <= 0)
-                {
-                    var cpuCores = Environment.ProcessorCount;
-                    maxThreads = Math.Min(cpuCores * 2, 32);
-                    Console.WriteLine($"Auto-detected thread count: {maxThreads} (CPU cores: {cpuCores}, ratio: {(double)maxThreads / cpuCores:F1}x)");
-                }
-                else
-                {
-                    Console.WriteLine($"Using custom thread count: {maxThreads}");
-                }
+                maxThreads = ResolveValidationThreadCount(maxThreads);
 
                 Console.WriteLine($"Validating {chunks.Count:N0} specified chunks from chunkstore using {maxThreads} threads");
 
@@ -448,7 +481,7 @@ namespace DepotDownloader
                         var newCount = Interlocked.Exchange(ref progressCount, validated);
                         if (validated % 100 == 0 || validated == total || validated - newCount >= 50)
                         {
-                            Console.WriteLine($"Progress: {validated:N0}/{total:N0} chunks validated ({(validated * 100.0 / total):F1}%)");
+                            Console.WriteLine($"Progress: {Util.FormatProgress(validated, total)} chunks validated");
                         }
                     });
 

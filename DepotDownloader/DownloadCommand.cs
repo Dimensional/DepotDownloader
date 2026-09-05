@@ -3,7 +3,6 @@
 
 using System;
 using System.Collections.Generic;
-using System.ComponentModel;
 using System.Globalization;
 using System.IO;
 using System.Linq;
@@ -19,8 +18,6 @@ namespace DepotDownloader
     /// </summary>
     public static class DownloadCommand
     {
-        private static bool[] consumedArgs;
-
         enum OperationMode
         {
             Invalid,
@@ -55,9 +52,9 @@ namespace DepotDownloader
         {
             AccountSettingsStore.LoadFromFile("account.config");
 
-            consumedArgs = new bool[args.Length];
+            var parser = new ArgParser(args);
 
-            if (HasParameter(args, "-debug"))
+            if (parser.HasFlag("-debug"))
             {
                 DebugLog.Enabled = true;
                 DebugLog.AddListener((category, message) =>
@@ -68,11 +65,11 @@ namespace DepotDownloader
                 var httpEventListener = new HttpDiagnosticEventListener();
             }
 
-            var username = GetParameter<string>(args, "-username") ?? GetParameter<string>(args, "-user");
-            var password = GetParameter<string>(args, "-password") ?? GetParameter<string>(args, "-pass");
-            ContentDownloader.Config.RememberPassword = HasParameter(args, "-remember-password");
-            ContentDownloader.Config.UseQrCode = HasParameter(args, "-qr");
-            ContentDownloader.Config.SkipAppConfirmation = HasParameter(args, "-no-mobile");
+            var username = parser.Get<string>(null, "-username", "-user");
+            var password = parser.Get<string>(null, "-password", "-pass");
+            ContentDownloader.Config.RememberPassword = parser.HasFlag("-remember-password");
+            ContentDownloader.Config.UseQrCode = parser.HasFlag("-qr");
+            ContentDownloader.Config.SkipAppConfirmation = parser.HasFlag("-no-mobile");
 
             if (username == null)
             {
@@ -88,9 +85,9 @@ namespace DepotDownloader
                 return 1;
             }
 
-            ContentDownloader.Config.DownloadManifestOnly = HasParameter(args, "-manifest-only");
+            ContentDownloader.Config.DownloadManifestOnly = parser.HasFlag("-manifest-only");
 
-            var cellId = GetParameter(args, "-cellid", -1);
+            var cellId = parser.Get(-1, "-cellid");
             if (cellId == -1)
             {
                 cellId = 0;
@@ -98,52 +95,31 @@ namespace DepotDownloader
 
             ContentDownloader.Config.CellID = cellId;
 
-            var fileList = GetParameter<string>(args, "-filelist");
+            var fileList = parser.Get<string>(null, "-filelist");
 
             if (fileList != null)
             {
-                const string RegexPrefix = "regex:";
-
-                try
+                if (Util.TryParseFileList(fileList, out var literals, out var regexes, out var filelistError))
                 {
                     ContentDownloader.Config.UsingFileList = true;
-                    ContentDownloader.Config.FilesToDownload = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-                    ContentDownloader.Config.FilesToDownloadRegex = [];
-
-                    var files = await File.ReadAllLinesAsync(fileList);
-
-                    foreach (var fileEntry in files)
-                    {
-                        if (string.IsNullOrWhiteSpace(fileEntry))
-                        {
-                            continue;
-                        }
-
-                        if (fileEntry.StartsWith(RegexPrefix))
-                        {
-                            var rgx = new Regex(fileEntry[RegexPrefix.Length..], RegexOptions.Compiled | RegexOptions.IgnoreCase);
-                            ContentDownloader.Config.FilesToDownloadRegex.Add(rgx);
-                        }
-                        else
-                        {
-                            ContentDownloader.Config.FilesToDownload.Add(fileEntry.Replace('\\', '/'));
-                        }
-                    }
-
+                    ContentDownloader.Config.FilesToDownload = literals;
+                    ContentDownloader.Config.FilesToDownloadRegex = regexes;
                     Console.WriteLine("Using filelist: '{0}'.", fileList);
                 }
-                catch (Exception ex)
+                else
                 {
-                    Console.WriteLine("Warning: Unable to load filelist: {0}", ex);
+                    Console.WriteLine("Warning: Unable to load filelist: {0}", filelistError);
                 }
             }
 
-            ContentDownloader.Config.InstallDirectory = GetParameter<string>(args, "-dir");
+            ContentDownloader.Config.InstallDirectory = parser.Get<string>(null, "-dir");
 
-            ContentDownloader.Config.VerifyAll = HasParameter(args, "-verify-all") || HasParameter(args, "-verify_all") || HasParameter(args, "-validate");
-            ContentDownloader.Config.ValidateDownloadedChunks = HasParameter(args, "-validate-chunks") || HasParameter(args, "-validate-downloaded-chunks");
+            ContentDownloader.Config.VerifyAll = parser.HasFlag("-verify-all", "-verify_all", "-validate");
+            ContentDownloader.Config.ValidateDownloadedChunks = parser.HasFlag("-validate-chunks", "-validate-downloaded-chunks");
 
-            if (HasParameter(args, "-use-lancache"))
+            ContentDownloader.Config.MaxDownloads = parser.Get(8, "-max-downloads");
+
+            if (parser.HasFlag("-use-lancache"))
             {
                 await SteamKit2.CDN.Client.DetectLancacheServerAsync();
                 if (SteamKit2.CDN.Client.UseLancacheServer)
@@ -152,33 +128,32 @@ namespace DepotDownloader
 
                     // Increasing the number of concurrent downloads when the cache is detected since the downloads will likely
                     // be served much faster than over the internet.  Steam internally has this behavior as well.
-                    if (!HasParameter(args, "-max-downloads"))
+                    if (!parser.HasFlag("-max-downloads"))
                     {
                         ContentDownloader.Config.MaxDownloads = 25;
                     }
                 }
             }
 
-            ContentDownloader.Config.MaxDownloads = GetParameter(args, "-max-downloads", 8);
-            ContentDownloader.Config.LoginID = HasParameter(args, "-loginid") ? GetParameter<uint>(args, "-loginid") : null;
+            ContentDownloader.Config.LoginID = parser.HasFlag("-loginid") ? parser.Get<uint>(0, "-loginid") : null;
 
             // Raw archive options
-            var rawMode = HasParameter(args, "-raw");
-            var rawDebugJson = HasParameter(args, "-raw-debug-json") || HasParameter(args, "-emit-debug-manifest-json");
-            var rawOutput = GetParameter<string>(args, "-raw-output");
-            var rawRespectFileFilters = HasParameter(args, "-raw-respect-filelist");
-            var rawVerifyChunkSha1 = HasParameter(args, "-raw-verify-chunks") || HasParameter(args, "-raw-verify-sha1");
-            var rawNoSkipExisting = HasParameter(args, "-raw-no-skip-existing");
-            var rawDryRun = HasParameter(args, "-raw-dry-run") || HasParameter(args, "-raw-manifests-only");
+            var rawMode = parser.HasFlag("-raw");
+            var rawDebugJson = parser.HasFlag("-raw-debug-json", "-emit-debug-manifest-json");
+            var rawOutput = parser.Get<string>(null, "-raw-output");
+            var rawRespectFileFilters = parser.HasFlag("-raw-respect-filelist");
+            var rawVerifyChunkSha1 = parser.HasFlag("-raw-verify-chunks", "-raw-verify-sha1");
+            var rawNoSkipExisting = parser.HasFlag("-raw-no-skip-existing");
+            var rawDryRun = parser.HasFlag("-raw-dry-run", "-raw-manifests-only");
 
-            var appId = GetParameter(args, "-app", ContentDownloader.INVALID_APP_ID);
-            var manifestCsvPath = GetParameter<string>(args, "-manifest-csv");
-            var workshopCsvPath = GetParameter<string>(args, "-workshop-csv");
-            var workshopIds = GetParameterList<ulong>(args, "-workshop");
+            var appId = parser.Get(ContentDownloader.INVALID_APP_ID, "-app");
+            var manifestCsvPath = parser.Get<string>(null, "-manifest-csv");
+            var workshopCsvPath = parser.Get<string>(null, "-workshop-csv");
+            var workshopIds = parser.GetList<ulong>("-workshop");
 
             // Legacy pubfile and ugc support - redirect to workshop mode
-            var pubFile = GetParameter(args, "-pubfile", ContentDownloader.INVALID_MANIFEST_ID);
-            var ugcId = GetParameter(args, "-ugc", ContentDownloader.INVALID_MANIFEST_ID);
+            var pubFile = parser.Get(ContentDownloader.INVALID_MANIFEST_ID, "-pubfile");
+            var ugcId = parser.Get(ContentDownloader.INVALID_MANIFEST_ID, "-ugc");
             if (pubFile != ContentDownloader.INVALID_MANIFEST_ID)
             {
                 workshopIds.Add(pubFile);
@@ -198,7 +173,7 @@ namespace DepotDownloader
             }
 
             // Auto-enable raw mode for scenarios that would cause file collisions
-            var autoRawReason = DetermineAutoRawMode(operationMode, args);
+            var autoRawReason = DetermineAutoRawMode(operationMode, parser);
             if (!string.IsNullOrEmpty(autoRawReason))
             {
                 if (!rawMode)
@@ -209,45 +184,49 @@ namespace DepotDownloader
             }
 
             // Mode-specific argument validation
-            if (!ValidateArgumentsForMode(operationMode, args))
+            if (!ValidateArgumentsForMode(operationMode, parser))
             {
                 return 1;
             }
 
+            // Built once here (after auto-raw-mode detection above may have flipped rawMode) and
+            // passed down as a single object instead of re-parsing/re-constructing an identical
+            // RawDownloadOptions from the same 6 loose values in each of the three modes below.
+            // Null exactly when rawMode is off, so callers can check "rawOptions != null" instead
+            // of threading a separate rawMode bool alongside it.
+            var rawOptions = rawMode ? new ContentDownloader.RawDownloadOptions
+            {
+                OutputRoot = rawOutput,
+                EmitDebugManifestJson = rawDebugJson,
+                RespectFileFilters = rawRespectFileFilters,
+                VerifyChunkSha1 = rawVerifyChunkSha1,
+                SkipExisting = !rawNoSkipExisting,
+                DryRun = rawDryRun,
+            } : null;
+
             if (operationMode == OperationMode.Workshop)
             {
-                return await ProcessWorkshopDownload(args, rawMode, rawDebugJson, rawOutput, rawRespectFileFilters, rawVerifyChunkSha1, rawNoSkipExisting, rawDryRun, workshopCsvPath, workshopIds, username, password);
+                return await ProcessWorkshopDownload(parser, rawOptions, workshopCsvPath, workshopIds, username, password);
             }
             else if (operationMode == OperationMode.ManifestCsv)
             {
-                return await ProcessManifestCsvDownload(args, manifestCsvPath, rawMode, rawDebugJson, rawOutput, rawRespectFileFilters, rawVerifyChunkSha1, rawNoSkipExisting, rawDryRun, username, password);
+                return await ProcessManifestCsvDownload(parser, manifestCsvPath, rawOptions, username, password);
             }
             else // OperationMode.App
             {
-                return await ProcessAppDownload(args, appId, rawMode, rawDebugJson, rawOutput, rawRespectFileFilters, rawVerifyChunkSha1, rawNoSkipExisting, rawDryRun, username, password);
+                return await ProcessAppDownload(parser, appId, rawOptions, username, password);
             }
         }
 
-        private static async Task<int> ProcessWorkshopDownload(string[] args, bool rawMode, bool rawDebugJson, string rawOutput, bool rawRespectFileFilters, bool rawVerifyChunkSha1, bool rawNoSkipExisting, bool rawDryRun, string workshopCsvPath, List<ulong> workshopIds, string username, string password)
+        private static async Task<int> ProcessWorkshopDownload(ArgParser parser, ContentDownloader.RawDownloadOptions rawOptions, string workshopCsvPath, List<ulong> workshopIds, string username, string password)
         {
-            PrintUnconsumedArgs(args);
+            parser.WarnUnconsumed();
 
             if (InitializeSteam(username, password))
             {
                 int exitStatus = 0;
                 try
                 {
-                    var rawOptions = rawMode ? new ContentDownloader.RawDownloadOptions
-                    {
-                        Enabled = true,
-                        OutputRoot = rawOutput,
-                        EmitDebugManifestJson = rawDebugJson,
-                        RespectFileFilters = rawRespectFileFilters,
-                        VerifyChunkSha1 = rawVerifyChunkSha1,
-                        SkipExisting = !rawNoSkipExisting,
-                        DryRun = rawDryRun,
-                    } : null;
-
                     if (!string.IsNullOrEmpty(workshopCsvPath))
                     {
                         // Process workshop CSV
@@ -256,7 +235,7 @@ namespace DepotDownloader
                         {
                             try
                             {
-                                if (rawMode)
+                                if (rawOptions != null)
                                 {
                                     await ContentDownloader.DownloadWorkshopItemRawAsync(workshopId, rawOptions).ConfigureAwait(false);
                                 }
@@ -279,7 +258,7 @@ namespace DepotDownloader
                         {
                             try
                             {
-                                if (rawMode)
+                                if (rawOptions != null)
                                 {
                                     await ContentDownloader.DownloadWorkshopItemRawAsync(workshopId, rawOptions).ConfigureAwait(false);
                                 }
@@ -322,26 +301,13 @@ namespace DepotDownloader
             }
         }
 
-        private static async Task<int> ProcessManifestCsvDownload(string[] args, string manifestCsvPath, bool rawMode, bool rawDebugJson, string rawOutput, bool rawRespectFileFilters, bool rawVerifyChunkSha1, bool rawNoSkipExisting, bool rawDryRun, string username, string password)
+        private static async Task<int> ProcessManifestCsvDownload(ArgParser parser, string manifestCsvPath, ContentDownloader.RawDownloadOptions rawOptions, string username, string password)
         {
-            // PrintUnconsumedArgs(args);
-
             if (InitializeSteam(username, password))
             {
                 try
                 {
-                    var rawOptions = new ContentDownloader.RawDownloadOptions
-                    {
-                        Enabled = true,
-                        OutputRoot = rawOutput,
-                        EmitDebugManifestJson = rawDebugJson,
-                        RespectFileFilters = rawRespectFileFilters,
-                        VerifyChunkSha1 = rawVerifyChunkSha1,
-                        SkipExisting = !rawNoSkipExisting,
-                        DryRun = rawDryRun,
-                    };
-
-                    await ProcessManifestCsvDownloadInternal(manifestCsvPath, rawMode, rawOptions, args).ConfigureAwait(false);
+                    await ProcessManifestCsvDownloadInternal(manifestCsvPath, rawOptions, parser).ConfigureAwait(false);
                 }
                 catch (Exception ex) when (
                     ex is ContentDownloaderException
@@ -369,21 +335,21 @@ namespace DepotDownloader
             return 0;
         }
 
-        private static async Task<int> ProcessAppDownload(string[] args, uint appId, bool rawMode, bool rawDebugJson, string rawOutput, bool rawRespectFileFilters, bool rawVerifyChunkSha1, bool rawNoSkipExisting, bool rawDryRun, string username, string password)
+        private static async Task<int> ProcessAppDownload(ArgParser parser, uint appId, ContentDownloader.RawDownloadOptions rawOptions, string username, string password)
         {
-            var branch = GetParameter<string>(args, "-branch") ?? GetParameter<string>(args, "-beta") ?? ContentDownloader.DEFAULT_BRANCH;
-            ContentDownloader.Config.BetaPassword = GetParameter<string>(args, "-branchpassword") ?? GetParameter<string>(args, "-betapassword");
-            var branchExplicit = HasParameter(args, "-branch") || HasParameter(args, "-beta");
+            var branch = parser.Get<string>(null, "-branch", "-beta") ?? ContentDownloader.DEFAULT_BRANCH;
+            ContentDownloader.Config.BetaPassword = parser.Get<string>(null, "-branchpassword", "-betapassword");
+            var branchExplicit = parser.HasFlag("-branch", "-beta");
 
-            if (!string.IsNullOrEmpty(ContentDownloader.Config.BetaPassword) && string.IsNullOrEmpty(branch))
+            if (!string.IsNullOrEmpty(ContentDownloader.Config.BetaPassword) && !branchExplicit)
             {
                 Console.WriteLine("Error: Cannot specify -branchpassword when -branch is not specified.");
                 return 1;
             }
 
-            ContentDownloader.Config.DownloadAllPlatforms = HasParameter(args, "-all-platforms");
+            ContentDownloader.Config.DownloadAllPlatforms = parser.HasFlag("-all-platforms");
 
-            var os = GetParameter<string>(args, "-os");
+            var os = parser.Get<string>(null, "-os");
 
             if (ContentDownloader.Config.DownloadAllPlatforms && !string.IsNullOrEmpty(os))
             {
@@ -391,9 +357,9 @@ namespace DepotDownloader
                 return 1;
             }
 
-            ContentDownloader.Config.DownloadAllArchs = HasParameter(args, "-all-archs");
+            ContentDownloader.Config.DownloadAllArchs = parser.HasFlag("-all-archs");
 
-            var arch = GetParameter<string>(args, "-osarch");
+            var arch = parser.Get<string>(null, "-osarch");
 
             if (ContentDownloader.Config.DownloadAllArchs && !string.IsNullOrEmpty(arch))
             {
@@ -401,8 +367,8 @@ namespace DepotDownloader
                 return 1;
             }
 
-            ContentDownloader.Config.DownloadAllLanguages = HasParameter(args, "-all-languages");
-            var language = GetParameter<string>(args, "-language");
+            ContentDownloader.Config.DownloadAllLanguages = parser.HasFlag("-all-languages");
+            var language = parser.Get<string>(null, "-language");
 
             if (ContentDownloader.Config.DownloadAllLanguages && !string.IsNullOrEmpty(language))
             {
@@ -410,14 +376,14 @@ namespace DepotDownloader
                 return 1;
             }
 
-            var lv = HasParameter(args, "-lowviolence");
+            var lv = parser.HasFlag("-lowviolence");
 
             var depotManifestIds = new List<(uint, ulong)>();
             var isUGC = false;
 
-            var depotIdList = GetParameterList<uint>(args, "-depot");
-            var manifestIdList = GetParameterList<ulong>(args, "-manifest");
-            var manifestEncList = GetParameterList<string>(args, "-manifest-enc");
+            var depotIdList = parser.GetList<uint>("-depot");
+            var manifestIdList = parser.GetList<ulong>("-manifest");
+            var manifestEncList = parser.GetList<string>("-manifest-enc");
 
             if (manifestIdList.Count > 0)
             {
@@ -465,7 +431,7 @@ namespace DepotDownloader
                 }
             }
 
-            PrintUnconsumedArgs(args);
+            parser.WarnUnconsumed();
 
             if (InitializeSteam(username, password))
             {
@@ -474,7 +440,7 @@ namespace DepotDownloader
                     // Resolve encrypted manifest ids AFTER Steam is initialized
                     if (encPairs != null)
                     {
-                        var outputRootForKeys = rawMode ? (rawOutput ?? ContentDownloader.Config.InstallDirectory) : ContentDownloader.Config.InstallDirectory;
+                        var outputRootForKeys = rawOptions?.OutputRoot ?? ContentDownloader.Config.InstallDirectory;
                         try
                         {
                             var resolved = await ContentDownloader.ResolveEncryptedManifestIdsAsync(appId, encPairs, branch, outputRootForKeys).ConfigureAwait(false);
@@ -487,19 +453,8 @@ namespace DepotDownloader
                         }
                     }
 
-                    if (rawMode)
+                    if (rawOptions != null)
                     {
-                        var rawOptions = new ContentDownloader.RawDownloadOptions
-                        {
-                            Enabled = true,
-                            OutputRoot = rawOutput,
-                            EmitDebugManifestJson = rawDebugJson,
-                            RespectFileFilters = rawRespectFileFilters,
-                            VerifyChunkSha1 = rawVerifyChunkSha1,
-                            SkipExisting = !rawNoSkipExisting,
-                            DryRun = rawDryRun,
-                        };
-
                         await ContentDownloader.DownloadAppRawAsync(appId, depotManifestIds, branch, os, arch, language, lv, rawOptions).ConfigureAwait(false);
                     }
                     else
@@ -582,17 +537,17 @@ namespace DepotDownloader
             }
         }
 
-        private static async Task ProcessManifestCsvDownloadInternal(string manifestCsvPath, bool rawMode, ContentDownloader.RawDownloadOptions rawOptions, string[] args)
+        private static async Task ProcessManifestCsvDownloadInternal(string manifestCsvPath, ContentDownloader.RawDownloadOptions rawOptions, ArgParser parser)
         {
-            var manifestCsvAll = HasParameter(args, "-manifest-csv-all");
-            var branch = GetParameter<string>(args, "-branch") ?? GetParameter<string>(args, "-beta") ?? ContentDownloader.DEFAULT_BRANCH;
-            var branchExplicit = HasParameter(args, "-branch") || HasParameter(args, "-beta");
-            var os = GetParameter<string>(args, "-os");
-            var arch = GetParameter<string>(args, "-osarch");
-            var language = GetParameter<string>(args, "-language");
-            var lv = HasParameter(args, "-lowviolence");
+            var manifestCsvAll = parser.HasFlag("-manifest-csv-all");
+            var branch = parser.Get<string>(null, "-branch", "-beta") ?? ContentDownloader.DEFAULT_BRANCH;
+            var branchExplicit = parser.HasFlag("-branch", "-beta");
+            var os = parser.Get<string>(null, "-os");
+            var arch = parser.Get<string>(null, "-osarch");
+            var language = parser.Get<string>(null, "-language");
+            var lv = parser.HasFlag("-lowviolence");
 
-            PrintUnconsumedArgs(args);
+            parser.WarnUnconsumed();
 
             // Group CSV data by AppID
             var csvGroups = ReadManifestCsv(manifestCsvPath)
@@ -679,7 +634,7 @@ namespace DepotDownloader
                         continue;
                     }
 
-                    if (rawMode)
+                    if (rawOptions != null)
                     {
                         await ContentDownloader.DownloadAppRawAsync(appId, depotManifestIds, branch, os, arch, language, lv, rawOptions).ConfigureAwait(false);
                     }
@@ -774,93 +729,6 @@ namespace DepotDownloader
             return ContentDownloader.InitializeSteam3(username, password);
         }
 
-        static int IndexOfParam(string[] args, string param)
-        {
-            for (var x = 0; x < args.Length; ++x)
-            {
-                if (args[x].Equals(param, StringComparison.OrdinalIgnoreCase))
-                {
-                    consumedArgs[x] = true;
-                    return x;
-                }
-            }
-
-            return -1;
-        }
-
-        static bool HasParameter(string[] args, string param)
-        {
-            return IndexOfParam(args, param) > -1;
-        }
-
-        static T GetParameter<T>(string[] args, string param, T defaultValue = default)
-        {
-            var index = IndexOfParam(args, param);
-
-            if (index == -1 || index == (args.Length - 1))
-                return defaultValue;
-
-            var strParam = args[index + 1];
-
-            var converter = TypeDescriptor.GetConverter(typeof(T));
-            if (converter != null)
-            {
-                consumedArgs[index + 1] = true;
-                return (T)converter.ConvertFromString(strParam);
-            }
-
-            return default;
-        }
-
-        static List<T> GetParameterList<T>(string[] args, string param)
-        {
-            var list = new List<T>();
-            var index = IndexOfParam(args, param);
-
-            if (index == -1 || index == (args.Length - 1))
-                return list;
-
-            index++;
-
-            while (index < args.Length)
-            {
-                var strParam = args[index];
-
-                if (strParam[0] == '-') break;
-
-                var converter = TypeDescriptor.GetConverter(typeof(T));
-                if (converter != null)
-                {
-                    consumedArgs[index] = true;
-                    list.Add((T)converter.ConvertFromString(strParam));
-                }
-
-                index++;
-            }
-
-            return list;
-        }
-
-        static void PrintUnconsumedArgs(string[] args)
-        {
-            var printError = false;
-
-            for (var index = 0; index < consumedArgs.Length; index++)
-            {
-                if (!consumedArgs[index])
-                {
-                    printError = true;
-                    Console.Error.WriteLine($"Argument #{index + 1} {args[index]} was not used.");
-                }
-            }
-
-            if (printError)
-            {
-                Console.Error.WriteLine("Make sure you specified the arguments correctly. Check --help for correct arguments.");
-                Console.Error.WriteLine();
-            }
-        }
-
         private static OperationMode DetermineOperationMode(uint appId, string manifestCsvPath, string workshopCsvPath, bool hasWorkshopIds)
         {
             var hasApp = appId != ContentDownloader.INVALID_APP_ID;
@@ -896,13 +764,13 @@ namespace DepotDownloader
             return OperationMode.Invalid;
         }
 
-        private static bool ValidateArgumentsForMode(OperationMode mode, string[] args)
+        private static bool ValidateArgumentsForMode(OperationMode mode, ArgParser parser)
         {
             switch (mode)
             {
                 case OperationMode.App:
                     // App mode: Cannot use manifest CSV or workshop CSV
-                    if (HasParameter(args, "-manifest-csv") || HasParameter(args, "-manifest-csv-all") || HasParameter(args, "-workshop-csv"))
+                    if (parser.HasFlag("-manifest-csv") || parser.HasFlag("-manifest-csv-all") || parser.HasFlag("-workshop-csv"))
                     {
                         Console.WriteLine("Error: -manifest-csv and -workshop-csv cannot be used with -app mode.");
                         return false;
@@ -911,24 +779,24 @@ namespace DepotDownloader
 
                 case OperationMode.ManifestCsv:
                     // Manifest CSV mode: Cannot use app-specific depot/manifest args or workshop args
-                    if (HasParameter(args, "-depot"))
+                    if (parser.HasFlag("-depot"))
                     {
                         Console.WriteLine("Error: -depot cannot be used with -manifest-csv mode.");
                         Console.WriteLine("Depot IDs should be specified in the CSV file.");
                         return false;
                     }
-                    if (HasParameter(args, "-manifest"))
+                    if (parser.HasFlag("-manifest"))
                     {
                         Console.WriteLine("Error: -manifest cannot be used with -manifest-csv mode.");
                         Console.WriteLine("Manifest IDs should be specified in the CSV file.");
                         return false;
                     }
-                    if (HasParameter(args, "-workshop"))
+                    if (parser.HasFlag("-workshop"))
                     {
                         Console.WriteLine("Error: -workshop cannot be used with -manifest-csv mode.");
                         return false;
                     }
-                    if (HasParameter(args, "-workshop-csv"))
+                    if (parser.HasFlag("-workshop-csv"))
                     {
                         Console.WriteLine("Error: -workshop-csv cannot be used with -manifest-csv mode.");
                         return false;
@@ -937,22 +805,22 @@ namespace DepotDownloader
 
                 case OperationMode.Workshop:
                     // Workshop mode: Cannot use app, depot, manifest, or manifest CSV args
-                    if (HasParameter(args, "-depot"))
+                    if (parser.HasFlag("-depot"))
                     {
                         Console.WriteLine("Error: -depot cannot be used with workshop mode.");
                         return false;
                     }
-                    if (HasParameter(args, "-manifest"))
+                    if (parser.HasFlag("-manifest"))
                     {
                         Console.WriteLine("Error: -manifest cannot be used with workshop mode.");
                         return false;
                     }
-                    if (HasParameter(args, "-manifest-csv"))
+                    if (parser.HasFlag("-manifest-csv"))
                     {
                         Console.WriteLine("Error: -manifest-csv cannot be used with workshop mode.");
                         return false;
                     }
-                    if (HasParameter(args, "-manifest-csv-all"))
+                    if (parser.HasFlag("-manifest-csv-all"))
                     {
                         Console.WriteLine("Error: -manifest-csv-all cannot be used with workshop mode.");
                         return false;
@@ -964,7 +832,7 @@ namespace DepotDownloader
         }
 
         // Detect scenarios that would cause file collisions and auto-enable raw mode
-        private static string DetermineAutoRawMode(OperationMode mode, string[] args)
+        private static string DetermineAutoRawMode(OperationMode mode, ArgParser parser)
         {
             switch (mode)
             {
@@ -974,8 +842,8 @@ namespace DepotDownloader
 
                 case OperationMode.App:
                     // Check if we have multiple manifests for the same depot
-                    var depotIdList = GetParameterList<uint>(args, "-depot");
-                    var manifestIdList = GetParameterList<ulong>(args, "-manifest");
+                    var depotIdList = parser.GetList<uint>("-depot");
+                    var manifestIdList = parser.GetList<ulong>("-manifest");
 
                     if (manifestIdList.Count > 1)
                     {
@@ -999,7 +867,7 @@ namespace DepotDownloader
                 case OperationMode.Workshop:
                     // Workshop mode doesn't typically have the same collision issues since each item goes to its own location
                     // But if using workshop CSV with many items, user might want raw mode for archival
-                    var workshopCsvPath = GetParameter<string>(args, "-workshop-csv");
+                    var workshopCsvPath = parser.Get<string>(null, "-workshop-csv");
                     if (!string.IsNullOrEmpty(workshopCsvPath))
                     {
                         // Let user decide for workshop CSV - they might want normal processing

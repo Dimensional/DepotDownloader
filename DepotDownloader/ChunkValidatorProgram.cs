@@ -39,11 +39,18 @@ namespace DepotDownloader
                     case "validate-chunk":
                         return await ValidateChunkCommand(args[1..]);
 
+                    // Chunkstore validation now lives under the "chunkstore" command; these two
+                    // names are kept as aliases of "chunkstore verify" for backward compatibility.
                     case "validate-chunkstore":
-                        return await ValidateChunkstoreCommand(args[1..]);
+                        return await ChunkstoreCommand.RunAsync(["verify", .. args[1..]]);
 
                     case "validate-chunkstore-chunks":
-                        return await ValidateChunkstoreChunksCommand(args[1..]);
+                        if (args.Length < 3)
+                        {
+                            Console.WriteLine("Usage: validate-chunkstore-chunks <chunkstore-path> <chunk-list-file> [-depot <depot-id>] [-key <depot-key-file>] [-verbose] [-threads <count>]");
+                            return 1;
+                        }
+                        return await ChunkstoreCommand.RunAsync(["verify", args[1], "-chunks", args[2], .. args[3..]]);
 
                     default:
                         Console.WriteLine($"Unknown validation command: {command}");
@@ -67,29 +74,13 @@ namespace DepotDownloader
             }
 
             var depotPath = args[0];
-            string manifestPath = null;
-            var verbose = false;
-            var threads = 0; // Default to auto-detect
 
-            for (int i = 1; i < args.Length; i++)
-            {
-                if (args[i] == "-verbose" || args[i] == "-v")
-                {
-                    verbose = true;
-                }
-                else if (args[i] == "-threads" || args[i] == "-t")
-                {
-                    if (i + 1 < args.Length && int.TryParse(args[i + 1], out var threadCount))
-                    {
-                        threads = threadCount;
-                        i++; // Skip the thread count argument
-                    }
-                }
-                else if (manifestPath == null)
-                {
-                    manifestPath = args[i];
-                }
-            }
+            // Parse options (skip the positional depot-path arg)
+            var parser = new ArgParser(args[1..]);
+            var verbose = parser.HasFlag("-verbose", "-v");
+            var threads = parser.Get(0, "-threads", "-t"); // Default to auto-detect
+            var manifestPath = parser.Positional(0);
+            parser.WarnUnconsumed();
 
             Console.WriteLine($"Validating depot: {depotPath}");
             if (!string.IsNullOrEmpty(manifestPath))
@@ -132,176 +123,8 @@ namespace DepotDownloader
             return result.IsValid ? 0 : 1;
         }
 
-        private static async Task<int> ValidateChunkstoreCommand(string[] args)
-        {
-            if (args.Length < 1)
-            {
-                Console.WriteLine("Usage: validate-chunkstore <chunkstore-path> [-depot <depot-id>] [-key <depot-key-file>] [-verbose] [-threads <count>]");
-                return 1;
-            }
-
-            var chunkstorePath = args[0];
-            uint? depotId = null;
-            string depotKeyPath = null;
-            var verbose = false;
-            var threads = 0; // Default to auto-detect
-
-            for (int i = 1; i < args.Length; i++)
-            {
-                if (args[i] == "-depot" || args[i] == "-d")
-                {
-                    if (i + 1 < args.Length && uint.TryParse(args[i + 1], out var depot))
-                    {
-                        depotId = depot;
-                        i++; // Skip the depot ID argument
-                    }
-                }
-                else if (args[i] == "-key" || args[i] == "-k")
-                {
-                    if (i + 1 < args.Length)
-                    {
-                        depotKeyPath = args[i + 1];
-                        i++; // Skip the key path argument
-                    }
-                }
-                else if (args[i] == "-verbose" || args[i] == "-v")
-                {
-                    verbose = true;
-                }
-                else if (args[i] == "-threads" || args[i] == "-t")
-                {
-                    if (i + 1 < args.Length && int.TryParse(args[i + 1], out var threadCount))
-                    {
-                        threads = threadCount;
-                        i++; // Skip the thread count argument
-                    }
-                }
-            }
-
-            Console.WriteLine($"Validating chunkstore: {chunkstorePath}");
-            if (depotId.HasValue)
-            {
-                Console.WriteLine($"Depot ID: {depotId}");
-            }
-            if (!string.IsNullOrEmpty(depotKeyPath))
-            {
-                Console.WriteLine($"Using depot key: {depotKeyPath}");
-            }
-
-            var summary = await StandaloneChunkValidator.ValidateChunkstoreAsync(chunkstorePath, depotId, depotKeyPath, verbose, threads);
-
-            Console.WriteLine();
-            Console.WriteLine(summary);
-
-            return summary.InvalidChunks > 0 || summary.ErrorChunks > 0 ? 1 : 0;
-        }
-
-        private static async Task<int> ValidateChunkstoreChunksCommand(string[] args)
-        {
-            if (args.Length < 2)
-            {
-                Console.WriteLine("Usage: validate-chunkstore-chunks <chunkstore-path> <chunk-list-file> [-depot <depot-id>] [-key <depot-key-file>] [-verbose] [-threads <count>]");
-                return 1;
-            }
-
-            var chunkstorePath = args[0];
-            var chunkListFile = args[1];
-            uint? depotId = null;
-            string depotKeyPath = null;
-            var verbose = false;
-            var threads = 0; // Default to auto-detect
-
-            for (int i = 2; i < args.Length; i++)
-            {
-                if (args[i] == "-depot" || args[i] == "-d")
-                {
-                    if (i + 1 < args.Length && uint.TryParse(args[i + 1], out var depot))
-                    {
-                        depotId = depot;
-                        i++; // Skip the depot ID argument
-                    }
-                }
-                else if (args[i] == "-key" || args[i] == "-k")
-                {
-                    if (i + 1 < args.Length)
-                    {
-                        depotKeyPath = args[i + 1];
-                        i++; // Skip the key path argument
-                    }
-                }
-                else if (args[i] == "-verbose" || args[i] == "-v")
-                {
-                    verbose = true;
-                }
-                else if (args[i] == "-threads" || args[i] == "-t")
-                {
-                    if (i + 1 < args.Length && int.TryParse(args[i + 1], out var threadCount))
-                    {
-                        threads = threadCount;
-                        i++; // Skip the thread count argument
-                    }
-                }
-            }
-
-            if (!File.Exists(chunkListFile))
-            {
-                Console.WriteLine($"Error: Chunk list file not found: {chunkListFile}");
-                return 1;
-            }
-
-            // Read chunk list from file
-            var chunkList = new List<string>();
-            try
-            {
-                var lines = await File.ReadAllLinesAsync(chunkListFile);
-                foreach (var line in lines)
-                {
-                    var trimmed = line.Trim();
-                    if (!string.IsNullOrEmpty(trimmed) && !trimmed.StartsWith("#"))
-                    {
-                        // Support both hex strings and comma-separated values
-                        if (trimmed.Contains(','))
-                        {
-                            var parts = trimmed.Split(',');
-                            chunkList.Add(parts[0].Trim()); // Take first column as SHA1
-                        }
-                        else
-                        {
-                            chunkList.Add(trimmed);
-                        }
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"Error reading chunk list file: {ex.Message}");
-                return 1;
-            }
-
-            if (chunkList.Count == 0)
-            {
-                Console.WriteLine("No chunks found in chunk list file");
-                return 1;
-            }
-
-            Console.WriteLine($"Validating chunkstore: {chunkstorePath}");
-            Console.WriteLine($"Chunk list file: {chunkListFile} ({chunkList.Count} chunks)");
-            if (depotId.HasValue)
-            {
-                Console.WriteLine($"Depot ID: {depotId}");
-            }
-            if (!string.IsNullOrEmpty(depotKeyPath))
-            {
-                Console.WriteLine($"Using depot key: {depotKeyPath}");
-            }
-
-            var summary = await StandaloneChunkValidator.ValidateChunkstoreChunksAsync(chunkstorePath, chunkList, depotId, depotKeyPath, verbose, threads);
-
-            Console.WriteLine();
-            Console.WriteLine(summary);
-
-            return summary.InvalidChunks > 0 || summary.ErrorChunks > 0 ? 1 : 0;
-        }
+        // Chunkstore validation (validate-chunkstore / validate-chunkstore-chunks) is implemented
+        // once, in ChunkstoreCommand's "chunkstore verify"; RunChunkValidationAsync forwards to it.
 
         /// <summary>
         /// Print comprehensive validation help information
@@ -350,9 +173,9 @@ namespace DepotDownloader
             Console.WriteLine("2a. Validate loose files with multithreading:");
             Console.WriteLine("    depotdownloader validate-depot depot/4001 -verbose -threads 16");
             Console.WriteLine();
-            Console.WriteLine("2b. OR convert to chunkstore and validate (future):");
+            Console.WriteLine("2b. OR convert to chunkstore and validate:");
             Console.WriteLine("    depotdownloader chunkstore pack depot/4001/chunk chunkstore/");
-            Console.WriteLine("    depotdownloader validate-chunkstore chunkstore/ -verbose -threads 16");
+            Console.WriteLine("    depotdownloader chunkstore verify chunkstore/ -verbose -threads 16");
             Console.WriteLine();
             Console.WriteLine("3. For critical data, use -validate-chunks during download:");
             Console.WriteLine("   depotdownloader download -app 4000 -depot 4001 -raw -validate-chunks");
@@ -369,16 +192,16 @@ namespace DepotDownloader
             Console.WriteLine();
             Console.WriteLine("COMMANDS:");
             Console.WriteLine("  validate-depot <depot-path> [manifest-path] [OPTIONS...]");
-            Console.WriteLine("    Validate all chunks in a depot directory");
+            Console.WriteLine("    Validate all chunks in a depot directory (loose files, not a chunkstore)");
             Console.WriteLine();
             Console.WriteLine("  validate-chunk <chunk-file> <depot-key-file> [uncompressed-length]");
             Console.WriteLine("    Validate a single chunk file");
             Console.WriteLine();
             Console.WriteLine("  validate-chunkstore <chunkstore-path> [OPTIONS...]");
-            Console.WriteLine("    Validate all chunks in a chunkstore");
+            Console.WriteLine("    Alias for 'chunkstore verify <chunkstore-path>' - validate all chunks in a chunkstore");
             Console.WriteLine();
             Console.WriteLine("  validate-chunkstore-chunks <chunkstore-path> <chunk-list-file> [OPTIONS...]");
-            Console.WriteLine("    Validate specific chunks in a chunkstore");
+            Console.WriteLine("    Alias for 'chunkstore verify <chunkstore-path> -chunks <chunk-list-file>'");
             Console.WriteLine();
             Console.WriteLine("OPTIONS:");
             Console.WriteLine("  -verbose, -v     Show detailed output for each chunk");
@@ -388,7 +211,7 @@ namespace DepotDownloader
             Console.WriteLine();
             Console.WriteLine("EXAMPLES:");
             Console.WriteLine("  depotdownloader validate-depot depot/12345 -verbose");
-            Console.WriteLine("  depotdownloader validate-chunkstore chunkstore/ -threads 16");
+            Console.WriteLine("  depotdownloader chunkstore verify chunkstore/ -threads 16");
             Console.WriteLine("  depotdownloader validate-chunk chunk.bin key.bin");
             Console.WriteLine();
             Console.WriteLine("For detailed help: depotdownloader help validation");

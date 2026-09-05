@@ -527,7 +527,6 @@ namespace DepotDownloader
                         if (ContentDownloader.Config.RememberPassword)
                         {
                             AccountSettingsStore.Instance.LoginTokens[result.AccountName] = result.RefreshToken;
-                            AccountSettingsStore.Save();
 
                             if (ContentDownloader.Config.UseQrCode)
                             {
@@ -538,6 +537,10 @@ namespace DepotDownloader
                         {
                             Console.WriteLine("Note: This session is temporary and will expire. Use -remember-password with -qr to persist your login.");
                         }
+
+                        // Guard data (above) must persist regardless of -remember-password - only
+                        // the login token itself is conditional on that flag.
+                        AccountSettingsStore.Save();
                     }
                     catch (TaskCanceledException)
                     {

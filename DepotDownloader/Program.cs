@@ -70,7 +70,7 @@ namespace DepotDownloader
 
                     case "version":
                     case "--version":
-                    case "-V":
+                    case "-v":
                         PrintVersion(true);
                         return 0;
                 }
@@ -151,10 +151,10 @@ namespace DepotDownloader
             Console.WriteLine("  manifest                     Extract and compare manifest files (offline)");
             Console.WriteLine("  validate-depot               Validate all chunks in a depot directory (offline)");
             Console.WriteLine("  validate-chunk               Validate a single chunk file (offline)");
-            Console.WriteLine("  validate-chunkstore          Validate all chunks in a chunkstore (offline)");
-            Console.WriteLine("  validate-chunkstore-chunks   Validate specific chunks in a chunkstore (offline)");
-            Console.WriteLine("  reconstruct                  Process raw chunks into installed files [Coming Soon]");
-            Console.WriteLine("  chunkstore                   Manage chunk storage and deduplication [Coming Soon]");
+            Console.WriteLine("  validate-chunkstore          Validate all chunks in a chunkstore (offline; alias for 'chunkstore verify')");
+            Console.WriteLine("  validate-chunkstore-chunks   Validate specific chunks in a chunkstore (offline; alias for 'chunkstore verify -chunks')");
+            Console.WriteLine("  reconstruct                  Rebuild installed files offline from a manifest + archived chunks");
+            Console.WriteLine("  chunkstore                   Pack/unpack/verify/stats on chunk storage (rebuild/update: [Coming Soon])");
             Console.WriteLine();
             Console.WriteLine("HELP:");
             Console.WriteLine("  help              Show this help message");

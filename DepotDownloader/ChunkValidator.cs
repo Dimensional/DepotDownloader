@@ -4,15 +4,10 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
-using System.IO.Compression;
 using System.Linq;
 using System.Security.Cryptography;
-using System.Threading;
 using System.Threading.Tasks;
 using SteamKit2;
-using SteamKit2.CDN;
-using SevenZip;
-using ZstdSharp;
 
 namespace DepotDownloader
 {
@@ -29,10 +24,12 @@ namespace DepotDownloader
         /// This implementation mirrors the Python depot_validator.py approach exactly
         /// </summary>
         /// <param name="chunkFilePath">Path to the raw chunk file</param>
-        /// <param name="depotKey">Depot key for decryption</param>
+        /// <param name="depotKey">Depot key for decryption (unused, may be null, when isEncrypted is false)</param>
+        /// <param name="isEncrypted">Whether this chunk is still AES-encrypted (bare "&lt;sha&gt;" filename) or
+        /// already decrypted ("&lt;sha&gt;_decrypted" filename) - same convention chunkstore packing uses.</param>
         /// <param name="estimatedUncompressedLength">Optional estimated uncompressed length (auto-detected from chunk headers)</param>
         /// <returns>ValidationResult with success status and details</returns>
-        public static async Task<ValidationResult> ValidateRawChunkAsync(string chunkFilePath, byte[] depotKey, uint estimatedUncompressedLength = 0)
+        public static async Task<ValidationResult> ValidateRawChunkAsync(string chunkFilePath, byte[] depotKey, bool isEncrypted, uint estimatedUncompressedLength = 0)
         {
             if (!File.Exists(chunkFilePath))
             {
@@ -43,7 +40,7 @@ namespace DepotDownloader
                 };
             }
 
-            if (depotKey == null || depotKey.Length != 32)
+            if (isEncrypted && (depotKey == null || depotKey.Length != 32))
             {
                 return new ValidationResult
                 {
@@ -52,16 +49,26 @@ namespace DepotDownloader
                 };
             }
 
+            // Extract expected SHA1 from the filename, stripping "_decrypted" when that's the
+            // mode - chunk files are named with their SHA1, never "<sha>_decrypted" once packed.
+            var fileName = Path.GetFileName(chunkFilePath);
+            if (!Chunkstore.TryGetChunkSha(fileName, isEncrypted, out var expectedChunkId))
+            {
+                return new ValidationResult
+                {
+                    IsValid = false,
+                    ErrorMessage = $"Filename does not look like a{(isEncrypted ? "n encrypted" : " decrypted")} chunk SHA1: {fileName}"
+                };
+            }
+
             try
             {
-                // Extract expected SHA1 from filename (chunk files are named with their SHA1)
-                var expectedChunkId = Path.GetFileNameWithoutExtension(chunkFilePath);
-
-                // Read the raw encrypted chunk data
+                // Read the raw chunk data - still AES-encrypted+compressed if isEncrypted,
+                // otherwise already the plain compressed payload.
                 var rawChunkData = await File.ReadAllBytesAsync(chunkFilePath);
 
                 // Process chunk exactly like the Python validator
-                var result = ProcessChunkLikePython(rawChunkData, depotKey, expectedChunkId);
+                var result = ProcessChunkLikePython(rawChunkData, depotKey, expectedChunkId, isEncrypted);
 
                 return result;
             }
@@ -84,7 +91,8 @@ namespace DepotDownloader
         /// <returns>ValidationResult with success status and details</returns>
         public static async Task<ValidationResult> ValidateRawChunkAsync(string chunkFilePath, DepotManifest.ChunkData chunkData, byte[] depotKey)
         {
-            return await ValidateRawChunkAsync(chunkFilePath, depotKey, chunkData.UncompressedLength);
+            // Manifest-driven validation always targets live CDN chunk data, which is always encrypted.
+            return await ValidateRawChunkAsync(chunkFilePath, depotKey, isEncrypted: true, chunkData.UncompressedLength);
         }
 
         /// <summary>
@@ -98,8 +106,8 @@ namespace DepotDownloader
         {
             try
             {
-                var actualSha1 = Convert.ToHexString(SHA1.HashData(decompressedData)).ToLowerInvariant();
-                var expectedSha1 = Convert.ToHexString(chunkData.ChunkID).ToLowerInvariant();
+                var actualSha1 = Util.ToHex(SHA1.HashData(decompressedData));
+                var expectedSha1 = Util.ToHex(chunkData.ChunkID);
 
                 var isValid = actualSha1 == expectedSha1;
 
@@ -132,7 +140,7 @@ namespace DepotDownloader
         {
             try
             {
-                var actualSha1 = Convert.ToHexString(SHA1.HashData(decompressedData)).ToLowerInvariant();
+                var actualSha1 = Util.ToHex(SHA1.HashData(decompressedData));
                 var expectedSha1 = expectedChunkId.ToLowerInvariant();
 
                 var isValid = actualSha1 == expectedSha1;
@@ -180,7 +188,7 @@ namespace DepotDownloader
 
             try
             {
-                var expectedChunkId = Convert.ToHexString(chunkSha).ToLowerInvariant();
+                var expectedChunkId = Util.ToHex(chunkSha);
 
                 // Check if chunk exists in chunkstore
                 if (!chunkstore.ChunkExists(chunkSha))
@@ -195,8 +203,9 @@ namespace DepotDownloader
                 // Get raw chunk data from chunkstore
                 var rawChunkData = chunkstore.GetChunk(chunkSha, process: false);
 
-                // Validate the chunk
-                return ProcessChunkLikePython(rawChunkData, depotKey, expectedChunkId);
+                // Validate the chunk. A chunkstore is either fully encrypted or fully decrypted
+                // (recorded in its CSM header, never mixed) - only decrypt if it actually is one.
+                return ProcessChunkLikePython(rawChunkData, depotKey, expectedChunkId, chunkstore.IsEncrypted.GetValueOrDefault());
             }
             catch (Exception ex)
             {
@@ -253,10 +262,7 @@ namespace DepotDownloader
                 throw new ArgumentNullException(nameof(chunkstore));
             }
 
-            if (maxParallelism <= 0)
-            {
-                maxParallelism = Math.Max(1, Environment.ProcessorCount - 1);
-            }
+            maxParallelism = Util.ResolveParallelism(maxParallelism);
 
             var results = new Dictionary<string, ValidationResult>();
             var chunks = chunkShaList.ToList();
@@ -265,19 +271,18 @@ namespace DepotDownloader
 
             var options = new ParallelOptions { MaxDegreeOfParallelism = maxParallelism };
 
-            await Parallel.ForEachAsync(chunks, options, async (chunkShaHex, ct) =>
+            await Parallel.ForEachAsync(chunks, options, (chunkShaHex, ct) =>
             {
-                await Task.Run(() =>
-                {
-                    var result = ValidateChunkstoreChunk(chunkstore, chunkShaHex, depotKey);
+                var result = ValidateChunkstoreChunk(chunkstore, chunkShaHex, depotKey);
 
-                    lock (lockObj)
-                    {
-                        results[chunkShaHex.ToLowerInvariant()] = result;
-                        validatedCount++;
-                        progress?.Invoke(validatedCount, chunks.Count);
-                    }
-                }, ct);
+                lock (lockObj)
+                {
+                    results[chunkShaHex.ToLowerInvariant()] = result;
+                    validatedCount++;
+                    progress?.Invoke(validatedCount, chunks.Count);
+                }
+
+                return ValueTask.CompletedTask;
             });
 
             return results;
@@ -307,10 +312,7 @@ namespace DepotDownloader
                 throw new ArgumentNullException(nameof(chunkstore));
             }
 
-            if (maxParallelism <= 0)
-            {
-                maxParallelism = Math.Max(1, Environment.ProcessorCount - 1);
-            }
+            maxParallelism = Util.ResolveParallelism(maxParallelism);
 
             // Group chunks by CSD index, preserving order within each CSD
             var byCsd = chunkstore.EnumerateChunks()
@@ -351,6 +353,21 @@ namespace DepotDownloader
                             currentChecksum == savedChecksum)
                         {
                             Console.WriteLine($"  CSD {csdIndex}: skipping (validated in previous run, checksum matches)");
+
+                            // The checkpoint only ever records previously-INVALID chunks (kept small
+                            // on purpose). Reconstruct this CSD's full result set for the final
+                            // summary without re-validating: any chunk not already in `results` was
+                            // therefore valid last time, and the checksum match proves the file
+                            // hasn't changed since.
+                            foreach (var sha in csdGroup.Select(c => c.Sha))
+                            {
+                                var key = sha.ToLowerInvariant();
+                                if (!results.ContainsKey(key))
+                                {
+                                    results[key] = new ValidationResult { IsValid = true };
+                                }
+                            }
+
                             progress?.Invoke(validatedCount, totalChunks);
                             continue;
                         }
@@ -367,18 +384,17 @@ namespace DepotDownloader
                 var lockObj = new object();
                 var options = new ParallelOptions { MaxDegreeOfParallelism = maxParallelism };
 
-                await Parallel.ForEachAsync(csdChunks, options, async (chunkShaHex, ct) =>
+                await Parallel.ForEachAsync(csdChunks, options, (chunkShaHex, ct) =>
                 {
-                    await Task.Run(() =>
+                    var result = ValidateChunkstoreChunk(chunkstore, chunkShaHex, depotKey);
+                    lock (lockObj)
                     {
-                        var result = ValidateChunkstoreChunk(chunkstore, chunkShaHex, depotKey);
-                        lock (lockObj)
-                        {
-                            results[chunkShaHex.ToLowerInvariant()] = result;
-                            validatedCount++;
-                            progress?.Invoke(validatedCount, totalChunks);
-                        }
-                    }, ct);
+                        results[chunkShaHex.ToLowerInvariant()] = result;
+                        validatedCount++;
+                        progress?.Invoke(validatedCount, totalChunks);
+                    }
+
+                    return ValueTask.CompletedTask;
                 });
 
                 // Notify caller that this CSD is complete (for checkpoint saving)
@@ -401,7 +417,7 @@ namespace DepotDownloader
         private static string HashFileStreaming(string path)
         {
             using var fs = File.OpenRead(path);
-            return Convert.ToHexString(SHA1.HashData(fs)).ToLowerInvariant();
+            return Util.ToHex(SHA1.HashData(fs));
         }
 
         #endregion
@@ -409,179 +425,24 @@ namespace DepotDownloader
         #region Shared Processing Logic
 
         /// <summary>
-        /// Process a chunk exactly like the Python depot_validator.py
+        /// Decrypts, decompresses, and reports whether the result's SHA1 matches
+        /// <paramref name="expectedChunkId"/> - via <see cref="Chunkstore.DecryptAndDecompress"/>,
+        /// the same core used by chunkstore reads and reconstruction, so validation results can
+        /// never silently diverge from what an actual read/reconstruct would produce.
         /// </summary>
-        private static ValidationResult ProcessChunkLikePython(byte[] encryptedData, byte[] depotKey, string expectedChunkId)
+        /// <param name="rawData">The chunk's stored bytes - AES-encrypted+compressed if
+        /// <paramref name="isEncrypted"/>, otherwise already-decrypted compressed data.</param>
+        /// <param name="isEncrypted">Whether this chunk needs AES decryption before decompression.
+        /// A decrypted chunk (or any chunk with no depot key available) skips straight to
+        /// decompression.</param>
+        private static ValidationResult ProcessChunkLikePython(byte[] rawData, byte[] depotKey, string expectedChunkId, bool isEncrypted)
         {
             try
             {
-                // Step 1: Decrypt the chunk data (same AES process as SteamKit2)
-                using var aes = Aes.Create();
-                aes.BlockSize = 128;
-                aes.KeySize = 256;
-                aes.Key = depotKey;
+                var decompressed = Chunkstore.DecryptAndDecompress(rawData, isEncrypted, depotKey, expectedChunkId);
 
-                if (encryptedData.Length < 16)
-                {
-                    throw new InvalidDataException("Chunk data too small to contain IV");
-                }
-
-                // First 16 bytes are ECB-encrypted IV
-                Span<byte> iv = stackalloc byte[16];
-                aes.DecryptEcb(encryptedData.AsSpan(0, 16), iv, PaddingMode.None);
-
-                // Decrypt the rest with CBC + PKCS7
-                var encryptedPayload = encryptedData.AsSpan(16);
-                var decryptedBuffer = new byte[encryptedPayload.Length]; // Over-allocate for PKCS7
-                var decryptedLength = aes.DecryptCbc(encryptedPayload, iv, decryptedBuffer, PaddingMode.PKCS7);
-
-                if (decryptedLength < 4)
-                {
-                    throw new InvalidDataException("Decrypted data too small to determine compression type");
-                }
-
-                var decrypted = decryptedBuffer.AsSpan(0, decryptedLength);
-
-                // Step 2: Determine compression type and decompress (exactly like Python)
-                byte[] decompressed;
-                int decompressedSize;
-
-                if (decrypted.Length >= 3 &&
-                    decrypted[0] == (byte)'V' && decrypted[1] == (byte)'Z' && decrypted[2] == (byte)'a') // VZa - LZMA
-                {
-                    // LZMA: size is in footer at offset -6 to -2 (little endian)
-                    if (decrypted.Length < 17) // Need header + footer + some data
-                        throw new InvalidDataException("LZMA chunk too small");
-
-                    var expectedSize = BitConverter.ToInt32(decrypted[^6..^2]);
-                    Console.WriteLine($"Testing (LZMA) from chunk {expectedChunkId}, Size: {expectedSize}");
-
-                    // LZMA properties are at offset 7-11 (5 bytes)
-                    var lzmaProps = decrypted[7..12].ToArray();
-
-                    // LZMA payload is between header and footer: offset 12 to (length - 10)
-                    var compressedPayload = decrypted[12..^10];
-
-                    decompressed = new byte[expectedSize];
-
-                    try
-                    {
-                        // Use SevenZip LZMA decoder (similar to SteamKit2's approach but using standard API)
-                        var decoder = new SevenZip.Compression.LZMA.Decoder();
-
-                        // Set properties exactly like VZipUtil does
-                        // Property byte is at offset 0, dictionary size at offset 1-4 (little endian)
-                        var propertyBits = lzmaProps[0];
-                        var dictionarySize = BitConverter.ToUInt32(lzmaProps, 1);
-
-                        // Create property array for standard SevenZip API
-                        byte[] properties = [propertyBits,
-                            (byte)(dictionarySize), (byte)(dictionarySize >> 8),
-                            (byte)(dictionarySize >> 16), (byte)(dictionarySize >> 24)];
-
-                        decoder.SetDecoderProperties(properties);
-
-                        // Decode with known input/output sizes
-                        using var inputStream = new MemoryStream(compressedPayload.ToArray());
-                        using var outputStream = new MemoryStream(decompressed);
-
-                        decoder.Code(inputStream, outputStream, compressedPayload.Length, expectedSize, null);
-                        decompressedSize = (int)outputStream.Position;
-
-                        if (decompressedSize != expectedSize)
-                        {
-                            throw new InvalidDataException($"LZMA decompressed size mismatch: expected {expectedSize}, got {decompressedSize}");
-                        }
-                    }
-                    catch (Exception ex)
-                    {
-                        throw new InvalidDataException($"LZMA decompression failed: {ex.Message}");
-                    }
-                }
-                else if (decrypted.Length >= 4 &&
-                         decrypted[0] == (byte)'V' && decrypted[1] == (byte)'S' && decrypted[2] == (byte)'Z' && decrypted[3] == (byte)'a') // VSZa - Zstd
-                {
-                    // Zstandard: size is at offset -11 to -7 (little endian)
-                    if (decrypted.Length < 23) // Need header + footer + some data
-                        throw new InvalidDataException("Zstd chunk too small");
-
-                    var expectedSize = BitConverter.ToInt32(decrypted[^11..^7]);
-                    Console.WriteLine($"Testing (Zstandard) from chunk {expectedChunkId}, Size: {expectedSize}");
-
-                    // Verify CRC32 consistency (header at offset 4-7, footer at offset -15 to -11)
-                    var headerCrc = BitConverter.ToUInt32(decrypted[4..8]);
-                    var footerCrc = BitConverter.ToUInt32(decrypted[^15..^11]);
-                    if (headerCrc != footerCrc)
-                    {
-                        throw new InvalidDataException($"Zstd CRC32 mismatch: header={headerCrc:X8}, footer={footerCrc:X8}");
-                    }
-
-                    // Verify footer signature "zsv"
-                    if (decrypted[^3] != (byte)'z' || decrypted[^2] != (byte)'s' || decrypted[^1] != (byte)'v')
-                    {
-                        throw new InvalidDataException("Invalid Zstd footer signature");
-                    }
-
-                    // Zstd payload: skip 8-byte header, 15-byte footer
-                    var compressedPayload = decrypted[8..^15];
-                    decompressed = new byte[expectedSize];
-
-                    try
-                    {
-                        // Use ZstdSharp for decompression
-                        using var decompressor = new ZstdSharp.Decompressor();
-                        var actualSize = decompressor.Unwrap(compressedPayload, decompressed);
-
-                        if (actualSize != expectedSize)
-                        {
-                            throw new InvalidDataException($"Zstd decompressed size mismatch: expected {expectedSize}, got {actualSize}");
-                        }
-
-                        decompressedSize = actualSize;
-                    }
-                    catch (Exception ex)
-                    {
-                        throw new InvalidDataException($"Zstd decompression failed: {ex.Message}");
-                    }
-                }
-                else if (decrypted.Length >= 4 &&
-                         decrypted[0] == (byte)'P' && decrypted[1] == (byte)'K' &&
-                         decrypted[2] == 0x03 && decrypted[3] == 0x04) // ZIP
-                {
-                    Console.WriteLine($"Testing (ZIP) from chunk {expectedChunkId}");
-
-                    // ZIP: Let .NET handle decompression automatically
-                    try
-                    {
-                        using var zipStream = new MemoryStream(decrypted.ToArray());
-                        using var zip = new ZipArchive(zipStream, ZipArchiveMode.Read);
-
-                        if (zip.Entries.Count != 1)
-                            throw new InvalidDataException($"Expected 1 ZIP entry, found {zip.Entries.Count}");
-
-                        using var entryStream = zip.Entries[0].Open();
-                        using var decompressedStream = new MemoryStream();
-                        entryStream.CopyTo(decompressedStream);
-
-                        decompressed = decompressedStream.ToArray();
-                        decompressedSize = decompressed.Length;
-                    }
-                    catch (Exception ex)
-                    {
-                        throw new InvalidDataException($"ZIP decompression failed: {ex.Message}");
-                    }
-                }
-                else
-                {
-                    // Unknown compression format
-                    var headerHex = Convert.ToHexString(decrypted[0..Math.Min(4, decrypted.Length)]);
-                    throw new InvalidDataException($"Unknown compression format: {headerHex}");
-                }
-
-                // Step 3: Validate SHA1 hash (exactly like Python)
-                var actualSha1 = Convert.ToHexString(SHA1.HashData(decompressed.AsSpan(0, decompressedSize))).ToLowerInvariant();
+                var actualSha1 = Util.ToHex(SHA1.HashData(decompressed));
                 var expectedSha1 = expectedChunkId.ToLowerInvariant();
-
                 var isValid = actualSha1 == expectedSha1;
 
                 return new ValidationResult
@@ -589,8 +450,8 @@ namespace DepotDownloader
                     IsValid = isValid,
                     ActualSha1 = actualSha1,
                     ExpectedSha1 = expectedSha1,
-                    DecompressedSize = decompressedSize,
-                    CompressedSize = encryptedData.Length,
+                    DecompressedSize = decompressed.Length,
+                    CompressedSize = rawData.Length,
                     ErrorMessage = isValid ? null : $"SHA1 mismatch: expected {expectedSha1}, got {actualSha1}"
                 };
             }

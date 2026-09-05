@@ -151,9 +151,39 @@ namespace DepotDownloader
         }
 
         /// <summary>
+        /// Load a manifest from disk as a real <see cref="DepotManifest"/> (chunk-level detail intact),
+        /// rather than the diff-oriented <see cref="ManifestData"/> DTO <see cref="LoadManifestFromAnyFormat"/>
+        /// builds. Used by commands that need to walk actual chunks (e.g. reconstruct), not just compare
+        /// file listings. Supports ".manifest" (decrypted binary) and ".manif4"/".manif5" (raw CDN zip,
+        /// requires the depot key to decrypt filenames) - not ".json", which is a lossy debug view.
+        /// </summary>
+        internal static async Task<DepotManifest> LoadDepotManifestFromAnyFormat(string filePath, byte[] depotKey = null)
+        {
+            var extension = Path.GetExtension(filePath).ToLowerInvariant();
+
+            if (extension == ".manifest")
+            {
+                return DepotManifest.LoadFromFile(filePath);
+            }
+
+            if (extension == ".manif4" || extension == ".manif5")
+            {
+                if (depotKey == null || depotKey.Length == 0)
+                {
+                    throw new Exception("Depot key is required to decrypt .manif4/.manif5 files. Use -depotkey or ensure depot key file exists.");
+                }
+
+                var zipBytes = await File.ReadAllBytesAsync(filePath);
+                return ParseManifestZipBytes(zipBytes, depotKey).Manifest;
+            }
+
+            throw new Exception($"Unsupported manifest format for reconstruct: {extension}. Supported: .manifest, .manif4, .manif5");
+        }
+
+        /// <summary>
         /// Parse result from manifest zip bytes
         /// </summary>
-        private class ParsedManifestResult
+        internal class ParsedManifestResult
         {
             public DepotManifest Manifest { get; set; }
             public List<string> EncryptedNames { get; set; }
@@ -164,7 +194,7 @@ namespace DepotDownloader
         /// Parse compressed manifest zip bytes (same as ContentDownloader logic)
         /// Captures encrypted filenames before decryption
         /// </summary>
-        private static ParsedManifestResult ParseManifestZipBytes(byte[] zipBytes, byte[] depotKey)
+        internal static ParsedManifestResult ParseManifestZipBytes(byte[] zipBytes, byte[] depotKey)
         {
             const uint V4_MAGIC = 0x16349781;
 
@@ -238,12 +268,12 @@ namespace DepotDownloader
                     EncryptedName = (encryptedNames != null && i < encryptedNames.Count) ? encryptedNames[i] : null,
                     FileName = f.FileName,
                     Size = f.TotalSize,
-                    Hash = f.FileHash != null ? BitConverter.ToString(f.FileHash).Replace("-", "").ToLowerInvariant() : null,
+                    Hash = f.FileHash != null ? Util.ToHex(f.FileHash) : null,
                     FilenameHash = ComputeFilenameHash(f.FileName),
                     Flags = (int)f.Flags,
                     Chunks = f.Chunks.Select(c => new ManifestData.ChunkEntry
                     {
-                        ChunkId = BitConverter.ToString(c.ChunkID).Replace("-", "").ToLowerInvariant(),
+                        ChunkId = Util.ToHex(c.ChunkID),
                         Checksum = c.Checksum,
                         Offset = c.Offset,
                         CompressedLength = c.CompressedLength,
@@ -265,7 +295,79 @@ namespace DepotDownloader
             var normalized = filename.Replace('/', '\\').ToLowerInvariant();
             var bytes = System.Text.Encoding.UTF8.GetBytes(normalized);
             var hash = SHA1.HashData(bytes);
-            return BitConverter.ToString(hash).Replace("-", "").ToLowerInvariant();
+            return Util.ToHex(hash);
+        }
+
+        /// <summary>
+        /// Resolve a depot decryption key for a .manif4/.manif5 file, in priority order:
+        /// an explicit hex key, an explicit key file, or an auto-detected key file based on
+        /// a "depot/&lt;id&gt;/..." segment found in one of the given manifest file paths.
+        /// Returns the resolved key together with the depot ID it was found/used under.
+        /// </summary>
+        internal static async Task<(byte[] Key, uint? DepotId)> ResolveDepotKeyAsync(string depotKeyHex, string depotKeyFile, uint? depotId, params string[] manifestFilePaths)
+        {
+            if (!string.IsNullOrEmpty(depotKeyHex))
+            {
+                try
+                {
+                    var key = Convert.FromHexString(depotKeyHex);
+                    Console.WriteLine("Using provided depot key (hex)");
+                    return (key, depotId);
+                }
+                catch (FormatException ex)
+                {
+                    throw new Exception($"Invalid depot key hex: {ex.Message}");
+                }
+            }
+
+            if (!string.IsNullOrEmpty(depotKeyFile))
+            {
+                if (!File.Exists(depotKeyFile))
+                {
+                    throw new Exception($"Depot key file not found: {depotKeyFile}");
+                }
+
+                var key = await File.ReadAllBytesAsync(depotKeyFile);
+                Console.WriteLine($"Loaded depot key from: {depotKeyFile}");
+                return (key, depotId);
+            }
+
+            // Auto-detect depot ID from a manifest path (e.g., depot/848452/manifest/...)
+            if (!depotId.HasValue)
+            {
+                foreach (var path in manifestFilePaths)
+                {
+                    var pathParts = Path.GetFullPath(path).Split(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+
+                    for (var i = 0; i < pathParts.Length - 1; i++)
+                    {
+                        if (pathParts[i].Equals("depot", StringComparison.OrdinalIgnoreCase)
+                            && uint.TryParse(pathParts[i + 1], out var detectedDepotId))
+                        {
+                            depotId = detectedDepotId;
+                            Console.WriteLine($"Auto-detected depot ID from path: {depotId}");
+                            break;
+                        }
+                    }
+
+                    if (depotId.HasValue) break;
+                }
+            }
+
+            if (!depotId.HasValue)
+            {
+                throw new Exception(".manif4/.manif5 files require -depot <id>, -depotkey <hex>, or -depotkey-file <path> (could not determine depot ID from file path)");
+            }
+
+            var depotKeyPath = Path.Combine("depot", depotId.Value.ToString(), $"{depotId.Value}.depotkey");
+            if (!File.Exists(depotKeyPath))
+            {
+                throw new Exception($"Depot key file not found: {depotKeyPath}. Provide depot key using -depotkey <hex>, -depotkey-file <path>, or ensure depot key file exists");
+            }
+
+            var loadedKey = await File.ReadAllBytesAsync(depotKeyPath);
+            Console.WriteLine($"Loaded depot key from: {depotKeyPath}");
+            return (loadedKey, depotId);
         }
 
         /// <summary>
@@ -333,60 +435,15 @@ namespace DepotDownloader
                 return 1;
             }
 
-            var manifestFile = (string)null;
-            var outputFile = (string)null;
-            uint? depotId = null;
-            var depotKeyHex = (string)null;
-            var depotKeyFile = (string)null;
+            var parser = new ArgParser(args);
 
-            // Check for positional argument first
-            if (!args[0].StartsWith('-'))
-            {
-                manifestFile = args[0];
-            }
+            var manifestFile = parser.Get<string>(null, "-manifest") ?? parser.Positional(0);
+            var outputFile = parser.Get<string>(null, "-output");
+            var depotId = parser.GetNullable<uint>("-depot", "-d");
+            var depotKeyHex = parser.Get<string>(null, "-depotkey");
+            var depotKeyFile = parser.Get<string>(null, "-depotkey-file");
 
-            // Parse named arguments
-            for (int i = 0; i < args.Length; i++)
-            {
-                switch (args[i].ToLowerInvariant())
-                {
-                    case "-manifest":
-                        if (i + 1 < args.Length)
-                        {
-                            manifestFile = args[i + 1];
-                            i++;
-                        }
-                        break;
-                    case "-output":
-                        if (i + 1 < args.Length)
-                        {
-                            outputFile = args[i + 1];
-                            i++;
-                        }
-                        break;
-                    case "-depot":
-                        if (i + 1 < args.Length && uint.TryParse(args[i + 1], out var depot))
-                        {
-                            depotId = depot;
-                            i++;
-                        }
-                        break;
-                    case "-depotkey":
-                        if (i + 1 < args.Length)
-                        {
-                            depotKeyHex = args[i + 1];
-                            i++;
-                        }
-                        break;
-                    case "-depotkey-file":
-                        if (i + 1 < args.Length)
-                        {
-                            depotKeyFile = args[i + 1];
-                            i++;
-                        }
-                        break;
-                }
-            }
+            parser.WarnUnconsumed();
 
             if (string.IsNullOrEmpty(manifestFile))
             {
@@ -401,96 +458,11 @@ namespace DepotDownloader
             }
 
             // Load depot key if needed for .manif4/.manif5 files
-            var depotKey = (byte[])null;
+            byte[] depotKey = null;
             var extension = Path.GetExtension(manifestFile).ToLowerInvariant();
             if (extension == ".manif4" || extension == ".manif5")
             {
-                // Priority: 1) -depotkey (hex string), 2) -depotkey-file (custom path), 3) auto-detect + standard path
-                if (!string.IsNullOrEmpty(depotKeyHex))
-                {
-                    try
-                    {
-                        depotKey = Convert.FromHexString(depotKeyHex);
-                        Console.WriteLine("Using provided depot key (hex)");
-                    }
-                    catch (Exception ex)
-                    {
-                        Console.WriteLine($"Error: Invalid depot key hex: {ex.Message}");
-                        return 1;
-                    }
-                }
-                else if (!string.IsNullOrEmpty(depotKeyFile))
-                {
-                    if (File.Exists(depotKeyFile))
-                    {
-                        try
-                        {
-                            depotKey = await File.ReadAllBytesAsync(depotKeyFile);
-                            Console.WriteLine($"Loaded depot key from: {depotKeyFile}");
-                        }
-                        catch (Exception ex)
-                        {
-                            Console.WriteLine($"Error reading depot key file: {ex.Message}");
-                            return 1;
-                        }
-                    }
-                    else
-                    {
-                        Console.WriteLine($"Error: Depot key file not found: {depotKeyFile}");
-                        return 1;
-                    }
-                }
-                else
-                {
-                    // Try to auto-detect depot ID from file path (e.g., depot/848452/manifest/...)
-                    if (!depotId.HasValue)
-                    {
-                        var fullPath = Path.GetFullPath(manifestFile);
-                        var pathParts = fullPath.Split(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
-
-                        // Look for "depot" folder followed by a numeric ID
-                        for (var i = 0; i < pathParts.Length - 1; i++)
-                        {
-                            if (pathParts[i].Equals("depot", StringComparison.OrdinalIgnoreCase)
-                                && uint.TryParse(pathParts[i + 1], out var detectedDepotId))
-                            {
-                                depotId = detectedDepotId;
-                                Console.WriteLine($"Auto-detected depot ID from path: {depotId}");
-                                break;
-                            }
-                        }
-                    }
-
-                    if (depotId.HasValue)
-                    {
-                        var depotKeyPath = Path.Combine("depot", depotId.Value.ToString(), $"{depotId.Value}.depotkey");
-                        if (File.Exists(depotKeyPath))
-                        {
-                            try
-                            {
-                                depotKey = await File.ReadAllBytesAsync(depotKeyPath);
-                                Console.WriteLine($"Loaded depot key from: {depotKeyPath}");
-                            }
-                            catch (Exception ex)
-                            {
-                                Console.WriteLine($"Error reading depot key: {ex.Message}");
-                                return 1;
-                            }
-                        }
-                        else
-                        {
-                            Console.WriteLine($"Error: Depot key file not found: {depotKeyPath}");
-                            Console.WriteLine("Provide depot key using -depotkey <hex>, -depotkey-file <path>, or ensure depot key file exists");
-                            return 1;
-                        }
-                    }
-                    else
-                    {
-                        Console.WriteLine("Error: Could not determine depot ID from file path.");
-                        Console.WriteLine(".manif4/.manif5 files require -depot <id>, -depotkey <hex>, or -depotkey-file <path>");
-                        return 1;
-                    }
-                }
+                (depotKey, depotId) = await ResolveDepotKeyAsync(depotKeyHex, depotKeyFile, depotId, manifestFile);
             }
 
             // Default output file
@@ -594,81 +566,17 @@ namespace DepotDownloader
                 return 1;
             }
 
-            var oldManifestFile = (string)null;
-            var newManifestFile = (string)null;
-            var outputFile = (string)null;
-            uint? depotId = null;
-            var depotKeyHex = (string)null;
-            var depotKeyFile = (string)null;
-            var verbose = false;
+            var parser = new ArgParser(args);
 
-            // Check for positional arguments first
-            var positionalIndex = 0;
-            for (var i = 0; i < args.Length && positionalIndex < 2; i++)
-            {
-                if (!args[i].StartsWith('-'))
-                {
-                    if (positionalIndex == 0)
-                        oldManifestFile = args[i];
-                    else if (positionalIndex == 1)
-                        newManifestFile = args[i];
-                    positionalIndex++;
-                }
-            }
+            var oldManifestFile = parser.Get<string>(null, "-old") ?? parser.Positional(0);
+            var newManifestFile = parser.Get<string>(null, "-new") ?? parser.Positional(1);
+            var outputFile = parser.Get<string>(null, "-output");
+            var depotId = parser.GetNullable<uint>("-depot", "-d");
+            var depotKeyHex = parser.Get<string>(null, "-depotkey");
+            var depotKeyFile = parser.Get<string>(null, "-depotkey-file");
+            var verbose = parser.HasFlag("-verbose", "-v");
 
-            // Parse named arguments
-            for (int i = 0; i < args.Length; i++)
-            {
-                switch (args[i].ToLowerInvariant())
-                {
-                    case "-old":
-                        if (i + 1 < args.Length)
-                        {
-                            oldManifestFile = args[i + 1];
-                            i++;
-                        }
-                        break;
-                    case "-new":
-                        if (i + 1 < args.Length)
-                        {
-                            newManifestFile = args[i + 1];
-                            i++;
-                        }
-                        break;
-                    case "-output":
-                        if (i + 1 < args.Length)
-                        {
-                            outputFile = args[i + 1];
-                            i++;
-                        }
-                        break;
-                    case "-depot":
-                        if (i + 1 < args.Length && uint.TryParse(args[i + 1], out var depot))
-                        {
-                            depotId = depot;
-                            i++;
-                        }
-                        break;
-                    case "-depotkey":
-                        if (i + 1 < args.Length)
-                        {
-                            depotKeyHex = args[i + 1];
-                            i++;
-                        }
-                        break;
-                    case "-depotkey-file":
-                        if (i + 1 < args.Length)
-                        {
-                            depotKeyFile = args[i + 1];
-                            i++;
-                        }
-                        break;
-                    case "-verbose":
-                    case "-v":
-                        verbose = true;
-                        break;
-                }
-            }
+            parser.WarnUnconsumed();
 
             if (string.IsNullOrEmpty(oldManifestFile) || string.IsNullOrEmpty(newManifestFile))
             {
@@ -689,118 +597,14 @@ namespace DepotDownloader
             }
 
             // Load depot key if needed for .manif4/.manif5 files
-            var depotKey = (byte[])null;
+            byte[] depotKey = null;
             var oldExt = Path.GetExtension(oldManifestFile).ToLowerInvariant();
             var newExt = Path.GetExtension(newManifestFile).ToLowerInvariant();
             var needsKey = oldExt == ".manif4" || oldExt == ".manif5" || newExt == ".manif4" || newExt == ".manif5";
 
             if (needsKey)
             {
-                // Priority: 1) -depotkey (hex string), 2) -depotkey-file (custom path), 3) auto-detect + standard path
-                if (!string.IsNullOrEmpty(depotKeyHex))
-                {
-                    try
-                    {
-                        depotKey = Convert.FromHexString(depotKeyHex);
-                        Console.WriteLine("Using provided depot key (hex)");
-                    }
-                    catch (Exception ex)
-                    {
-                        Console.WriteLine($"Error: Invalid depot key hex: {ex.Message}");
-                        return 1;
-                    }
-                }
-                else if (!string.IsNullOrEmpty(depotKeyFile))
-                {
-                    if (File.Exists(depotKeyFile))
-                    {
-                        try
-                        {
-                            depotKey = await File.ReadAllBytesAsync(depotKeyFile);
-                            Console.WriteLine($"Loaded depot key from: {depotKeyFile}");
-                        }
-                        catch (Exception ex)
-                        {
-                            Console.WriteLine($"Error reading depot key file: {ex.Message}");
-                            return 1;
-                        }
-                    }
-                    else
-                    {
-                        Console.WriteLine($"Error: Depot key file not found: {depotKeyFile}");
-                        return 1;
-                    }
-                }
-                else
-                {
-                    // Try to auto-detect depot ID from file paths (e.g., depot/848452/manifest/...)
-                    if (!depotId.HasValue)
-                    {
-                        // Check old manifest path first
-                        var fullPath = Path.GetFullPath(oldManifestFile);
-                        var pathParts = fullPath.Split(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
-
-                        // Look for "depot" folder followed by a numeric ID
-                        for (var i = 0; i < pathParts.Length - 1; i++)
-                        {
-                            if (pathParts[i].Equals("depot", StringComparison.OrdinalIgnoreCase)
-                                && uint.TryParse(pathParts[i + 1], out var detectedDepotId))
-                            {
-                                depotId = detectedDepotId;
-                                Console.WriteLine($"Auto-detected depot ID from path: {depotId}");
-                                break;
-                            }
-                        }
-
-                        // If not found in old path, check new manifest path
-                        if (!depotId.HasValue)
-                        {
-                            fullPath = Path.GetFullPath(newManifestFile);
-                            pathParts = fullPath.Split(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
-
-                            for (var i = 0; i < pathParts.Length - 1; i++)
-                            {
-                                if (pathParts[i].Equals("depot", StringComparison.OrdinalIgnoreCase)
-                                    && uint.TryParse(pathParts[i + 1], out var detectedDepotId))
-                                {
-                                    depotId = detectedDepotId;
-                                    Console.WriteLine($"Auto-detected depot ID from path: {depotId}");
-                                    break;
-                                }
-                            }
-                        }
-                    }
-
-                    if (depotId.HasValue)
-                    {
-                        var depotKeyPath = Path.Combine("depot", depotId.Value.ToString(), $"{depotId.Value}.depotkey");
-                        if (File.Exists(depotKeyPath))
-                        {
-                            try
-                            {
-                                depotKey = await File.ReadAllBytesAsync(depotKeyPath);
-                                Console.WriteLine($"Loaded depot key from: {depotKeyPath}");
-                            }
-                            catch (Exception ex)
-                            {
-                                Console.WriteLine($"Error reading depot key: {ex.Message}");
-                                return 1;
-                            }
-                        }
-                        else
-                        {
-                            Console.WriteLine($"Error: Depot key file not found: {depotKeyPath}");
-                            Console.WriteLine("Provide depot key using -depotkey <hex>, -depotkey-file <path>, or ensure depot key file exists");
-                            return 1;
-                        }
-                    }
-                    else
-                    {
-                        Console.WriteLine("Error: Could not determine depot ID from file paths.");
-                        Console.WriteLine(".manif4/.manif5 files require -depot <id>, -depotkey <hex>, or -depotkey-file <path>");
-                        return 1;
-                    }
-                }
+                (depotKey, depotId) = await ResolveDepotKeyAsync(depotKeyHex, depotKeyFile, depotId, oldManifestFile, newManifestFile);
             }
 
             Console.WriteLine($"Loading old manifest from: {oldManifestFile}");

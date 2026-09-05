@@ -4,6 +4,7 @@
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Globalization;
 using System.IO;
 using System.IO.Compression;
 using System.Linq;
@@ -48,8 +49,11 @@ namespace DepotDownloader
         [ProtoMember(5)]
         public Dictionary<string, ChunkMetadataProto> ChunkIndex { get; set; }
 
-        [ProtoMember(6)]
-        public List<ChunkList> ChunksPerFile { get; set; }
+        // ProtoMember 6 ("ChunksPerFile") used to duplicate ChunkIndex's data as a hand-synced
+        // per-CSD list purely for ordered CSM generation - removed since it's one query away
+        // (chunkIndex.Values.Where(...).OrderBy(...)) and was persisted redundantly on every
+        // checkpoint save. An older checkpoint file with that field is read fine (protobuf-net
+        // ignores unknown members); it's just no longer written.
 
         [ProtoContract]
         public class ChunkMetadataProto
@@ -65,13 +69,6 @@ namespace DepotDownloader
 
             [ProtoMember(4)]
             public int Length { get; set; }
-        }
-
-        [ProtoContract]
-        public class ChunkList
-        {
-            [ProtoMember(1)]
-            public List<ChunkMetadataProto> Chunks { get; set; } = new();
         }
     }
 
@@ -95,7 +92,15 @@ namespace DepotDownloader
 
         // Native .NET collections - much faster than SQLite for this use case
         private readonly ConcurrentDictionary<string, ChunkMetadata> chunkIndex = new(StringComparer.OrdinalIgnoreCase);
-        private readonly List<List<ChunkMetadata>> chunksPerFile = new(); // For ordered CSM generation
+
+        // Per-segment chunks, in write (= offset) order, purely as an in-memory index for fast CSM
+        // writes - NOT persisted in the checkpoint (unlike an earlier version of this field): it's
+        // fully derivable from chunkIndex, so persisting it too was pure redundancy. Kept in memory
+        // anyway because deriving it on every CSM write (chunkIndex.Values.Where(...).OrderBy(...))
+        // costs O(chunk count) *per segment*, i.e. O(N*segments) over a whole pack/rebuild - a real
+        // cost for a large depot. Rebuilt with one O(N) pass whenever chunkIndex is loaded/replaced
+        // wholesale (initial CSM parse, checkpoint load); appended to incrementally by WriteChunk.
+        private readonly List<List<ChunkMetadata>> chunksPerFile = new();
 
         // Lock for write operations ONLY - reads are lock-free
         private readonly object writeLock = new();
@@ -188,7 +193,6 @@ namespace DepotDownloader
                             Console.WriteLine($"Warning: Checkpoint file count mismatch (expected {expectedFiles}, found {actualFiles}). Rebuilding from CSM files...");
                             // Fall through to rebuild from CSM
                             chunkIndex.Clear();
-                            chunksPerFile.Clear();
                             files.Clear();
                         }
                     }
@@ -197,18 +201,31 @@ namespace DepotDownloader
                 {
                     Console.WriteLine($"Warning: Failed to load checkpoint: {ex.Message}. Rebuilding from CSM files...");
                     chunkIndex.Clear();
-                    chunksPerFile.Clear();
                     files.Clear();
                 }
             }
 
-            // Load existing CSD/CSM pairs (fallback or initial load)
+            // Load existing CSD/CSM pairs (fallback or initial load). Ignore, rather than crash on,
+            // any file that happens to match the glob but doesn't follow the expected
+            // "{depot}_depotcache_<N>.csm" naming (a manual backup, a Windows "(1)"-suffixed copy,
+            // etc.) - one stray file shouldn't take down every command that opens this chunkstore.
             var csmFiles = Directory.EnumerateFiles(folder, $"{depot}_*.csm")
-                .OrderBy(f =>
+                .Select(f =>
                 {
-                    var parts = Path.GetFileNameWithoutExtension(f).Split('_');
-                    return int.Parse(parts[^1]);
+                    var lastPart = Path.GetFileNameWithoutExtension(f).Split('_')[^1];
+                    var parsed = int.TryParse(lastPart, NumberStyles.Integer, CultureInfo.InvariantCulture, out var idx) ? idx : (int?)null;
+                    return (Path: f, Index: parsed);
                 })
+                .Where(x =>
+                {
+                    if (x.Index == null)
+                    {
+                        Console.WriteLine($"Warning: Ignoring unrecognized file in chunkstore folder (doesn't match the expected '{{depot}}_depotcache_<N>.csm' naming): {Path.GetFileName(x.Path)}");
+                    }
+                    return x.Index != null;
+                })
+                .OrderBy(x => x.Index!.Value)
+                .Select(x => x.Path)
                 .ToList();
 
             foreach (var csmPath in csmFiles)
@@ -219,7 +236,7 @@ namespace DepotDownloader
                 if (File.Exists(csdPath))
                 {
                     files.Add((csdPath, csmPath));
-                    chunksPerFile.Add(new List<ChunkMetadata>());
+                    chunksPerFile.Add([]);
                 }
             }
 
@@ -317,8 +334,6 @@ namespace DepotDownloader
                     $"Depot ID mismatch in file {csmPath}. Expected {depot}, found {depotId}.");
             }
 
-            var fileChunks = chunksPerFile[chunkstoreIndex - 1];
-
             // Read chunk metadata
             for (int i = 0; i < chunkCount; i++)
             {
@@ -327,7 +342,7 @@ namespace DepotDownloader
                 reader.ReadUInt32(); // reserved
                 var length = reader.ReadInt32();
 
-                var shaHex = Convert.ToHexString(sha).ToLowerInvariant();
+                var shaHex = Util.ToHex(sha);
                 var metadata = new ChunkMetadata
                 {
                     Sha = shaHex,
@@ -337,17 +352,64 @@ namespace DepotDownloader
                 };
 
                 chunkIndex[shaHex] = metadata;
-                fileChunks.Add(metadata);
+                chunksPerFile[chunkstoreIndex - 1].Add(metadata);
             }
         }
+
+        /// <summary>
+        /// Whether this chunkstore's chunks are AES-encrypted (as they are when downloaded for raw
+        /// archival), or already decrypted. A single chunkstore (CSD/CSM set) is always one or the
+        /// other - the CSM header records it and mixed content is never allowed. Null only before
+        /// the mode has been established (e.g. a brand new, still-empty chunkstore).
+        /// </summary>
+        public bool? IsEncrypted => isEncrypted;
 
         /// <summary>
         /// Checks if a chunk with the given SHA1 exists in the chunkstore.
         /// </summary>
         public bool ChunkExists(byte[] sha)
         {
-            var shaHex = Convert.ToHexString(sha).ToLowerInvariant();
+            var shaHex = Util.ToHex(sha);
             return chunkIndex.ContainsKey(shaHex);
+        }
+
+        /// <summary>
+        /// Extracts the lowercase SHA1 hex from a loose chunk file's name for the given encryption
+        /// mode, or returns false if the name doesn't match. Decrypted chunks are named
+        /// "&lt;sha&gt;_decrypted" when stored loosely; encrypted chunks are named just "&lt;sha&gt;".
+        /// A chunkstore only ever holds one mode - this rejects a name in the wrong mode's format
+        /// rather than guessing, since the two are never mixed within one CSD/CSM set.
+        /// </summary>
+        public static bool TryGetChunkSha(string fileName, bool isEncrypted, out string sha)
+        {
+            const string DecryptedSuffix = "_decrypted";
+
+            sha = fileName;
+
+            if (!isEncrypted)
+            {
+                if (!sha.EndsWith(DecryptedSuffix, StringComparison.Ordinal))
+                {
+                    sha = null;
+                    return false;
+                }
+
+                sha = sha[..^DecryptedSuffix.Length];
+            }
+            else if (sha.EndsWith(DecryptedSuffix, StringComparison.Ordinal))
+            {
+                sha = null;
+                return false;
+            }
+
+            if (sha.Length != 40 || !sha.All(char.IsAsciiHexDigit))
+            {
+                sha = null;
+                return false;
+            }
+
+            sha = sha.ToLowerInvariant();
+            return true;
         }
 
         /// <summary>
@@ -358,7 +420,7 @@ namespace DepotDownloader
         /// <returns>The chunk data</returns>
         public byte[] GetChunk(byte[] sha, bool process = false)
         {
-            var shaHex = Convert.ToHexString(sha).ToLowerInvariant();
+            var shaHex = Util.ToHex(sha);
 
             if (!chunkIndex.TryGetValue(shaHex, out var metadata))
             {
@@ -386,67 +448,65 @@ namespace DepotDownloader
         /// </summary>
         public async Task<Dictionary<string, byte[]>> GetChunksAsync(IEnumerable<byte[]> shaList, bool process = false, int maxParallelism = 0)
         {
-            if (maxParallelism <= 0)
-            {
-                maxParallelism = Math.Max(1, Environment.ProcessorCount - 1);
-            }
+            maxParallelism = Util.ResolveParallelism(maxParallelism);
 
             var results = new ConcurrentDictionary<string, byte[]>(StringComparer.OrdinalIgnoreCase);
+            var failures = new ConcurrentDictionary<string, Exception>(StringComparer.OrdinalIgnoreCase);
             var options = new ParallelOptions { MaxDegreeOfParallelism = maxParallelism };
 
-            await Parallel.ForEachAsync(shaList, options, async (sha, ct) =>
+            // The per-item work below is entirely synchronous (file I/O + CPU decrypt/decompress);
+            // Parallel.ForEachAsync already gives up to MaxDegreeOfParallelism concurrent bodies on
+            // pool threads on its own, so wrapping this in a nested Task.Run would only add a
+            // second, pointless thread-pool scheduling hop per item with no added concurrency.
+            await Parallel.ForEachAsync(shaList, options, (sha, ct) =>
             {
-                await Task.Run(() =>
+                var shaHex = Util.ToHex(sha);
+                try
                 {
-                    var shaHex = Convert.ToHexString(sha).ToLowerInvariant();
-                    try
-                    {
-                        var data = GetChunk(sha, process);
-                        results[shaHex] = data;
-                    }
-                    catch (Exception ex)
-                    {
-                        Console.WriteLine($"Error retrieving chunk {shaHex}: {ex.Message}");
-                    }
-                }, ct);
+                    var data = GetChunk(sha, process);
+                    results[shaHex] = data;
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"Error retrieving chunk {shaHex}: {ex.Message}");
+                    failures[shaHex] = ex;
+                }
+
+                return ValueTask.CompletedTask;
             });
+
+            // Surface partial failure rather than silently returning a dictionary with fewer
+            // entries than requested - a caller indexing by the original SHA list has no other
+            // way to tell "not requested" from "failed" apart.
+            if (!failures.IsEmpty)
+            {
+                throw new AggregateException(
+                    $"Failed to retrieve {failures.Count:N0} of {results.Count + failures.Count:N0} requested chunks.",
+                    failures.Values);
+            }
 
             return results.ToDictionary(kvp => kvp.Key, kvp => kvp.Value);
         }
 
-        private byte[] ProcessChunk(string shaHex, byte[] content)
-        {
-            // Decrypt if necessary
-            if (isEncrypted == true && depotKey != null)
-            {
-                content = DecryptChunk(content, depotKey);
-            }
+        private byte[] ProcessChunk(string shaHex, byte[] content) =>
+            ProcessChunkStatic(shaHex, content, isEncrypted == true, depotKey);
 
-            // Decompress based on format
-            byte[] decompressed;
-            if (content.Length >= 3 && content[0] == 'V' && content[1] == 'Z' && content[2] == 'a')
-            {
-                // LZMA format
-                decompressed = DecompressLZMA(content);
-            }
-            else if (content.Length >= 4 && content[0] == 'P' && content[1] == 'K' && content[2] == 0x03 && content[3] == 0x04)
-            {
-                // ZIP format
-                decompressed = DecompressZip(content);
-            }
-            else if (content.Length >= 4 && content[0] == 'V' && content[1] == 'S' && content[2] == 'Z' && content[3] == 'a')
-            {
-                // Zstandard format
-                decompressed = DecompressZstd(content);
-            }
-            else
-            {
-                throw new InvalidDataException($"Unknown compression format for chunk {shaHex}");
-            }
+        /// <summary>
+        /// Decrypts (if applicable) and decompresses raw chunk bytes, auto-detecting the
+        /// compression format (LZMA/ZIP/Zstandard) by magic bytes, then verifies the result's
+        /// SHA1 matches <paramref name="shaHex"/>, throwing if it doesn't. This is the single
+        /// decrypt/decompress core shared by chunkstore reads and loose-file reconstruction - do
+        /// not duplicate it. A caller that needs to *report* a mismatch rather than throw on one
+        /// (chunk validation) should call <see cref="DecryptAndDecompress"/> directly instead and
+        /// compare the hash itself.
+        /// </summary>
+        internal static byte[] ProcessChunkStatic(string shaHex, byte[] content, bool isEncrypted, byte[] depotKey)
+        {
+            var decompressed = DecryptAndDecompress(content, isEncrypted, depotKey, shaHex);
 
             // Verify SHA1
             using var sha1 = SHA1.Create();
-            var calculatedSha = Convert.ToHexString(sha1.ComputeHash(decompressed)).ToLowerInvariant();
+            var calculatedSha = Util.ToHex(sha1.ComputeHash(decompressed));
 
             if (calculatedSha != shaHex)
             {
@@ -455,6 +515,52 @@ namespace DepotDownloader
             }
 
             return decompressed;
+        }
+
+        /// <summary>
+        /// Decrypts (if applicable) and decompresses raw chunk bytes, auto-detecting the
+        /// compression format (LZMA/ZIP/Zstandard) by magic bytes. Does NOT verify the result's
+        /// SHA1 - the shared core beneath both <see cref="ProcessChunkStatic"/> (hard-fails on a
+        /// mismatch) and <see cref="ChunkValidator"/>'s chunk validation (reports a mismatch as a
+        /// result rather than throwing on it).
+        /// </summary>
+        internal static byte[] DecryptAndDecompress(byte[] content, bool isEncrypted, byte[] depotKey, string chunkIdForErrors = null)
+        {
+            // Decrypt if necessary
+            if (isEncrypted && depotKey != null)
+            {
+                content = DecryptChunk(content, depotKey);
+
+                if (content.Length < 4)
+                {
+                    throw new InvalidDataException(chunkIdForErrors != null
+                        ? $"Decrypted data too small to determine compression type for chunk {chunkIdForErrors}"
+                        : "Decrypted data too small to determine compression type");
+                }
+            }
+
+            // Decompress based on format
+            if (content.Length >= 3 && content[0] == 'V' && content[1] == 'Z' && content[2] == 'a')
+            {
+                // LZMA format
+                return DecompressLZMA(content);
+            }
+
+            if (content.Length >= 4 && content[0] == 'P' && content[1] == 'K' && content[2] == 0x03 && content[3] == 0x04)
+            {
+                // ZIP format
+                return DecompressZip(content);
+            }
+
+            if (content.Length >= 4 && content[0] == 'V' && content[1] == 'S' && content[2] == 'Z' && content[3] == 'a')
+            {
+                // Zstandard format
+                return DecompressZstd(content);
+            }
+
+            throw new InvalidDataException(chunkIdForErrors != null
+                ? $"Unknown compression format for chunk {chunkIdForErrors}"
+                : "Unknown compression format");
         }
 
         private static byte[] DecompressLZMA(ReadOnlySpan<byte> data)
@@ -574,7 +680,7 @@ namespace DepotDownloader
         /// <returns>True if the chunk was written, false if it already existed</returns>
         public bool WriteChunk(byte[] sha, byte[] content)
         {
-            var shaHex = Convert.ToHexString(sha).ToLowerInvariant();
+            var shaHex = Util.ToHex(sha);
 
             // Fast check without lock (if already exists, skip immediately)
             if (chunkIndex.ContainsKey(shaHex))
@@ -656,31 +762,10 @@ namespace DepotDownloader
                         ChunkstoreIndex = kvp.Value.ChunkstoreIndex,
                         Offset = kvp.Value.Offset,
                         Length = kvp.Value.Length
-                    }),
-                ChunksPerFile = chunksPerFile.Select(list =>
-                    new ChunkstoreCheckpoint.ChunkList
-                    {
-                        Chunks = list.Select(c => new ChunkstoreCheckpoint.ChunkMetadataProto
-                        {
-                            Sha = c.Sha,
-                            ChunkstoreIndex = c.ChunkstoreIndex,
-                            Offset = c.Offset,
-                            Length = c.Length
-                        }).ToList()
-                    }).ToList()
+                    })
             };
 
-            var tempPath = CheckpointPath + ".tmp";
-
-            // Write to temp file first (atomic operation)
-            using (var fs = File.Create(tempPath))
-            using (var ds = new DeflateStream(fs, CompressionMode.Compress))
-            {
-                Serializer.Serialize(ds, checkpoint);
-            }
-
-            // Atomic replace (survives crashes during write)
-            File.Move(tempPath, CheckpointPath, overwrite: true);
+            CheckpointFile.Save(CheckpointPath, checkpoint);
         }
 
         /// <summary>
@@ -710,12 +795,7 @@ namespace DepotDownloader
 
             try
             {
-                ChunkstoreCheckpoint checkpoint;
-                using (var fs = File.OpenRead(CheckpointPath))
-                using (var ds = new DeflateStream(fs, CompressionMode.Decompress))
-                {
-                    checkpoint = Serializer.Deserialize<ChunkstoreCheckpoint>(ds);
-                }
+                var checkpoint = CheckpointFile.Load<ChunkstoreCheckpoint>(CheckpointPath);
 
                 // Restore state
                 depot = checkpoint.DepotId;
@@ -734,18 +814,6 @@ namespace DepotDownloader
                         Offset = proto.Offset,
                         Length = proto.Length
                     };
-                }
-
-                chunksPerFile.Clear();
-                foreach (var chunkList in checkpoint.ChunksPerFile)
-                {
-                    chunksPerFile.Add(chunkList.Chunks.Select(proto => new ChunkMetadata
-                    {
-                        Sha = proto.Sha,
-                        ChunkstoreIndex = proto.ChunkstoreIndex,
-                        Offset = proto.Offset,
-                        Length = proto.Length
-                    }).ToList());
                 }
 
                 // Restore file list
@@ -810,7 +878,10 @@ namespace DepotDownloader
         private void WriteSingleCSMUnsafe(int index)
         {
             var (_, csmPath) = files[index - 1];
-            var chunks = chunksPerFile[index - 1];
+            // O(1) lookup via chunksPerFile rather than scanning/filtering the whole chunkIndex -
+            // this runs once per segment during every pack/rebuild, so an O(total chunks) scan
+            // here would make the whole operation O(total chunks * segment count).
+            var chunks = chunksPerFile[index - 1].OrderBy(c => c.Offset).ToList();
 
             using var stream = File.Open(csmPath, FileMode.Open, FileAccess.Write);
             using var writer = new BinaryWriter(stream);
@@ -822,8 +893,8 @@ namespace DepotDownloader
             writer.Write(depot ?? 0);
             writer.Write(chunks.Count);
 
-            // Write chunk metadata (sorted by offset for consistency)
-            foreach (var chunk in chunks.OrderBy(c => c.Offset))
+            // Write chunk metadata (already sorted by offset for consistency)
+            foreach (var chunk in chunks)
             {
                 writer.Write(Convert.FromHexString(chunk.Sha));
                 writer.Write(chunk.Offset);
@@ -858,21 +929,13 @@ namespace DepotDownloader
                     }
 
                     var fileName = Path.GetFileName(filePath);
-                    var sha = fileName;
 
-                    // Remove _decrypted suffix if present
-                    if (!isEncrypted.GetValueOrDefault() && sha.EndsWith("_decrypted"))
-                    {
-                        sha = sha[..^"_decrypted".Length];
-                    }
-
-                    // Validate SHA1 format
-                    if (sha.Length != 40 || !sha.All(c => char.IsAsciiHexDigit(c)))
+                    if (!TryGetChunkSha(fileName, isEncrypted.GetValueOrDefault(), out var sha))
                     {
                         throw new InvalidOperationException($"Invalid SHA1 filename: {fileName}");
                     }
 
-                    return new { FilePath = filePath, Sha = sha.ToLowerInvariant(), FileName = fileName };
+                    return new { FilePath = filePath, Sha = sha, FileName = fileName };
                 })
                 .OrderBy(f => f.Sha, StringComparer.OrdinalIgnoreCase) // Sort by SHA1
                 .ToList();
@@ -918,10 +981,7 @@ namespace DepotDownloader
             int checkpointInterval = 5000,
             bool resumeFromCheckpoint = true)
         {
-            if (maxParallelism <= 0)
-            {
-                maxParallelism = Math.Max(1, Environment.ProcessorCount - 1);
-            }
+            maxParallelism = Util.ResolveParallelism(maxParallelism);
 
             // Try to resume from checkpoint
             HashSet<string> processedChunks = null;
@@ -941,16 +1001,8 @@ namespace DepotDownloader
                     }
 
                     var fileName = Path.GetFileName(filePath);
-                    var sha = fileName;
 
-                    // Remove _decrypted suffix if present
-                    if (!isEncrypted.GetValueOrDefault() && sha.EndsWith("_decrypted"))
-                    {
-                        sha = sha[..^"_decrypted".Length];
-                    }
-
-                    // Validate SHA1 format
-                    if (sha.Length != 40 || !sha.All(c => char.IsAsciiHexDigit(c)))
+                    if (!TryGetChunkSha(fileName, isEncrypted.GetValueOrDefault(), out var sha))
                     {
                         throw new InvalidOperationException($"Invalid SHA1 filename: {fileName}");
                     }
@@ -958,7 +1010,7 @@ namespace DepotDownloader
                     return new ChunkFile
                     {
                         FilePath = filePath,
-                        Sha = sha.ToLowerInvariant(),
+                        Sha = sha,
                         FileName = fileName
                     };
                 })
@@ -996,22 +1048,22 @@ namespace DepotDownloader
                 var chunkData = new (string Sha, byte[] Content, string FileName)[batch.Count];
                 var options = new ParallelOptions { MaxDegreeOfParallelism = maxParallelism };
 
-                await Parallel.ForEachAsync(batch.Select((f, idx) => (f, idx)), options, async (item, ct) =>
+                await Parallel.ForEachAsync(batch.Select((f, idx) => (f, idx)), options, (item, ct) =>
                 {
-                    await Task.Run(() =>
+                    var (file, index) = item;
+
+                    // Skip if already exists (fast check without loading file)
+                    if (ChunkExists(Convert.FromHexString(file.Sha)))
                     {
-                        var (file, index) = item;
-
-                        // Skip if already exists (fast check without loading file)
-                        if (ChunkExists(Convert.FromHexString(file.Sha)))
-                        {
-                            chunkData[index] = (file.Sha, null, file.FileName);
-                            return;
-                        }
-
+                        chunkData[index] = (file.Sha, null, file.FileName);
+                    }
+                    else
+                    {
                         var content = File.ReadAllBytes(file.FilePath);
                         chunkData[index] = (file.Sha, content, file.FileName);
-                    }, ct);
+                    }
+
+                    return ValueTask.CompletedTask;
                 });
 
                 // Step 2b: Write batch sequentially in sorted order
@@ -1031,7 +1083,7 @@ namespace DepotDownloader
 
                         if (packedCount % 100 == 0)
                         {
-                            Console.WriteLine($"Packed {packedCount:N0}/{totalChunks:N0} chunks ({(packedCount * 100.0 / totalChunks):F1}%)");
+                            Console.WriteLine($"Packed {Util.FormatProgress(packedCount, totalChunks)} chunks");
                         }
 
                         // Save checkpoint periodically (by count or time)
@@ -1074,6 +1126,274 @@ namespace DepotDownloader
         }
 
         /// <summary>
+        /// Copies every chunk from <paramref name="source"/> into this chunkstore in ascending
+        /// SHA1 order, producing the canonical, deterministic on-disk layout - the same layout a
+        /// from-scratch <see cref="PackAsync"/> of the same chunk set would produce. Used by
+        /// 'chunkstore rebuild' to restore that property after incremental <see cref="WriteChunk"/>
+        /// calls (e.g. via 'update') have appended chunks out of order. Copies raw (still
+        /// encrypted/compressed) bytes directly - no decrypt/decompress needed, since rebuild
+        /// never touches chunk content, only its position. Mirrors PackAsync's
+        /// batching/parallel-read/checkpoint shape, reading from another chunkstore's
+        /// <see cref="GetChunk"/> instead of loose files on disk.
+        /// </summary>
+        public async Task RebuildFromAsync(
+            Chunkstore source,
+            int maxParallelism = 0,
+            int batchSize = 1000,
+            int checkpointInterval = 5000,
+            bool resumeFromCheckpoint = true,
+            bool deleteSourceAsWeGo = false)
+        {
+            maxParallelism = Util.ResolveParallelism(maxParallelism);
+
+            // Snapshot the source's chunk index once - EnumerateChunks() does a full
+            // ConcurrentDictionary copy, and both uses below (segment membership, sort order) only
+            // need this one snapshot; source is never mutated during a rebuild copy.
+            var sourceChunks = source.EnumerateChunks().ToList();
+
+            // Per-old-segment chunk membership (metadata only - SHA1s, not bytes) and the set of
+            // segments already deleted. Only needed for deleteSourceAsWeGo, but building it is
+            // cheap even for a large store.
+            Dictionary<int, List<string>> sourceChunksBySegment = null;
+            HashSet<int> deletedSegments = null;
+            if (deleteSourceAsWeGo)
+            {
+                sourceChunksBySegment = sourceChunks
+                    .GroupBy(c => c.ChunkstoreIndex)
+                    .ToDictionary(g => g.Key, g => g.Select(c => c.Sha).ToList());
+                deletedSegments = [];
+            }
+
+            // Try to resume from checkpoint (loaded automatically by the constructor if this
+            // target folder already has partial state from an earlier, interrupted attempt).
+            HashSet<string> processedChunks = null;
+            if (resumeFromCheckpoint && chunkIndex.Count > 0)
+            {
+                Console.WriteLine($"Resuming from checkpoint with {chunkIndex.Count:N0} already-copied chunks");
+                processedChunks = chunkIndex.Keys.ToHashSet(StringComparer.OrdinalIgnoreCase);
+            }
+
+            // A crash could have landed after a segment became logically complete (its chunks are
+            // all in this already-loaded target state) but before it was physically deleted. This
+            // is a crash-recovery hygiene check, not a "resume the copy" decision - it must run
+            // whenever there's pre-existing target state, even if the caller passed -no-resume for
+            // the copy loop itself (that flag only affects which chunks get re-read, never whether
+            // an already-drained source segment is safe to clean up).
+            if (deleteSourceAsWeGo && chunkIndex.Count > 0)
+            {
+                DeleteDrainedSourceSegments(source, sourceChunksBySegment, deletedSegments);
+
+                // The sweep above may have just deleted a source segment whose chunks are already
+                // recorded here. -no-resume's "re-copy everything, don't trust the checkpoint" idea
+                // is fundamentally unsafe combined with this flag once any deletion has happened -
+                // there's nothing left to re-read. Chunks already in this index must always be
+                // skipped in this mode, regardless of resumeFromCheckpoint.
+                if (processedChunks == null)
+                {
+                    Console.WriteLine($"Note: -no-resume does not apply to the {chunkIndex.Count:N0} chunks already recorded here - " +
+                        "-delete-source-as-we-go may have already deleted their only source copy, so they can't be re-read regardless.");
+                    processedChunks = chunkIndex.Keys.ToHashSet(StringComparer.OrdinalIgnoreCase);
+                }
+            }
+
+            var sortedShas = sourceChunks
+                .Select(c => c.Sha)
+                .OrderBy(sha => sha, StringComparer.OrdinalIgnoreCase)
+                .ToList();
+
+            if (processedChunks != null)
+            {
+                var originalCount = sortedShas.Count;
+                sortedShas = sortedShas.Where(sha => !processedChunks.Contains(sha)).ToList();
+                Console.WriteLine($"Skipping {originalCount - sortedShas.Count:N0} already-copied chunks from checkpoint");
+            }
+
+            if (sortedShas.Count == 0)
+            {
+                Console.WriteLine("No chunks to copy (all already copied)");
+                return;
+            }
+
+            Console.WriteLine($"Copying {sortedShas.Count:N0} chunks in alphanumeric order...");
+
+            // Pairs every checkpoint save with the deletion sweep it gates, structurally rather
+            // than by convention - a future new checkpoint-save call site (a different trigger, an
+            // early-exit path) gets the pairing for free just by calling this instead of
+            // SaveCheckpoint() directly, instead of having to remember to add the "if
+            // (deleteSourceAsWeGo) DeleteDrainedSourceSegments(...)" that follows it by hand.
+            void SaveCheckpointAndDrain()
+            {
+                SaveCheckpoint();
+                if (deleteSourceAsWeGo)
+                {
+                    DeleteDrainedSourceSegments(source, sourceChunksBySegment, deletedSegments);
+                }
+            }
+
+            var totalChunks = sortedShas.Count;
+            var copiedCount = 0;
+            var skippedCount = 0;
+            var checkpointCounter = 0;
+            var lastCheckpointTime = DateTime.Now;
+
+            for (var i = 0; i < totalChunks; i += batchSize)
+            {
+                var batch = sortedShas.Skip(i).Take(batchSize).ToList();
+
+                // Step 1: Read batch in parallel from the source chunkstore
+                var chunkData = new (string Sha, byte[] Content)[batch.Count];
+                var options = new ParallelOptions { MaxDegreeOfParallelism = maxParallelism };
+
+                await Parallel.ForEachAsync(batch.Select((sha, idx) => (sha, idx)), options, (item, ct) =>
+                {
+                    var (sha, index) = item;
+
+                    // Skip if already copied (fast check, e.g. duplicate SHA races across batches)
+                    if (ChunkExists(Convert.FromHexString(sha)))
+                    {
+                        chunkData[index] = (sha, null);
+                    }
+                    else
+                    {
+                        var content = source.GetChunk(Convert.FromHexString(sha), process: false);
+                        chunkData[index] = (sha, content);
+                    }
+
+                    return ValueTask.CompletedTask;
+                });
+
+                // Step 2: Write batch sequentially in sorted order
+                foreach (var (sha, content) in chunkData)
+                {
+                    if (content == null)
+                    {
+                        skippedCount++;
+                        continue;
+                    }
+
+                    var shaBytes = Convert.FromHexString(sha);
+                    if (WriteChunk(shaBytes, content))
+                    {
+                        // Before this chunk's only other copy can ever be deleted, confirm the
+                        // bytes that landed in the new CSD actually match what was read - this
+                        // catches a bad write (truncation, disk error), not pre-existing archive
+                        // corruption (that's chunkstore verify's job, and would need a depot key
+                        // to check - a raw byte comparison doesn't).
+                        if (deleteSourceAsWeGo)
+                        {
+                            var metadata = chunkIndex[sha];
+                            var (writtenCsdPath, _) = files[metadata.ChunkstoreIndex - 1];
+                            byte[] readBack;
+                            using (var verifyStream = File.OpenRead(writtenCsdPath))
+                            {
+                                verifyStream.Seek(metadata.Offset, SeekOrigin.Begin);
+                                readBack = new byte[metadata.Length];
+                                verifyStream.ReadExactly(readBack);
+                            }
+
+                            if (!readBack.AsSpan().SequenceEqual(content))
+                            {
+                                throw new InvalidDataException(
+                                    $"Post-write verification failed for chunk {sha}: bytes read back from " +
+                                    "the new chunkstore don't match what was written. Aborting before any " +
+                                    "source data is deleted.");
+                            }
+                        }
+
+                        copiedCount++;
+                        checkpointCounter++;
+
+                        if (copiedCount % 100 == 0)
+                        {
+                            Console.WriteLine($"Copied {Util.FormatProgress(copiedCount, totalChunks)} chunks");
+                        }
+
+                        if (checkpointInterval > 0 && (
+                            checkpointCounter >= checkpointInterval ||
+                            (DateTime.Now - lastCheckpointTime).TotalMinutes >= 5))
+                        {
+                            Console.WriteLine("Saving checkpoint...");
+                            // Only now that the checkpoint recording their new location is durably
+                            // on disk is it safe to delete any old segment that's fully drained -
+                            // deleting right after WriteChunk (before this) would risk losing data
+                            // that's physically written but has no surviving record of where.
+                            SaveCheckpointAndDrain();
+                            checkpointCounter = 0;
+                            lastCheckpointTime = DateTime.Now;
+                            Console.WriteLine($"Checkpoint saved ({chunkIndex.Count:N0} chunks indexed)");
+                        }
+                    }
+                    else
+                    {
+                        skippedCount++;
+                    }
+                }
+            }
+
+            // Finalize current CSM
+            if (currentFileIndex > 0)
+            {
+                Console.WriteLine("Writing CSM metadata...");
+                WriteCSM(currentFileIndex);
+            }
+
+            // Save final checkpoint then immediately clear it on success
+            if (checkpointInterval > 0)
+            {
+                Console.WriteLine("Saving final checkpoint...");
+                SaveCheckpointAndDrain();
+
+                Console.WriteLine("Clearing checkpoint (operation complete)...");
+                ClearCheckpoint();
+            }
+
+            Console.WriteLine($"Rebuild copy complete: {copiedCount:N0} copied, {skippedCount:N0} skipped");
+            Console.WriteLine($"Total chunks in chunkstore: {chunkIndex.Count:N0}");
+        }
+
+        /// <summary>
+        /// Deletes any old source segment whose every chunk is now confirmed present in this
+        /// (target) chunkstore's chunk index - called only right after that index has just been
+        /// durably checkpointed, never immediately after an individual WriteChunk, so a segment
+        /// is never removed based on state that could still vanish in a crash. Failing to delete
+        /// a given segment (e.g. a permissions error) is logged and skipped, not fatal - the copy
+        /// itself is already correct either way, this only affects how much space gets reclaimed.
+        /// </summary>
+        private void DeleteDrainedSourceSegments(Chunkstore source, Dictionary<int, List<string>> sourceChunksBySegment, HashSet<int> deletedSegments)
+        {
+            foreach (var (segmentIndex, shas) in sourceChunksBySegment)
+            {
+                if (deletedSegments.Contains(segmentIndex) || !shas.All(chunkIndex.ContainsKey))
+                {
+                    continue;
+                }
+
+                try
+                {
+                    var csdPath = source.GetCsdPath(segmentIndex);
+                    var csmPath = csdPath != null ? Path.ChangeExtension(csdPath, ".csm") : null;
+
+                    if (csdPath != null && File.Exists(csdPath))
+                    {
+                        File.Delete(csdPath);
+                    }
+
+                    if (csmPath != null && File.Exists(csmPath))
+                    {
+                        File.Delete(csmPath);
+                    }
+
+                    deletedSegments.Add(segmentIndex);
+                    Console.WriteLine($"Deleted drained source segment {segmentIndex} (all {shas.Count:N0} chunks confirmed in new store)");
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"Warning: failed to delete drained source segment {segmentIndex}: {ex.Message}");
+                }
+            }
+        }
+
+        /// <summary>
         /// Packs a single chunk file into the chunkstore.
         /// Useful for incremental additions or when processing files one at a time.
         /// </summary>
@@ -1087,16 +1407,8 @@ namespace DepotDownloader
             }
 
             var fileName = Path.GetFileName(chunkFile);
-            var sha = fileName;
 
-            // Remove _decrypted suffix if present
-            if (!isEncrypted.GetValueOrDefault() && sha.EndsWith("_decrypted"))
-            {
-                sha = sha[..^"_decrypted".Length];
-            }
-
-            // Validate SHA1 format
-            if (sha.Length != 40 || !sha.All(c => char.IsAsciiHexDigit(c)))
+            if (!TryGetChunkSha(fileName, isEncrypted.GetValueOrDefault(), out var sha))
             {
                 throw new InvalidOperationException($"Invalid SHA1 filename: {fileName}");
             }
@@ -1138,10 +1450,7 @@ namespace DepotDownloader
         {
             Directory.CreateDirectory(outputFolder);
 
-            if (maxParallelism <= 0)
-            {
-                maxParallelism = Math.Max(1, Environment.ProcessorCount - 1);
-            }
+            maxParallelism = Util.ResolveParallelism(maxParallelism);
 
             var allChunks = chunkIndex.Values.ToList();
             Console.WriteLine($"Unpacking {allChunks.Count} chunks...");
@@ -1151,31 +1460,29 @@ namespace DepotDownloader
             var skippedCount = 0;
             var lockObj = new object();
 
-            await Parallel.ForEachAsync(allChunks, options, async (chunk, ct) =>
+            await Parallel.ForEachAsync(allChunks, options, (chunk, ct) =>
             {
-                await Task.Run(() =>
+                var fileName = chunk.Sha;
+                if (!isEncrypted.GetValueOrDefault())
                 {
-                    var fileName = chunk.Sha;
-                    if (!isEncrypted.GetValueOrDefault())
-                    {
-                        fileName += "_decrypted";
-                    }
+                    fileName += "_decrypted";
+                }
 
-                    var outputPath = Path.Combine(outputFolder, fileName);
+                var outputPath = Path.Combine(outputFolder, fileName);
 
-                    if (skipExisting && File.Exists(outputPath))
+                if (skipExisting && File.Exists(outputPath))
+                {
+                    lock (lockObj)
                     {
-                        lock (lockObj)
+                        skippedCount++;
+                        if ((unpackedCount + skippedCount) % 100 == 0)
                         {
-                            skippedCount++;
-                            if ((unpackedCount + skippedCount) % 100 == 0)
-                            {
-                                Console.WriteLine($"Progress: {unpackedCount + skippedCount}/{allChunks.Count} ({((unpackedCount + skippedCount) * 100.0 / allChunks.Count):F1}%)");
-                            }
+                            Console.WriteLine($"Progress: {Util.FormatProgress(unpackedCount + skippedCount, allChunks.Count)}");
                         }
-                        return;
                     }
-
+                }
+                else
+                {
                     try
                     {
                         var (csdPath, _) = files[chunk.ChunkstoreIndex - 1];
@@ -1197,7 +1504,7 @@ namespace DepotDownloader
                             unpackedCount++;
                             if (unpackedCount % 100 == 0)
                             {
-                                Console.WriteLine($"Unpacked {unpackedCount}/{allChunks.Count} chunks ({(unpackedCount * 100.0 / allChunks.Count):F1}%)");
+                                Console.WriteLine($"Unpacked {Util.FormatProgress(unpackedCount, allChunks.Count)} chunks");
                             }
                         }
                     }
@@ -1205,7 +1512,9 @@ namespace DepotDownloader
                     {
                         Console.WriteLine($"Error unpacking {fileName}: {ex.Message}");
                     }
-                }, ct);
+                }
+
+                return ValueTask.CompletedTask;
             });
 
             Console.WriteLine($"Unpack complete: {unpackedCount} unpacked, {skippedCount} skipped");
@@ -1223,10 +1532,7 @@ namespace DepotDownloader
         {
             Directory.CreateDirectory(outputFolder);
 
-            if (maxParallelism <= 0)
-            {
-                maxParallelism = Math.Max(1, Environment.ProcessorCount - 1);
-            }
+            maxParallelism = Util.ResolveParallelism(maxParallelism);
 
             // Filter to only chunks that exist
             var chunksToUnpack = shaList
@@ -1256,24 +1562,22 @@ namespace DepotDownloader
             var skippedCount = 0;
             var lockObj = new object();
 
-            await Parallel.ForEachAsync(chunksToUnpack, options, async (chunk, ct) =>
+            await Parallel.ForEachAsync(chunksToUnpack, options, (chunk, ct) =>
             {
-                await Task.Run(() =>
+                var fileName = chunk.Sha;
+                if (!isEncrypted.GetValueOrDefault())
                 {
-                    var fileName = chunk.Sha;
-                    if (!isEncrypted.GetValueOrDefault())
-                    {
-                        fileName += "_decrypted";
-                    }
+                    fileName += "_decrypted";
+                }
 
-                    var outputPath = Path.Combine(outputFolder, fileName);
+                var outputPath = Path.Combine(outputFolder, fileName);
 
-                    if (skipExisting && File.Exists(outputPath))
-                    {
-                        lock (lockObj) { skippedCount++; }
-                        return;
-                    }
-
+                if (skipExisting && File.Exists(outputPath))
+                {
+                    lock (lockObj) { skippedCount++; }
+                }
+                else
+                {
                     try
                     {
                         var (csdPath, _) = files[chunk.ChunkstoreIndex - 1];
@@ -1299,7 +1603,9 @@ namespace DepotDownloader
                     {
                         Console.WriteLine($"Error unpacking {fileName}: {ex.Message}");
                     }
-                }, ct);
+                }
+
+                return ValueTask.CompletedTask;
             });
 
             Console.WriteLine($"Unpack complete: {unpackedCount} unpacked, {skippedCount} skipped");
@@ -1387,7 +1693,7 @@ namespace DepotDownloader
             currentCsd = Path.Combine(folder, baseName + ".csd");
             currentCsm = Path.Combine(folder, baseName + ".csm");
             files.Add((currentCsd, currentCsm));
-            chunksPerFile.Add(new List<ChunkMetadata>());
+            chunksPerFile.Add([]);
             currentFileSize = 0;
 
             // Create empty CSD file

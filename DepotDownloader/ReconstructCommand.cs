@@ -2,18 +2,21 @@
 // in file 'LICENSE', which is part of this source code package.
 
 using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Text.RegularExpressions;
 using System.Threading.Tasks;
 
 namespace DepotDownloader
 {
     /// <summary>
-    /// Reconstruct command handler for all reconstruction-related operations
+    /// Reconstruct command handler: rebuilds installed depot files entirely offline from a
+    /// saved manifest, a depot key, and previously-archived chunk data (loose files or a
+    /// chunkstore). The actual assembly algorithm lives in <see cref="ReconstructEngine"/>;
+    /// this class only handles argument parsing and wiring, matching the other commands' shape.
     /// </summary>
     public static class ReconstructCommand
     {
-        /// <summary>
-        /// Run reconstruct command with sub-command syntax
-        /// </summary>
         public static async Task<int> RunAsync(string[] args)
         {
             if (args.Length == 0)
@@ -22,50 +25,236 @@ namespace DepotDownloader
                 return 1;
             }
 
-            Console.WriteLine("Reconstruct command is not yet implemented.");
-            Console.WriteLine();
-            Console.WriteLine("This command will process raw depot chunks into installed files,");
-            Console.WriteLine("similar to the original DepotDownloader behavior but operating on archived chunks.");
-            Console.WriteLine();
-            Console.WriteLine("Planned usage:");
-            Console.WriteLine($"  depotdownloader reconstruct {string.Join(" ", args)}");
-            Console.WriteLine();
-            Console.WriteLine("Use 'depotdownloader help reconstruct' for more details.");
+            var parser = new ArgParser(args);
 
-            return await Task.FromResult(1);
+            var manifestFile = parser.Get<string>(null, "-manifest") ?? parser.Positional(0);
+            if (string.IsNullOrEmpty(manifestFile))
+            {
+                Console.WriteLine("Error: a manifest file is required (positional argument or -manifest <file>)");
+                PrintUsage();
+                return 1;
+            }
+
+            if (!File.Exists(manifestFile))
+            {
+                Console.WriteLine($"Error: Manifest file not found: {manifestFile}");
+                return 1;
+            }
+
+            var outputDir = parser.Get<string>(null, "-output");
+            if (string.IsNullOrEmpty(outputDir))
+            {
+                Console.WriteLine("Error: -output <dir> is required");
+                return 1;
+            }
+
+            var depotId = parser.GetNullable<uint>("-depot", "-d");
+            var depotKeyHex = parser.Get<string>(null, "-depotkey");
+            var depotKeyFile = parser.Get<string>(null, "-depotkey-file");
+            var chunksDir = parser.Get<string>(null, "-chunks");
+            var chunkstoreDir = parser.Get<string>(null, "-chunkstore");
+            var fileListPath = parser.Get<string>(null, "-filelist");
+            var validate = parser.HasFlag("-validate");
+            var maxThreads = parser.Get(0, "-threads");
+            var failFast = parser.HasFlag("-fail-fast");
+            var verbose = parser.HasFlag("-verbose", "-v");
+            parser.WarnUnconsumed();
+
+            if (!string.IsNullOrEmpty(chunksDir) && !string.IsNullOrEmpty(chunkstoreDir))
+            {
+                Console.WriteLine("Error: -chunks and -chunkstore are mutually exclusive - pick one chunk source");
+                return 1;
+            }
+
+            // Resolve the depot key first (best-effort - it may turn out not to be needed, e.g.
+            // a .manifest input plus an already-decrypted chunkstore, but almost every real case
+            // needs it, and .manif4/.manif5 inputs always do to decrypt filenames).
+            byte[] depotKey = null;
+            try
+            {
+                var (key, resolvedDepotId) = await ManifestCommand.ResolveDepotKeyAsync(depotKeyHex, depotKeyFile, depotId, manifestFile);
+                depotKey = key;
+                depotId ??= resolvedDepotId;
+            }
+            catch (Exception ex)
+            {
+                // Not fatal here - a .manifest file doesn't strictly need a key to load. Whether
+                // a key is actually required gets decided once we know the chunk source below.
+                Console.WriteLine($"Note: could not resolve a depot key up front ({ex.Message})");
+            }
+
+            SteamKit2.DepotManifest manifest;
+            try
+            {
+                manifest = await ManifestCommand.LoadDepotManifestFromAnyFormat(manifestFile, depotKey);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error: Failed to load manifest: {ex.Message}");
+                return 1;
+            }
+
+            depotId ??= manifest.DepotID != 0 ? manifest.DepotID : null;
+
+            IChunkSource chunkSource;
+            try
+            {
+                chunkSource = ResolveChunkSource(chunksDir, chunkstoreDir, manifestFile, depotId, depotKey);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error: {ex.Message}");
+                return 1;
+            }
+
+            using (chunkSource)
+            {
+                var options = new ReconstructOptions
+                {
+                    MaxParallelism = maxThreads,
+                    Validate = validate,
+                    FailFast = failFast,
+                    Verbose = verbose
+                };
+
+                if (!string.IsNullOrEmpty(fileListPath))
+                {
+                    if (!TryParseFileList(fileListPath, out var includeFiles, out var includeRegexes))
+                    {
+                        return 1;
+                    }
+
+                    options.IncludeFiles = includeFiles;
+                    options.IncludeRegexes = includeRegexes;
+                }
+
+                Console.WriteLine($"Reconstructing {manifest.Files.Count:N0} manifest entries to {outputDir}...");
+
+                ReconstructSummary summary;
+                try
+                {
+                    summary = await ReconstructEngine.RunAsync(manifest, chunkSource, outputDir, options);
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"Error: {ex.Message}");
+                    return 1;
+                }
+
+                Console.WriteLine();
+                Console.WriteLine("=== RECONSTRUCT SUMMARY ===");
+                Console.WriteLine($"Total:              {summary.TotalFiles:N0}");
+                Console.WriteLine($"Completed:          {summary.CompletedFiles:N0}");
+                if (summary.FailedFiles > 0)
+                    Console.WriteLine($"Failed:             {summary.FailedFiles:N0}");
+                if (summary.ValidationFailures > 0)
+                    Console.WriteLine($"Validation failed:  {summary.ValidationFailures:N0}");
+                if (summary.SkippedSymlinks > 0)
+                    Console.WriteLine($"Symlinks skipped:   {summary.SkippedSymlinks:N0}");
+
+                return summary.FailedFiles > 0 || summary.ValidationFailures > 0 ? 1 : 0;
+            }
+        }
+
+        private static IChunkSource ResolveChunkSource(string chunksDir, string chunkstoreDir, string manifestFile, uint? depotId, byte[] depotKey)
+        {
+            if (!string.IsNullOrEmpty(chunkstoreDir))
+            {
+                if (!Directory.Exists(chunkstoreDir))
+                {
+                    throw new DirectoryNotFoundException($"Chunkstore folder does not exist: {chunkstoreDir}");
+                }
+
+                var chunkstore = new Chunkstore(chunkstoreDir, depotId, depotKey, readOnly: true);
+                if (chunkstore.IsEncrypted == true && depotKey == null)
+                {
+                    chunkstore.Dispose();
+                    throw new InvalidOperationException("Chunkstore is encrypted but no depot key was resolved - use -depotkey or -depotkey-file");
+                }
+
+                return new ChunkstoreChunkSource(chunkstore, ownsChunkstore: true);
+            }
+
+            var looseDir = chunksDir;
+            if (string.IsNullOrEmpty(looseDir))
+            {
+                if (depotId == null)
+                {
+                    throw new InvalidOperationException("No -chunks or -chunkstore given, and depot ID couldn't be determined to auto-detect one - specify one explicitly");
+                }
+
+                // Mirror the raw-archive layout's convention (depot/<id>/chunk), relative to the
+                // manifest's own location if it lives under that same layout.
+                var manifestDir = Path.GetDirectoryName(Path.GetFullPath(manifestFile));
+                var candidate = Path.Combine(manifestDir ?? ".", "..", "chunk");
+                if (!Directory.Exists(candidate))
+                {
+                    candidate = Path.Combine("depot", depotId.Value.ToString(), "chunk");
+                }
+
+                looseDir = candidate;
+                Console.WriteLine($"Auto-detected loose chunk folder: {looseDir}");
+            }
+
+            if (!Directory.Exists(looseDir))
+            {
+                throw new DirectoryNotFoundException($"Chunk folder does not exist: {looseDir}");
+            }
+
+            if (depotKey == null)
+            {
+                throw new InvalidOperationException("Loose archived chunks are always encrypted and need a depot key - use -depotkey or -depotkey-file");
+            }
+
+            return new LooseChunkSource(looseDir, depotKey);
+        }
+
+        /// <summary>Same literal-path/"regex:"-prefix format as -filelist elsewhere in this codebase (see DownloadCommand.cs).</summary>
+        private static bool TryParseFileList(string fileListPath, out HashSet<string> includeFiles, out List<Regex> includeRegexes)
+        {
+            if (!Util.TryParseFileList(fileListPath, out includeFiles, out includeRegexes, out var error))
+            {
+                Console.WriteLine($"Error: {error}");
+                return false;
+            }
+
+            Console.WriteLine($"Using filelist: '{fileListPath}'.");
+            return true;
         }
 
         public static void PrintUsage()
         {
             Console.WriteLine();
-            Console.WriteLine("Reconstruct Command (Coming Soon)");
+            Console.WriteLine("Reconstruct Command");
             Console.WriteLine();
-            Console.WriteLine("The reconstruct command will process raw depot chunks into installed files,");
-            Console.WriteLine("similar to the original DepotDownloader behavior but operating on archived chunks.");
+            Console.WriteLine("Rebuilds installed depot files entirely offline from a saved manifest, a depot");
+            Console.WriteLine("key, and previously-archived chunk data (loose files or a chunkstore).");
             Console.WriteLine();
             Console.WriteLine("USAGE:");
-            Console.WriteLine("  depotdownloader reconstruct <depot-path> [OPTIONS...]");
+            Console.WriteLine("  depotdownloader reconstruct <manifest-file> [OPTIONS...]");
             Console.WriteLine();
             Console.WriteLine("OPTIONS:");
-            Console.WriteLine("  -output <dir>            - output directory for reconstructed files");
-            Console.WriteLine("  -filelist <file>         - only reconstruct specific files");
-            Console.WriteLine("  -validate                - verify file integrity during reconstruction");
-            Console.WriteLine("  -manifest <file>         - use specific manifest for reconstruction");
+            Console.WriteLine("  -manifest <file>         Manifest file (alternative to the positional argument)");
+            Console.WriteLine("  -output <dir>            Output directory for reconstructed files (required)");
+            Console.WriteLine("  -depot <id>              Depot ID (for key lookup / chunk source auto-detect)");
+            Console.WriteLine("  -depotkey <hex>          Depot key in hex");
+            Console.WriteLine("  -depotkey-file <path>    Path to depot key file");
+            Console.WriteLine("  -chunks <dir>            Loose chunk folder (default: auto-detect depot/<id>/chunk)");
+            Console.WriteLine("  -chunkstore <dir>        Packed chunkstore folder (mutually exclusive with -chunks)");
+            Console.WriteLine("  -filelist <file>         Only reconstruct files matching this list (literal paths");
+            Console.WriteLine("                           or \"regex:<pattern>\" lines)");
+            Console.WriteLine("  -validate                Verify each file's whole-content SHA1 after writing");
+            Console.WriteLine("  -threads <count>         Max parallel file writers (default: CPU count - 1)");
+            Console.WriteLine("  -fail-fast               Stop enqueuing further files after the first failure");
+            Console.WriteLine("  -verbose, -v             Show per-file progress output");
             Console.WriteLine();
-            Console.WriteLine("BENEFITS:");
-            Console.WriteLine("  • Convert raw depot archives back into playable/usable file structures");
-            Console.WriteLine("  • Extract specific files from depot archives");
-            Console.WriteLine("  • Verify file integrity during reconstruction");
-            Console.WriteLine("  • Process depots without requiring Steam login");
+            Console.WriteLine("Every in-scope file is always rewritten from scratch - reconstruct is safe to");
+            Console.WriteLine("re-run after an interruption, nothing partial is ever trusted or reused.");
             Console.WriteLine();
             Console.WriteLine("EXAMPLES:");
-            Console.WriteLine("  depotdownloader reconstruct depot/12345 -output games/app");
-            Console.WriteLine("  depotdownloader reconstruct depot/12345 -filelist important_files.txt");
-            Console.WriteLine("  depotdownloader reconstruct depot/12345 -validate -output games/app");
-            Console.WriteLine();
-            Console.WriteLine("This command is not yet implemented. Current alternatives:");
-            Console.WriteLine("  1. Download with -raw mode: depotdownloader download -app 123 -depot 456 -raw");
-            Console.WriteLine("  2. Manually extract files from depot archives using third-party tools");
+            Console.WriteLine("  depotdownloader reconstruct depot/4001/manifest/123.manifest -output game/ -depot 4001");
+            Console.WriteLine("  depotdownloader reconstruct depot/4001/manifest/123.manif5 -output game/ -depotkey-file depot/4001/4001.depotkey");
+            Console.WriteLine("  depotdownloader reconstruct depot/4001/manifest/123.manifest -output game/ -chunkstore chunkstore/ -validate");
         }
     }
 }
