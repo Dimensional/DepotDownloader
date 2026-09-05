@@ -1,6 +1,7 @@
 // This file is subject to the terms and conditions defined
 // in file 'LICENSE', which is part of this source code package.
 
+using System;
 using System.Collections.Generic;
 using System.ComponentModel;
 using System.IO;
@@ -138,7 +139,26 @@ namespace DepotDownloader
         {
             if (File.Exists(path))
             {
-                return CheckpointFile.Load<WorkshopCatalog>(path);
+                // CheckpointFile.Save only ever renames a fully-written ".tmp" over the real path,
+                // so a crash mid-write can never leave a torn/partial file here - what's on disk is
+                // always either the previous fully-valid save or the new one, never a mix. The
+                // remaining realistic risk is post-write corruption (disk bit-rot, a manual edit) or
+                // a schema mismatch (an older/newer build's catalog). protobuf-net's wire format is
+                // self-describing (field number + wire type per field), so garbled bytes fail to
+                // parse rather than silently landing in the wrong typed field - but surface that as
+                // a clear, actionable message instead of a raw ProtoException stack trace.
+                try
+                {
+                    return CheckpointFile.Load<WorkshopCatalog>(path);
+                }
+                catch (Exception ex)
+                {
+                    throw new InvalidDataException(
+                        $"Workshop catalog at '{path}' could not be read (it may be corrupt, truncated, or from an " +
+                        $"incompatible version). Delete it and re-run 'workshop bootstrap' to rebuild it - this app's " +
+                        $"downloaded content is not affected, only the tracking catalog. Underlying error: {ex.Message}",
+                        ex);
+                }
             }
 
             return new WorkshopCatalog { AppId = appId };

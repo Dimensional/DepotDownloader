@@ -201,15 +201,54 @@ namespace DepotDownloader
 
             var appId = parser.GetNullable<uint>("-app", "-appid");
             var output = parser.Get<string>(null, "-output", "-dir");
+            var list = parser.HasFlag("-list");
+            var kindRaw = parser.Get<string>(null, "-kind");
+            var onlyRaw = parser.Get<string>(null, "-only");
+            var limit = parser.Get<uint>(200, "-limit");
             parser.WarnUnconsumed();
 
             if (appId == null)
             {
                 Console.WriteLine("Usage: depotdownloader workshop status -app <appid> [-output <dir>]");
+                Console.WriteLine("       depotdownloader workshop status -app <appid> -list [-kind chunk|ancient|unknown] [-only <id,id2,...>] [-limit N]");
                 return 1;
             }
 
-            return ContentDownloader.PrintWorkshopCatalogStatus(appId.Value, output);
+            var statusResult = ContentDownloader.PrintWorkshopCatalogStatus(appId.Value, output);
+            if (!list || statusResult != 0)
+            {
+                return statusResult;
+            }
+
+            WorkshopItemKind? kindFilter = null;
+            if (!string.IsNullOrWhiteSpace(kindRaw))
+            {
+                switch (kindRaw.Trim().ToLowerInvariant())
+                {
+                    case "chunk" or "chunkbased" or "chunk-based": kindFilter = WorkshopItemKind.ChunkBased; break;
+                    case "ancient" or "ancientugc" or "ancient-ugc" or "ugc": kindFilter = WorkshopItemKind.AncientUgc; break;
+                    case "unknown" or "unclassified": kindFilter = WorkshopItemKind.Unknown; break;
+                    default:
+                        Console.WriteLine($"Error: unrecognized -kind '{kindRaw}' - expected chunk, ancient, or unknown.");
+                        return 1;
+                }
+            }
+
+            HashSet<ulong> onlyIds = null;
+            if (!string.IsNullOrWhiteSpace(onlyRaw))
+            {
+                onlyIds = [];
+                foreach (var part in onlyRaw.Split(','))
+                {
+                    if (ulong.TryParse(part.Trim(), out var id))
+                    {
+                        onlyIds.Add(id);
+                    }
+                }
+            }
+
+            Console.WriteLine();
+            return ContentDownloader.PrintWorkshopCatalogList(appId.Value, output, onlyIds, kindFilter, limit);
         }
 
         private static bool LogOn(string username, string password, bool rememberPassword)
@@ -257,7 +296,7 @@ namespace DepotDownloader
             Console.WriteLine("  depotdownloader workshop poll -app <appid> [OPTIONS...]");
             Console.WriteLine("  depotdownloader workshop download -app <appid> [OPTIONS...]");
             Console.WriteLine("  depotdownloader workshop download -workshop <id> [<id>...] [OPTIONS...]");
-            Console.WriteLine("  depotdownloader workshop status -app <appid> [-output <dir>]");
+            Console.WriteLine("  depotdownloader workshop status -app <appid> [-output <dir>] [-list [OPTIONS...]]");
             Console.WriteLine();
             Console.WriteLine("BOOTSTRAP - one-time (per app), walks the entire workshop via QueryFiles to record");
             Console.WriteLine("            every item's current state (classifying each one chunk-based vs. ancient");
@@ -312,6 +351,16 @@ namespace DepotDownloader
             Console.WriteLine("  -dry-run           Report what would be checked/downloaded - fetches nothing at all");
             Console.WriteLine("  -manifests-only    Same meaning as on \"download\" above");
             Console.WriteLine();
+            Console.WriteLine("STATUS - summary counts by default. Add -list for the actual per-item view (there is");
+            Console.WriteLine("         no other way to inspect a catalog - workshop_catalog.bin is protobuf/Deflate,");
+            Console.WriteLine("         not a text format meant to be opened directly). Sorted by ID for stable,");
+            Console.WriteLine("         diffable output across runs.");
+            Console.WriteLine("  -list              Print each matching item: ID, kind, manifest ID, last update/seen");
+            Console.WriteLine("                     time, title");
+            Console.WriteLine("    -kind <k>            Filter: chunk, ancient, or unknown");
+            Console.WriteLine("    -only <id,id2,...>   Filter to specific IDs");
+            Console.WriteLine("    -limit <n>           Cap rows printed (default 200; 0 = no limit)");
+            Console.WriteLine();
             Console.WriteLine("COMMON OPTIONS:");
             Console.WriteLine("  -output <dir>      Root output directory (default: current directory, same as");
             Console.WriteLine("                     \"download -raw\" - catalog and manifests land under depot/<appid>/)");
@@ -326,6 +375,7 @@ namespace DepotDownloader
             Console.WriteLine("  depotdownloader workshop download -workshop 123456 789012        # ad-hoc, no bootstrap needed");
             Console.WriteLine("  depotdownloader workshop poll -app 4000 -username myaccount -remember-password");
             Console.WriteLine("  depotdownloader workshop status -app 4000");
+            Console.WriteLine("  depotdownloader workshop status -app 4000 -list -kind ancient -limit 50");
         }
     }
 }

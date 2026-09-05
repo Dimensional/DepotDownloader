@@ -659,7 +659,7 @@ depotdownloader workshop bootstrap -app <appid> [OPTIONS...]
 depotdownloader workshop download -app <appid> [OPTIONS...]
 depotdownloader workshop download -workshop <id> [<id>...] [OPTIONS...]
 depotdownloader workshop poll -app <appid> [OPTIONS...]
-depotdownloader workshop status -app <appid> [-output <dir>]
+depotdownloader workshop status -app <appid> [-output <dir>] [-list [-kind chunk|ancient|unknown] [-only <id,id2,...>] [-limit N]]
 ```
 
 **Bootstrap** (one-time per app, resumable): pages through the entire workshop via `QueryFiles`
@@ -770,6 +770,19 @@ anywhere (it isn't part of the public Steamworks Web API at all):**
 `download` can run anonymously; catalog-driven `download` inherits whatever the items themselves
 require; `poll` cannot run anonymously - see above).
 
+**Inspecting a catalog:** `status` alone prints only aggregate counts - `workshop_catalog.bin` is
+protobuf/Deflate, not a format meant to be opened directly, so `status -list` is the actual way to
+see what got recorded (one row per item: ID, kind, manifest/content handle, last-update/last-seen
+time, title). Sorted by ID, not dictionary order, so two snapshots print identically and diff
+cleanly. Defaults to the first 200 matching rows (`-limit 0` for all); narrow with `-kind
+chunk|ancient|unknown` and/or `-only <id,id2,...>`. On load, a corrupt/truncated/incompatible-
+version catalog fails loudly with a clear message rather than silently misreading it - protobuf-
+net's wire format is self-describing (field number + wire type per field), so garbled bytes fail to
+parse rather than landing in the wrong typed field, and `CheckpointFile`'s atomic tmp+move save
+(the same pattern this project uses everywhere else) means a crash mid-write can never leave a torn
+file behind in the first place - what's on disk is always either the previous complete save or the
+new one, never a mix.
+
 A brand-new item discovered only via `poll`/ad-hoc `download` (not previously seen during
 `bootstrap`) costs one extra `GetDetails` call to classify it (chunk-based vs. ancient) and learn
 its title, since `GetItemChanges` returns neither - this should be rare relative to updates on
@@ -797,6 +810,7 @@ depotdownloader workshop download -app 4000 -history -only 2956730580       # fu
 depotdownloader workshop download -workshop 123456 789012                   # ad-hoc, no bootstrap needed
 depotdownloader workshop poll -app 4000 -username myaccount -remember-password
 depotdownloader workshop status -app 4000
+depotdownloader workshop status -app 4000 -list -kind ancient -limit 50      # inspect the actual items
 ```
 
 ---

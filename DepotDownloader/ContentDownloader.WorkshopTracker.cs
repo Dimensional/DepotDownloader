@@ -459,6 +459,55 @@ namespace DepotDownloader
         }
 
         /// <summary>
+        /// "workshop status -list" - the actual per-item view of the catalog. Without this, the
+        /// only way to see what bootstrap/poll actually recorded was the aggregate counts above or
+        /// opening the protobuf/Deflate .bin file directly, which isn't human-readable and isn't a
+        /// real inspection path. Sorted by PublishedFileId (not dictionary/insertion order) so two
+        /// snapshots of the same catalog print identically and diff cleanly.
+        /// </summary>
+        public static int PrintWorkshopCatalogList(uint appId, string outputRoot, HashSet<ulong> onlyIds, WorkshopItemKind? kindFilter, uint limit)
+        {
+            outputRoot = ResolveOutputRoot(outputRoot);
+            var catalogPath = WorkshopCatalog.GetPath(outputRoot, appId);
+
+            if (!File.Exists(catalogPath))
+            {
+                Console.WriteLine($"No catalog found for app {appId} at {catalogPath}.");
+                return 1;
+            }
+
+            var catalog = WorkshopCatalog.LoadOrCreate(catalogPath, appId);
+
+            IEnumerable<WorkshopCatalogItem> items = catalog.Items.Values;
+            if (onlyIds is { Count: > 0 })
+            {
+                items = items.Where(i => onlyIds.Contains(i.PublishedFileId));
+            }
+            if (kindFilter != null)
+            {
+                items = items.Where(i => i.Kind == kindFilter.Value);
+            }
+
+            var matching = items.OrderBy(i => i.PublishedFileId).ToList();
+            var shown = limit == 0 ? matching : matching.Take((int)limit).ToList();
+
+            Console.WriteLine($"{"PublishedFileId",-20} {"Kind",-11} {"ManifestId",-20} {"TimeUpdated",-20} {"LastSeenAt",-20} Title");
+            foreach (var item in shown)
+            {
+                var updated = item.TimeUpdated == 0 ? "-" : DateTimeOffset.FromUnixTimeSeconds(item.TimeUpdated).ToString("u");
+                var seen = item.LastSeenAt == 0 ? "-" : DateTimeOffset.FromUnixTimeSeconds(item.LastSeenAt).ToString("u");
+                Console.WriteLine($"{item.PublishedFileId,-20} {item.Kind,-11} {item.ManifestId,-20} {updated,-20} {seen,-20} {item.Title}");
+            }
+
+            Console.WriteLine();
+            Console.WriteLine(shown.Count < matching.Count
+                ? $"Showing {shown.Count:N0} of {matching.Count:N0} matching item(s) - pass -limit 0 to print all, or narrow with -only/-kind."
+                : $"{matching.Count:N0} matching item(s).");
+
+            return 0;
+        }
+
+        /// <summary>
         /// Every historical entry for one item, fully paginated - most items have far fewer
         /// changes than one page, but this doesn't assume that. Returns an empty list (rather than
         /// throwing) on any failure, since a single item's history being unavailable shouldn't
