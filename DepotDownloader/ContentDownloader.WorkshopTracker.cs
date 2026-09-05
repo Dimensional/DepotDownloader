@@ -25,6 +25,43 @@ namespace DepotDownloader
     {
         #region Workshop Catalog (bootstrap + poll)
 
+        // A page-request every ~250ms is a deliberate pace, not a minimum - QueryFiles has no
+        // documented rate limit, but hammering it back-to-back with zero delay (as this loop
+        // originally did) is exactly the kind of behavior that gets an anonymous session throttled
+        // on a sustained multi-hour walk. Modest compared to raw manifest downloads' own 500ms
+        // per-new-manifest throttle, since a metadata-only page fetch is much cheaper than a real
+        // manifest download to begin with.
+        private static readonly TimeSpan WorkshopApiPacingDelay = TimeSpan.FromMilliseconds(250);
+
+        /// <summary>
+        /// Retries a transient network failure (confirmed in practice: an unhandled
+        /// TaskCanceledException from a unified-messages call crashed a real multi-hour bootstrap
+        /// run outright) with exponential backoff, up to maxAttempts. On the final attempt the
+        /// exception is left to propagate rather than retried again - callers further up (the
+        /// bootstrap/poll/download entry points) catch that and exit gracefully with progress
+        /// already saved, rather than this helper retrying forever on something that may not be
+        /// transient at all.
+        /// </summary>
+        private static async Task<T> WithTransientRetryAsync<T>(string operationName, Func<Task<T>> action, int maxAttempts = 5)
+        {
+            for (var attempt = 1; ; attempt++)
+            {
+                try
+                {
+                    return await action();
+                }
+                catch (Exception ex) when (attempt < maxAttempts && IsTransientNetworkException(ex))
+                {
+                    var delay = TimeSpan.FromSeconds(Math.Min(30, Math.Pow(2, attempt)));
+                    Console.WriteLine($"  {operationName} failed ({ex.GetType().Name}: {ex.Message}) - retrying in {delay.TotalSeconds:F0}s (attempt {attempt}/{maxAttempts})...");
+                    await Task.Delay(delay);
+                }
+            }
+        }
+
+        private static bool IsTransientNetworkException(Exception ex) =>
+            ex is TaskCanceledException or OperationCanceledException or System.Net.Http.HttpRequestException;
+
         public static async Task<int> BootstrapWorkshopCatalogAsync(uint appId, string outputRoot, uint pageSize, uint maxItems, uint queryType, bool manifestsOnly = false)
         {
             outputRoot = ResolveOutputRoot(outputRoot);
@@ -60,103 +97,130 @@ namespace DepotDownloader
             var pagesSinceSave = 0;
             var safetyPageBudget = int.MaxValue;
 
-            while (true)
+            try
             {
-                var (result, body) = await steam3.QueryFiles(appId, catalog.BootstrapCursor, pageSize, queryType);
-
-                if (result != EResult.OK || body == null)
+                while (true)
                 {
-                    Console.WriteLine($"QueryFiles failed: {result}. Progress saved - re-run the same command to resume.");
-                    catalog.Save(catalogPath);
-                    return 1;
-                }
+                    var (result, body) = await WithTransientRetryAsync("QueryFiles",
+                        () => steam3.QueryFiles(appId, catalog.BootstrapCursor, pageSize, queryType));
 
-                if (catalog.BootstrapTotalAsOfStart == 0)
-                {
-                    catalog.BootstrapTotalAsOfStart = body.total;
-                    // total/pageSize is a live/moving target on a churning workshop (items can be
-                    // added/removed mid-walk) - this is only a generous backstop against an
-                    // infinite loop from an API misbehavior, not a real progress estimate.
-                    safetyPageBudget = (int)(body.total / Math.Max(1u, pageSize)) * 3 + 1000;
-                }
-
-                var now = (uint)DateTimeOffset.UtcNow.ToUnixTimeSeconds();
-                foreach (var d in body.publishedfiledetails)
-                {
-                    // Same classification DownloadPubfileRawAsync itself uses - file_url wins
-                    // first. Confirmed empirically that ancient (2012-era) items still have
-                    // hcontent_file populated too, but it's just the CDN handle embedded in that
-                    // URL, not a depot manifest ID - Kind is what keeps "poll" from confusing them.
-                    var kind = !string.IsNullOrEmpty(d.file_url) ? WorkshopItemKind.AncientUgc : WorkshopItemKind.ChunkBased;
-
-                    catalog.Items[d.publishedfileid] = new WorkshopCatalogItem
+                    if (result != EResult.OK || body == null)
                     {
-                        PublishedFileId = d.publishedfileid,
-                        Title = d.title,
-                        Kind = kind,
-                        FileUrl = kind == WorkshopItemKind.AncientUgc ? d.file_url : null,
-                        ManifestId = d.hcontent_file,
-                        TimeUpdated = d.time_updated,
-                        LastSeenAt = now,
-                    };
+                        Console.WriteLine($"QueryFiles failed: {result}. Progress saved - re-run the same command to resume.");
+                        catalog.Save(catalogPath);
+                        return 1;
+                    }
 
-                    if (manifestsOnly)
+                    if (catalog.BootstrapTotalAsOfStart == 0)
                     {
-                        try
+                        catalog.BootstrapTotalAsOfStart = body.total;
+                        // total/pageSize is a live/moving target on a churning workshop (items can
+                        // be added/removed mid-walk) - this is only a generous backstop against an
+                        // infinite loop from an API misbehavior, not a real progress estimate.
+                        safetyPageBudget = (int)(body.total / Math.Max(1u, pageSize)) * 3 + 1000;
+                    }
+
+                    var now = (uint)DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+                    foreach (var d in body.publishedfiledetails)
+                    {
+                        // Same classification DownloadPubfileRawAsync itself uses - file_url wins
+                        // first. Confirmed empirically that ancient (2012-era) items still have
+                        // hcontent_file populated too, but it's just the CDN handle embedded in
+                        // that URL, not a depot manifest ID - Kind is what keeps "poll" from
+                        // confusing them.
+                        var kind = !string.IsNullOrEmpty(d.file_url) ? WorkshopItemKind.AncientUgc : WorkshopItemKind.ChunkBased;
+
+                        catalog.Items[d.publishedfileid] = new WorkshopCatalogItem
                         {
-                            // Reuses "d" (already fetched by this page's QueryFiles call) rather
-                            // than the single-argument overload, which would redundantly re-fetch
-                            // the same PublishedFileDetails via GetPublishedFileDetails per item -
-                            // doubling an already-expensive walk. Manifest-only for ChunkBased
-                            // (RawDownloadOptions.DryRun), metadata-logged-not-fetched for
-                            // AncientUgc (see DownloadWebFileToUGCAsync's dryRun handling).
-                            await DownloadPubfileRawAsync(d.publishedfileid, d, new RawDownloadOptions { OutputRoot = outputRoot, DryRun = true });
-                        }
-                        catch (Exception ex)
+                            PublishedFileId = d.publishedfileid,
+                            Title = d.title,
+                            Kind = kind,
+                            FileUrl = kind == WorkshopItemKind.AncientUgc ? d.file_url : null,
+                            ManifestId = d.hcontent_file,
+                            TimeUpdated = d.time_updated,
+                            LastSeenAt = now,
+                        };
+
+                        if (manifestsOnly)
                         {
-                            Console.WriteLine($"    Warning: manifest/metadata fetch failed for {d.publishedfileid}: {ex.Message}");
+                            try
+                            {
+                                // Reuses "d" (already fetched by this page's QueryFiles call)
+                                // rather than the single-argument overload, which would
+                                // redundantly re-fetch the same PublishedFileDetails via
+                                // GetPublishedFileDetails per item - doubling an already-expensive
+                                // walk. Manifest-only for ChunkBased (RawDownloadOptions.DryRun),
+                                // metadata-logged-not-fetched for AncientUgc (see
+                                // DownloadWebFileToUGCAsync's dryRun handling).
+                                await DownloadPubfileRawAsync(d.publishedfileid, d, new RawDownloadOptions { OutputRoot = outputRoot, DryRun = true });
+                            }
+                            catch (Exception ex)
+                            {
+                                Console.WriteLine($"    Warning: manifest/metadata fetch failed for {d.publishedfileid}: {ex.Message}");
+                            }
                         }
                     }
+
+                    Console.WriteLine($"  {catalog.Items.Count:N0} items recorded so far (of ~{body.total:N0} reported by Steam)...");
+
+                    // Compare against the cursor we just queried WITH (not the previous
+                    // request's) - this is what actually detects "the server stopped advancing".
+                    var donePaging = string.IsNullOrEmpty(body.next_cursor)
+                        || body.next_cursor == catalog.BootstrapCursor
+                        || body.publishedfiledetails.Count == 0;
+
+                    if (donePaging)
+                    {
+                        catalog.BootstrapCompleted = true;
+                        catalog.BootstrapCompletedAt = now;
+                        catalog.Save(catalogPath);
+                        Console.WriteLine($"Bootstrap complete: {catalog.Items.Count:N0} items recorded for app {appId}.");
+                        return 0;
+                    }
+
+                    catalog.BootstrapCursor = body.next_cursor;
+
+                    if (maxItems > 0 && catalog.Items.Count >= maxItems)
+                    {
+                        catalog.Save(catalogPath);
+                        Console.WriteLine($"Reached -max-items {maxItems} - stopping early (bootstrap NOT marked complete; re-run without -max-items to continue).");
+                        return 0;
+                    }
+
+                    // Every 5 pages (not 20) - a real multi-hour run losing more than ~500 items'
+                    // worth of already-fetched-but-unsaved progress to an interruption is a real
+                    // cost at this data's scale; the write itself is cheap (small protobuf+deflate
+                    // file).
+                    if (++pagesSinceSave >= 5)
+                    {
+                        catalog.Save(catalogPath);
+                        pagesSinceSave = 0;
+                    }
+
+                    if (--safetyPageBudget <= 0)
+                    {
+                        catalog.Save(catalogPath);
+                        Console.WriteLine("Warning: page count far exceeded the expected total - stopping to avoid an unbounded loop. Progress saved; re-run to resume, or investigate before continuing.");
+                        return 1;
+                    }
+
+                    // Deliberate pacing, not a rate-limit workaround we've confirmed exists - see
+                    // WorkshopApiPacingDelay.
+                    await Task.Delay(WorkshopApiPacingDelay);
                 }
-
-                Console.WriteLine($"  {catalog.Items.Count:N0} items recorded so far (of ~{body.total:N0} reported by Steam)...");
-
-                // Compare against the cursor we just queried WITH (not the previous request's) -
-                // this is what actually detects "the server stopped advancing".
-                var donePaging = string.IsNullOrEmpty(body.next_cursor)
-                    || body.next_cursor == catalog.BootstrapCursor
-                    || body.publishedfiledetails.Count == 0;
-
-                if (donePaging)
-                {
-                    catalog.BootstrapCompleted = true;
-                    catalog.BootstrapCompletedAt = now;
-                    catalog.Save(catalogPath);
-                    Console.WriteLine($"Bootstrap complete: {catalog.Items.Count:N0} items recorded for app {appId}.");
-                    return 0;
-                }
-
-                catalog.BootstrapCursor = body.next_cursor;
-
-                if (maxItems > 0 && catalog.Items.Count >= maxItems)
-                {
-                    catalog.Save(catalogPath);
-                    Console.WriteLine($"Reached -max-items {maxItems} - stopping early (bootstrap NOT marked complete; re-run without -max-items to continue).");
-                    return 0;
-                }
-
-                if (++pagesSinceSave >= 20)
-                {
-                    catalog.Save(catalogPath);
-                    pagesSinceSave = 0;
-                }
-
-                if (--safetyPageBudget <= 0)
-                {
-                    catalog.Save(catalogPath);
-                    Console.WriteLine("Warning: page count far exceeded the expected total - stopping to avoid an unbounded loop. Progress saved; re-run to resume, or investigate before continuing.");
-                    return 1;
-                }
+            }
+            catch (Exception ex) when (IsTransientNetworkException(ex))
+            {
+                // WithTransientRetryAsync's own retries are exhausted, or -manifests-only's
+                // DownloadPubfileRawAsync call threw one directly (that path isn't retried itself
+                // - a single item's manifest fetch failing is already just logged and skipped
+                // there, this only catches a genuinely unrecoverable one escaping that try/catch
+                // too). Progress is saved regardless - the whole point of resumable bootstrap is
+                // that this is a "re-run the same command" situation, not a crash.
+                Console.WriteLine($"Bootstrap stopped after repeated {ex.GetType().Name}s - this looks like throttling or a sustained network issue, not a bug in what's been recorded so far.");
+                catalog.Save(catalogPath);
+                Console.WriteLine($"Progress saved ({catalog.Items.Count:N0} items) - re-run the same command to resume.");
+                return 1;
             }
         }
 
@@ -187,7 +251,17 @@ namespace DepotDownloader
 
             Console.WriteLine($"Polling app {appId} for changes since {since} ({DateTimeOffset.FromUnixTimeSeconds(since):u})...");
 
-            var (result, body) = await steam3.GetItemChanges(appId, since);
+            EResult result;
+            CPublishedFile_GetItemChanges_Response body;
+            try
+            {
+                (result, body) = await WithTransientRetryAsync("GetItemChanges", () => steam3.GetItemChanges(appId, since));
+            }
+            catch (Exception ex) when (IsTransientNetworkException(ex))
+            {
+                Console.WriteLine($"Poll stopped after repeated {ex.GetType().Name}s - this looks like throttling or a sustained network issue. The watermark was not advanced, so a re-run will ask about the same window again.");
+                return 1;
+            }
             catalog.LastPolledAt = (uint)DateTimeOffset.UtcNow.ToUnixTimeSeconds();
             catalog.LastPollResult = result.ToString();
 
@@ -400,7 +474,8 @@ namespace DepotDownloader
             {
                 while (true)
                 {
-                    var (result, body) = await steam3.GetChangeHistory(publishedFileId, startIndex, pageSize);
+                    var (result, body) = await WithTransientRetryAsync("GetChangeHistory",
+                        () => steam3.GetChangeHistory(publishedFileId, startIndex, pageSize));
                     if (result != EResult.OK || body == null || body.changes.Count == 0)
                     {
                         break;
@@ -413,11 +488,14 @@ namespace DepotDownloader
                     {
                         break;
                     }
+
+                    await Task.Delay(WorkshopApiPacingDelay);
                 }
             }
             catch
             {
-                // Best-effort - fall through with whatever was gathered before the failure.
+                // Retries (see WithTransientRetryAsync) already exhausted - best-effort beyond
+                // that, fall through with whatever was gathered before the failure.
             }
 
             return all;

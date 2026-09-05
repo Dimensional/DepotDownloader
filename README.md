@@ -671,8 +671,19 @@ not a depot manifest ID; the classification is what keeps this from confusing th
 only by default** - it records metadata, it does not download any manifest/chunk/UGC content;
 that's `download`'s job (`-manifests-only` below is the opt-in exception, for prefetching manifests
 during the same walk). Expensive for a large workshop regardless - depot 4000 (Garry's Mod) alone
-reports **~2 million items** - but safe to interrupt and re-run; it resumes from its last saved
-page rather than restarting.
+reports **~2 million items** (independently corroborated: a several-months-old third-party scrape
+of the same workshop already found ~1.9M, consistent with organic growth since) - but safe to
+interrupt and re-run; it resumes from its last saved page rather than restarting, checkpointing
+every 5 pages.
+
+A real multi-hour run against depot 4000 hit a sustained `TaskCanceledException` after roughly
+15,000 items - almost certainly Steam throttling a long burst of back-to-back `QueryFiles` calls,
+since the loop originally had no pacing between pages at all (confirmed independently: the same
+workshop's own third-party scraper needed to handle the same throttling). Fixed with exponential
+backoff (up to 5 attempts) around every `QueryFiles`/`GetItemChanges`/`GetChangeHistory` call, a
+deliberate ~250ms pace between pages, and a graceful exit (progress saved, clear message) if
+retries are still exhausted - a `TaskCanceledException` crashing the whole process outright, losing
+whatever hadn't been checkpointed yet, was a real bug, not expected/acceptable behavior.
 
 **Download** - the actual content-acquisition step, in two forms:
 - **Catalog-driven** (`-app <appid>`): walks an app's existing catalog (built by `bootstrap`/`poll`)
