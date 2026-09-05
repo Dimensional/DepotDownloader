@@ -382,14 +382,41 @@ namespace DepotDownloader
 
         /// <summary>
         /// PublishedFile.QueryFiles - the same backend the workshop browse page itself calls.
-        /// Confirmed working under anonymous login (unlike GetItemChanges). With
-        /// query_type=k_PublishedFileQueryType_RankedByLastUpdatedDate (21) and return_details,
+        /// Confirmed working under anonymous login (unlike GetItemChanges). With return_details,
         /// this is what "workshop bootstrap" pages through to build the initial catalog - each
         /// returned PublishedFileDetails already carries hcontent_file/time_updated/title, so no
         /// per-item follow-up call is needed. cursor "*" starts a new query; pass back
-        /// Body.next_cursor to continue.
+        /// Body.next_cursor to continue. query_type picks the ranking paged through - which one
+        /// matters a lot more than it looks, see below.
+        ///
+        /// query_type=k_PublishedFileQueryType_RankedByLastUpdatedDate (21) was the first choice
+        /// and is NOT the current default - confirmed empirically (live scan, depot 4000) unsafe
+        /// for a long-running resumable walk of a live, actively-churning workshop. Items come back
+        /// DESCENDING by time_updated (most-recently-updated first), and that ranking is NOT stable
+        /// while the workshop keeps changing: an item updated WHILE a scan is in progress jumps
+        /// toward the front of the ranking (it's now more recent than most of what's already
+        /// ranked), observed directly as an out-of-order, much-newer timestamp appearing mid-page.
+        /// Since bootstrap walks a ranking forward exactly once via next_cursor and never revisits
+        /// earlier pages, an item updated concurrently with the scan could land in a position
+        /// already passed and go unrecorded by that run - not confirmed to have actually caused a
+        /// miss (the anomalies observed still surfaced, just oddly positioned), but the mechanism
+        /// for one clearly exists.
+        ///
+        /// query_type=k_PublishedFileQueryType_RankedByPublicationDate (1) is "workshop bootstrap"'s
+        /// current default instead, specifically because it doesn't have this problem: an item's
+        /// creation time never changes after it exists, so the ranking is fully stable regardless
+        /// of concurrent activity elsewhere - confirmed directly in the same kind of live scan, an
+        /// item whose time_updated had clearly just changed (moments before being observed) still
+        /// landed in its exact correct sorted position by time_created, undisturbed. Also confirmed
+        /// descending (newest-published first) - direction doesn't matter for this property, only
+        /// that the sort key itself is immutable does.
+        ///
+        /// "workshop poll" is comparatively immune to either ordering hazard regardless, since
+        /// GetItemChanges works off a time watermark rather than a position in any ranking -
+        /// running poll after (or soon after starting) a bootstrap is a second, independent way to
+        /// close any gap the chosen query_type's ranking might still leave.
         /// </summary>
-        public async Task<(EResult Result, CPublishedFile_QueryFiles_Response Body)> QueryFiles(uint appId, string cursor, uint numPerPage, uint queryType = 21)
+        public async Task<(EResult Result, CPublishedFile_QueryFiles_Response Body)> QueryFiles(uint appId, string cursor, uint numPerPage, uint queryType = 1)
         {
             var request = new CPublishedFile_QueryFiles_Request
             {

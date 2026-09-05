@@ -62,13 +62,24 @@ namespace DepotDownloader
         private static bool IsTransientNetworkException(Exception ex) =>
             ex is TaskCanceledException or OperationCanceledException or System.Net.Http.HttpRequestException;
 
-        public static async Task<int> BootstrapWorkshopCatalogAsync(uint appId, string outputRoot, uint pageSize, uint maxItems, uint queryType, bool manifestsOnly = false)
+        public static async Task<int> BootstrapWorkshopCatalogAsync(uint appId, string outputRoot, uint pageSize, uint maxItems, uint queryType, bool manifestsOnly = false, bool shallow = false, uint backfillBatch = 200)
         {
             outputRoot = ResolveOutputRoot(outputRoot);
             var catalogPath = WorkshopCatalog.GetPath(outputRoot, appId);
             Directory.CreateDirectory(Path.GetDirectoryName(catalogPath));
 
             var catalog = WorkshopCatalog.LoadOrCreate(catalogPath, appId);
+
+            // Runs once per invocation, regardless of whether bootstrap itself is complete yet -
+            // resuming an in-progress walk only fetches history for items newly reached from here
+            // on (see below), it doesn't revisit ones already recorded on an earlier run (including
+            // an entire catalog recorded before these fields existed, which loads with every item
+            // marked incomplete - see WorkshopCatalogItem). This is what actually reaches those
+            // without needing to delete anything and start over.
+            if (!shallow)
+            {
+                await BackfillIncompleteHistoryAsync(catalog, catalogPath, backfillBatch);
+            }
 
             if (catalog.BootstrapCompleted)
             {
@@ -77,10 +88,21 @@ namespace DepotDownloader
                 return 0;
             }
 
-            catalog.QueryType = queryType;
             if (catalog.BootstrapStartedAt == 0)
             {
+                // Only pinned on a genuinely fresh start - this was previously overwritten
+                // unconditionally on every invocation (a real bug found while checking how safe it
+                // would be to change the default query-type below: a resumed walk's BootstrapCursor
+                // is only meaningful relative to the ranking it was issued under, so silently
+                // repointing an in-progress walk at a different query-type - whether from an
+                // explicit -query-type or just a changed default - could have produced undefined
+                // pagination behavior, not a clean switch).
+                catalog.QueryType = queryType;
                 catalog.BootstrapStartedAt = (uint)DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+            }
+            else if (catalog.QueryType != queryType)
+            {
+                Console.WriteLine($"Note: this catalog's walk started under query-type {catalog.QueryType} - ignoring the different -query-type {queryType} passed here (a resumed cursor is only valid under its original ranking). Delete the catalog to restart under a different query-type.");
             }
 
             Console.WriteLine($"Bootstrapping workshop catalog for app {appId} (resuming at {catalog.Items.Count:N0} items already recorded)...");
@@ -94,6 +116,19 @@ namespace DepotDownloader
                 Console.WriteLine("-manifests-only requested: every item in this walk will also have its manifest fetched/UGC metadata logged, not just recorded in the catalog. This is far slower than a catalog-only bootstrap - consider -max-items for a large workshop.");
             }
 
+            if (!shallow)
+            {
+                // Full history is the default specifically so an item that updates more than once
+                // between checks never silently loses the versions in between - but for a brand-new
+                // item during THIS walk, that's one extra GetChangeHistory round trip PER ITEM on
+                // top of the existing per-PAGE pacing, not per-page - at depot 4000's ~2M items,
+                // ~250ms of pacing alone per item is multiple days. -shallow skips this (items are
+                // marked history-incomplete and get backfilled gradually by later bootstrap/poll
+                // runs instead, a handful at a time) - worth using for a first walk of a huge,
+                // never-before-bootstrapped workshop.
+                Console.WriteLine("Full history (GetChangeHistory) will also be fetched for every new item during this walk - safe for a modest workshop, but adds a full extra round-trip PER ITEM. Pass -shallow to skip this for a large workshop's first bootstrap (items are marked history-incomplete and backfilled gradually afterward instead).");
+            }
+
             var pagesSinceSave = 0;
             var safetyPageBudget = int.MaxValue;
 
@@ -102,7 +137,7 @@ namespace DepotDownloader
                 while (true)
                 {
                     var (result, body) = await WithTransientRetryAsync("QueryFiles",
-                        () => steam3.QueryFiles(appId, catalog.BootstrapCursor, pageSize, queryType));
+                        () => steam3.QueryFiles(appId, catalog.BootstrapCursor, pageSize, catalog.QueryType));
 
                     if (result != EResult.OK || body == null)
                     {
@@ -130,7 +165,7 @@ namespace DepotDownloader
                         // confusing them.
                         var kind = !string.IsNullOrEmpty(d.file_url) ? WorkshopItemKind.AncientUgc : WorkshopItemKind.ChunkBased;
 
-                        catalog.Items[d.publishedfileid] = new WorkshopCatalogItem
+                        var item = new WorkshopCatalogItem
                         {
                             PublishedFileId = d.publishedfileid,
                             Title = d.title,
@@ -140,6 +175,21 @@ namespace DepotDownloader
                             TimeUpdated = d.time_updated,
                             LastSeenAt = now,
                         };
+                        catalog.Items[d.publishedfileid] = item;
+
+                        if (!shallow)
+                        {
+                            await FetchAndRecordHistoryAsync(item);
+                            await Task.Delay(WorkshopApiPacingDelay);
+                        }
+                        else
+                        {
+                            // Seed with just the one entry already known for free (no extra call) -
+                            // still marked incomplete regardless, since a single current snapshot
+                            // can't tell us whether other versions exist in between.
+                            item.History = [new WorkshopHistoryEntry { Timestamp = d.time_updated, ManifestId = d.hcontent_file }];
+                            item.HistoryComplete = false;
+                        }
 
                         if (manifestsOnly)
                         {
@@ -224,7 +274,7 @@ namespace DepotDownloader
             }
         }
 
-        public static async Task<int> PollWorkshopCatalogAsync(uint appId, string outputRoot, bool dryRun, bool manifestsOnly = false)
+        public static async Task<int> PollWorkshopCatalogAsync(uint appId, string outputRoot, bool dryRun, bool manifestsOnly = false, bool shallow = false, uint backfillBatch = 200)
         {
             outputRoot = ResolveOutputRoot(outputRoot);
             var catalogPath = WorkshopCatalog.GetPath(outputRoot, appId);
@@ -333,7 +383,7 @@ namespace DepotDownloader
                     && existing != null
                     && existing.ManifestId == change.manifest_id;
 
-                catalog.Items[change.published_file_id] = new WorkshopCatalogItem
+                var newItem = new WorkshopCatalogItem
                 {
                     PublishedFileId = change.published_file_id,
                     Title = title,
@@ -342,12 +392,18 @@ namespace DepotDownloader
                     ManifestId = change.manifest_id,
                     TimeUpdated = change.time_updated,
                     LastSeenAt = catalog.LastPolledAt,
+                    // Carried forward, not reset - overwritten below only if this pass actually
+                    // fetches history itself.
+                    History = existing?.History ?? [],
+                    HistoryComplete = existing?.HistoryComplete ?? false,
                 };
+                catalog.Items[change.published_file_id] = newItem;
 
                 if (skip)
                 {
                     // Steam counted it as "changed" (could be a metadata-only edit) but the
-                    // manifest we'd archive by didn't move - nothing new to download.
+                    // manifest we'd archive by didn't move - nothing new to download, and (since
+                    // nothing about the archived content changed) nothing new to backfill either.
                     continue;
                 }
 
@@ -356,6 +412,22 @@ namespace DepotDownloader
                 if (dryRun)
                 {
                     continue;
+                }
+
+                // Full history by default - GetItemChanges only ever says "this changed since X,"
+                // never how many times or through what intermediate versions, so without this an
+                // item that updated more than once between polls would silently lose everything
+                // but its latest state. No incremental fetch exists (see
+                // WorkshopCatalogItem.History) - this always re-fetches and overwrites the whole
+                // list, whether or not it was already complete.
+                if (!shallow)
+                {
+                    await FetchAndRecordHistoryAsync(newItem);
+                    await Task.Delay(WorkshopApiPacingDelay);
+                }
+                else
+                {
+                    newItem.HistoryComplete = false;
                 }
 
                 try
@@ -389,6 +461,16 @@ namespace DepotDownloader
             // Advance only to what GetItemChanges itself reported, never to "now" - so a poll can
             // never silently skip a window it didn't actually ask Steam about.
             catalog.LastWatermark = body.update_time;
+
+            // Beyond this poll's own delta, also chip away at any items still marked
+            // history-incomplete from an earlier "-shallow" pass - not just the ones this
+            // particular poll happened to touch. Bounded (-backfill-batch) so this can't turn an
+            // otherwise-cheap poll into a long sweep by accident.
+            if (!shallow)
+            {
+                await BackfillIncompleteHistoryAsync(catalog, catalogPath, backfillBatch);
+            }
+
             catalog.Save(catalogPath);
 
             var verb = manifestsOnly ? "Recorded manifests/metadata for" : "Downloaded";
@@ -415,6 +497,7 @@ namespace DepotDownloader
             var chunkBased = 0;
             var ancientUgc = 0;
             var unknownKind = 0;
+            var historyComplete = 0;
             foreach (var item in catalog.Items.Values)
             {
                 switch (item.Kind)
@@ -423,12 +506,21 @@ namespace DepotDownloader
                     case WorkshopItemKind.AncientUgc: ancientUgc++; break;
                     default: unknownKind++; break;
                 }
+
+                if (item.HistoryComplete)
+                {
+                    historyComplete++;
+                }
             }
 
             Console.WriteLine($"App:                {catalog.AppId}");
             Console.WriteLine($"Catalog path:       {catalogPath}");
             Console.WriteLine($"Items recorded:     {catalog.Items.Count:N0}  (chunk-based: {chunkBased:N0}, ancient UGC: {ancientUgc:N0}, unclassified: {unknownKind:N0})");
+            Console.WriteLine($"Full history known: {historyComplete:N0} of {catalog.Items.Count:N0}" +
+                (historyComplete < catalog.Items.Count ? " - the rest will backfill gradually on future bootstrap/poll runs (see -backfill-batch)." : ""));
             Console.WriteLine($"Bootstrap complete: {catalog.BootstrapCompleted}");
+            Console.WriteLine($"Query type:         {catalog.QueryType}" +
+                (catalog.QueryType == 1 ? " (RankedByPublicationDate - stable)" : catalog.QueryType == 21 ? " (RankedByLastUpdatedDate - NOT stable under concurrent activity, see README)" : ""));
 
             if (!catalog.BootstrapCompleted && catalog.BootstrapStartedAt != 0)
             {
@@ -491,12 +583,17 @@ namespace DepotDownloader
             var matching = items.OrderBy(i => i.PublishedFileId).ToList();
             var shown = limit == 0 ? matching : matching.Take((int)limit).ToList();
 
-            Console.WriteLine($"{"PublishedFileId",-20} {"Kind",-11} {"ManifestId",-20} {"TimeUpdated",-20} {"LastSeenAt",-20} Title");
+            Console.WriteLine($"{"PublishedFileId",-20} {"Kind",-11} {"ManifestId",-20} {"TimeUpdated",-20} {"LastSeenAt",-20} {"History",-9} Title");
             foreach (var item in shown)
             {
                 var updated = item.TimeUpdated == 0 ? "-" : DateTimeOffset.FromUnixTimeSeconds(item.TimeUpdated).ToString("u");
                 var seen = item.LastSeenAt == 0 ? "-" : DateTimeOffset.FromUnixTimeSeconds(item.LastSeenAt).ToString("u");
-                Console.WriteLine($"{item.PublishedFileId,-20} {item.Kind,-11} {item.ManifestId,-20} {updated,-20} {seen,-20} {item.Title}");
+                // "N (complete)" once a real GetChangeHistory fetch has landed and is trusted
+                // gap-free; "N? (partial)" for anything recorded "-shallow" or from before these
+                // fields existed - N there is just whatever's known so far (often just the current
+                // version), not a real total.
+                var hist = item.HistoryComplete ? $"{item.History.Count} (complete)" : $"{item.History.Count}? (partial)";
+                Console.WriteLine($"{item.PublishedFileId,-20} {item.Kind,-11} {item.ManifestId,-20} {updated,-20} {seen,-20} {hist,-16} {item.Title}");
             }
 
             Console.WriteLine();
@@ -551,6 +648,92 @@ namespace DepotDownloader
         }
 
         /// <summary>
+        /// Fetches an item's full history via GetChangeHistory and overwrites History/
+        /// HistoryComplete on the given (already-in-catalog) item in place - the shared mechanism
+        /// bootstrap and poll both use, whether this is an item's very first history fetch or a
+        /// backfill of a previously "-shallow" one. Always a full overwrite, never a merge - see
+        /// WorkshopCatalogItem's doc comment for why that's always correct here (GetChangeHistory
+        /// has no "since" filter of its own, so every fetch returns the complete list anyway).
+        /// Returns false (leaving the item untouched) when GetChangeHistory came back empty - a
+        /// real item always has at least its own creation as one entry, so an empty result means
+        /// the fetch failed (already retried internally) rather than "genuinely no history";
+        /// leaving HistoryComplete false lets a later run retry instead of wrongly trusting a
+        /// blank list as the truth.
+        /// </summary>
+        private static async Task<bool> FetchAndRecordHistoryAsync(WorkshopCatalogItem item)
+        {
+            var changes = await GetFullChangeHistoryAsync(item.PublishedFileId);
+            if (changes.Count == 0)
+            {
+                return false;
+            }
+
+            item.History = changes
+                .OrderBy(c => c.timestamp)
+                .Select(c => new WorkshopHistoryEntry
+                {
+                    Timestamp = c.timestamp,
+                    ManifestId = c.manifest_id,
+                    ChangeDescription = c.change_description,
+                })
+                .ToList();
+            item.HistoryComplete = true;
+            return true;
+        }
+
+        /// <summary>
+        /// Sweeps up to <paramref name="batchSize"/> catalog items still marked
+        /// HistoryComplete == false (from a prior "-shallow" bootstrap/poll pass, or an item that
+        /// predates these fields entirely) and fetches their full history. Bounded per call - a
+        /// large backlog (e.g. an entire workshop shallow-bootstrapped up front) is worked off
+        /// gradually across repeated bootstrap/poll runs instead of turning the very next one into
+        /// an unbounded multi-day sweep by accident. batchSize == 0 disables this entirely (a
+        /// caller-facing "-backfill-batch 0", distinct from "-shallow" - the latter also skips
+        /// fetching history for brand-new/changed items this run, this only skips the extra sweep
+        /// over already-recorded incomplete ones).
+        /// </summary>
+        private static async Task BackfillIncompleteHistoryAsync(WorkshopCatalog catalog, string catalogPath, uint batchSize)
+        {
+            if (batchSize == 0)
+            {
+                return;
+            }
+
+            var candidates = catalog.Items.Values.Where(i => !i.HistoryComplete).Take((int)batchSize).ToList();
+            if (candidates.Count == 0)
+            {
+                return;
+            }
+
+            Console.WriteLine($"Backfilling full history for {candidates.Count:N0} item(s) still marked incomplete...");
+
+            var fetched = 0;
+            var sinceSave = 0;
+            foreach (var item in candidates)
+            {
+                if (await FetchAndRecordHistoryAsync(item))
+                {
+                    fetched++;
+                }
+
+                if (++sinceSave >= 20)
+                {
+                    catalog.Save(catalogPath);
+                    sinceSave = 0;
+                }
+
+                await Task.Delay(WorkshopApiPacingDelay);
+            }
+
+            catalog.Save(catalogPath);
+
+            var remaining = catalog.Items.Values.Count(i => !i.HistoryComplete);
+            Console.WriteLine(remaining > 0
+                ? $"Backfill: {fetched:N0}/{candidates.Count:N0} succeeded this pass. {remaining:N0} item(s) still incomplete - will continue on future runs."
+                : $"Backfill: {fetched:N0}/{candidates.Count:N0} succeeded this pass. No incomplete items remain.");
+        }
+
+        /// <summary>
         /// Archives one item, shared by both the catalog-driven and ad-hoc download entry points
         /// below. Without history: current version only, same as a normal "download -workshop
         /// -raw" per item. With history, for a ChunkBased item: walks GetChangeHistory and
@@ -564,8 +747,17 @@ namespace DepotDownloader
         /// Only the current version is actually fetched for those regardless of -history; a note
         /// is printed when an ancient item's history has more than one entry, since that's the
         /// case where something real is known to exist but isn't reachable through this API.
+        ///
+        /// Always a LIVE GetChangeHistory call when history is requested here - deliberately never
+        /// trusts a catalog's cached History/HistoryComplete, even when it looks complete. This is
+        /// the "-history" download path's own long-standing contract (get every version, right
+        /// now), and a cached list could predate the current moment by as long as it's been since
+        /// the last bootstrap/poll touched this item - reusing it here would risk silently missing
+        /// a version Steam added since. The returned FetchedHistory is what THIS call just learned
+        /// live, for a caller to persist back into the catalog if it wants to (a nice side benefit,
+        /// not something this method relies on for correctness).
         /// </summary>
-        private static async Task<(int Downloaded, int Failed)> ArchiveWorkshopItemAsync(uint appId, ulong publishedFileId, string title, WorkshopItemKind kind, ulong currentManifestId, bool history, RawDownloadOptions options)
+        private static async Task<(int Downloaded, int Failed, List<WorkshopHistoryEntry> FetchedHistory)> ArchiveWorkshopItemAsync(uint appId, ulong publishedFileId, string title, WorkshopItemKind kind, ulong currentManifestId, bool history, RawDownloadOptions options)
         {
             var downloaded = 0;
             var failed = 0;
@@ -573,6 +765,8 @@ namespace DepotDownloader
             if (history && kind == WorkshopItemKind.ChunkBased)
             {
                 var changes = await GetFullChangeHistoryAsync(publishedFileId);
+                var fetchedHistory = ToHistoryEntries(changes);
+
                 if (changes.Count == 0)
                 {
                     Console.WriteLine($"  {publishedFileId} \"{title}\": no change history available, falling back to current version");
@@ -597,12 +791,15 @@ namespace DepotDownloader
                     }
                 }
 
-                return (downloaded, failed);
+                return (downloaded, failed, fetchedHistory);
             }
 
+            List<WorkshopHistoryEntry> fetchedAncientHistory = null;
             if (history && kind == WorkshopItemKind.AncientUgc)
             {
                 var changes = await GetFullChangeHistoryAsync(publishedFileId);
+                fetchedAncientHistory = ToHistoryEntries(changes);
+
                 if (changes.Count > 1)
                 {
                     Console.WriteLine($"  Note: {publishedFileId} \"{title}\" has {changes.Count} historical versions, but only the current one is retrievable - Steam doesn't expose old direct-URL content through this API (see README).");
@@ -621,15 +818,36 @@ namespace DepotDownloader
                 Console.WriteLine($"    ERROR downloading {publishedFileId}: {ex.Message}");
             }
 
-            return (downloaded, failed);
+            return (downloaded, failed, fetchedAncientHistory);
+        }
+
+        /// <summary>Maps a raw GetChangeHistory page into catalog-storage form, oldest first. Null
+        /// (not empty) when the fetch came back with nothing - see FetchAndRecordHistoryAsync for
+        /// why that distinction matters (empty means "fetch failed," not "genuinely no history").</summary>
+        private static List<WorkshopHistoryEntry> ToHistoryEntries(List<CPublishedFile_GetChangeHistory_Response.ChangeLog> changes)
+        {
+            if (changes == null || changes.Count == 0)
+            {
+                return null;
+            }
+
+            return changes
+                .OrderBy(c => c.timestamp)
+                .Select(c => new WorkshopHistoryEntry { Timestamp = c.timestamp, ManifestId = c.manifest_id, ChangeDescription = c.change_description })
+                .ToList();
         }
 
         /// <summary>
         /// Inserts/updates one item's entry directly into its own app's catalog - what makes
         /// "workshop download -workshop &lt;id&gt;..." (ad-hoc, no prior bootstrap needed) still
         /// contribute to that app's tracked state, not just fetch content and forget it happened.
+        /// <paramref name="history"/> is whatever ArchiveWorkshopItemAsync already fetched live for
+        /// this same call (via its own -history handling) - reused here so an ad-hoc "-history"
+        /// pull doesn't pay for a second GetChangeHistory round trip just to record what the first
+        /// one already learned. Null/empty means this pass didn't fetch history, so the entry is
+        /// recorded incomplete like any other freshly-seen item.
         /// </summary>
-        private static void UpsertCatalogEntry(string outputRoot, PublishedFileDetails details, WorkshopItemKind kind)
+        private static void UpsertCatalogEntry(string outputRoot, PublishedFileDetails details, WorkshopItemKind kind, List<WorkshopHistoryEntry> history = null)
         {
             var catalogPath = WorkshopCatalog.GetPath(outputRoot, details.consumer_appid);
             Directory.CreateDirectory(Path.GetDirectoryName(catalogPath));
@@ -644,6 +862,8 @@ namespace DepotDownloader
                 ManifestId = details.hcontent_file,
                 TimeUpdated = details.time_updated,
                 LastSeenAt = (uint)DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
+                History = history ?? [],
+                HistoryComplete = history is { Count: > 0 },
             };
 
             catalog.Save(catalogPath);
@@ -686,6 +906,7 @@ namespace DepotDownloader
             var processed = 0;
             var downloaded = 0;
             var failed = 0;
+            var catalogChanged = false;
 
             foreach (var item in items)
             {
@@ -696,9 +917,21 @@ namespace DepotDownloader
                 }
                 processed++;
 
-                var (d, f) = await ArchiveWorkshopItemAsync(appId, item.PublishedFileId, item.Title, item.Kind, item.ManifestId, history, options);
+                var (d, f, fetchedHistory) = await ArchiveWorkshopItemAsync(appId, item.PublishedFileId, item.Title, item.Kind, item.ManifestId, history, options);
                 downloaded += d;
                 failed += f;
+
+                if (fetchedHistory != null)
+                {
+                    item.History = fetchedHistory;
+                    item.HistoryComplete = true;
+                    catalogChanged = true;
+                }
+            }
+
+            if (catalogChanged)
+            {
+                catalog.Save(catalogPath);
             }
 
             var verb = manifestsOnly ? "Recorded manifests/metadata for" : "Downloaded";
@@ -757,11 +990,11 @@ namespace DepotDownloader
 
                 var kind = !string.IsNullOrEmpty(details.file_url) ? WorkshopItemKind.AncientUgc : WorkshopItemKind.ChunkBased;
 
-                var (d, f) = await ArchiveWorkshopItemAsync(details.consumer_appid, id, details.title, kind, details.hcontent_file, history, options);
+                var (d, f, fetchedHistory) = await ArchiveWorkshopItemAsync(details.consumer_appid, id, details.title, kind, details.hcontent_file, history, options);
                 downloaded += d;
                 failed += f;
 
-                UpsertCatalogEntry(outputRoot, details, kind);
+                UpsertCatalogEntry(outputRoot, details, kind, fetchedHistory);
             }
 
             var verb = manifestsOnly ? "Recorded manifests/metadata for" : "Downloaded";

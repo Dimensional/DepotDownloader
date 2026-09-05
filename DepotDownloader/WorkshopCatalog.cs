@@ -28,13 +28,50 @@ namespace DepotDownloader
     }
 
     /// <summary>
-    /// One tracked workshop item's last-known state, as recorded by "workshop bootstrap"/"poll".
+    /// One entry from PublishedFile.GetChangeHistory, as recorded into a catalog item's
+    /// <see cref="WorkshopCatalogItem.History"/>. ManifestId is a real depot manifest ID for
+    /// ChunkBased items, or just Steam's CDN content handle for AncientUgc ones (see
+    /// WorkshopItemKind) - never a URL either way; an ancient item's old versions are discoverable
+    /// this way but not necessarily re-downloadable (see README).
+    /// </summary>
+    [ProtoContract]
+    public class WorkshopHistoryEntry
+    {
+        [ProtoMember(1)]
+        public uint Timestamp { get; set; }
+
+        [ProtoMember(2)]
+        public ulong ManifestId { get; set; }
+
+        [ProtoMember(3)]
+        public string ChangeDescription { get; set; }
+    }
+
+    /// <summary>
+    /// One tracked workshop item's state, as recorded by "workshop bootstrap"/"poll".
     /// ManifestId/TimeUpdated mirror Steam's own PublishedFileDetails.hcontent_file/time_updated
-    /// at LastSeenAt - not a full version history (see "manifest list -workshop" for the
-    /// per-item change history via GetChangeHistory instead, or the ugc/&lt;appid&gt;/&lt;id&gt;/_meta.json
-    /// sidecar that DownloadPubfileRawAsync itself already maintains for AncientUgc items). Title
-    /// is cached here specifically so polling never needs a per-item GetDetails round-trip just to
-    /// build a download filename - GetItemChanges (the poll RPC) does not return it.
+    /// at LastSeenAt - the CURRENT version only. History is the full picture: every version
+    /// GetChangeHistory reports, fetched by default so an item that updated more than once between
+    /// two polls doesn't silently lose the versions in between (poll's own GetItemChanges delta
+    /// only ever reports "this changed since X," never each intermediate step). Because
+    /// GetChangeHistory has no "since" filter of its own (see Steam3Session.GetChangeHistory),
+    /// every fetch - whether triggered by this item changing, or a backfill sweep - retrieves and
+    /// overwrites the WHOLE history; there's no incremental merge logic to get wrong, and no stored
+    /// state that could make a fetch trust stale data instead of just re-fetching it.
+    ///
+    /// HistoryComplete is NOT a "verified forever, stop checking" flag - it only records whether
+    /// THE LAST TIME this item was touched by bootstrap/poll, that touch was "-shallow" or not.
+    /// It never gates whether a future touch re-fetches: bootstrap fetches for every genuinely new
+    /// item, and poll fetches for every item its own GetItemChanges delta reports changed,
+    /// regardless of this flag's current value - so a change is never missed because History
+    /// looked "complete" already. Its only two actual jobs are (1) telling
+    /// BackfillIncompleteHistoryAsync which items still need a first/catch-up fetch (an item that
+    /// hasn't changed since a "-shallow" touch has nothing new to learn from a plain re-fetch until
+    /// it changes again - GetChangeHistory would just return the same thing - so the sweep targets
+    /// exactly those), and (2) surfacing in "status"/"status -list" which items' History might be
+    /// incomplete. An older catalog saved before these two fields existed loads them at their
+    /// protobuf zero-value defaults (empty list, false) - equivalent to every item in it having
+    /// been recorded "-shallow", so it backfills the same way rather than needing a rebuild.
     /// </summary>
     [ProtoContract]
     public class WorkshopCatalogItem
@@ -42,6 +79,9 @@ namespace DepotDownloader
         [ProtoMember(1)]
         public ulong PublishedFileId { get; set; }
 
+        /// <summary>Cached here specifically so polling never needs a per-item GetDetails
+        /// round-trip just to build a download filename - GetItemChanges (the poll RPC) does not
+        /// return it.</summary>
         [ProtoMember(2)]
         public string Title { get; set; }
 
@@ -65,6 +105,24 @@ namespace DepotDownloader
         /// possibly-stale cached URL.</summary>
         [ProtoMember(7)]
         public string FileUrl { get; set; }
+
+        /// <summary>Every version GetChangeHistory reported as of the last time it was actually
+        /// fetched (see LastSeenAt) - oldest first. Only as current as that last fetch; nothing
+        /// here is re-verified except by fetching again (see HistoryComplete).</summary>
+        [ProtoMember(8)]
+        public List<WorkshopHistoryEntry> History { get; set; } = [];
+
+        /// <summary>Whether the LAST bootstrap/poll touch of this item was a full GetChangeHistory
+        /// fetch (true) or a "-shallow" one that skipped it (false) - a shallow-tracking marker,
+        /// not a permanent "verified, never needs checking again" stamp. It does not prevent a
+        /// future change from being caught: poll always re-fetches full history for any item its
+        /// own GetItemChanges delta reports changed, and bootstrap always fetches for any genuinely
+        /// new item, regardless of what this flag currently says. Its actual job is narrower - it's
+        /// what BackfillIncompleteHistoryAsync checks to find items that still need a first/catch-up
+        /// fetch (nothing to gain from re-fetching one that hasn't changed since its last shallow
+        /// touch, until it changes again - which the change-triggered fetch above already handles).</summary>
+        [ProtoMember(9)]
+        public bool HistoryComplete { get; set; }
     }
 
     /// <summary>
@@ -90,8 +148,18 @@ namespace DepotDownloader
         [ProtoMember(2)]
         public Dictionary<ulong, WorkshopCatalogItem> Items { get; set; } = [];
 
-        /// <summary>EPublishedFileQueryType used for bootstrap - kept so a resumed bootstrap
-        /// can't silently continue with a different sort/filter than it started with.</summary>
+        /// <summary>EPublishedFileQueryType used for bootstrap - pinned on a fresh catalog's first
+        /// bootstrap call and never changed after (see BootstrapWorkshopCatalogAsync), so a resumed
+        /// bootstrap can't silently continue with a different sort/filter - and hence a
+        /// BootstrapCursor - than it started with. This C#/wire-format default of 21
+        /// (RankedByLastUpdatedDate) is deliberately NOT changed to match "workshop bootstrap"'s
+        /// current CLI default (1, RankedByPublicationDate - confirmed empirically more stable
+        /// under concurrent workshop activity, see README) - protobuf-net omits a field from the
+        /// wire entirely when it equals [DefaultValue], so changing this value would silently
+        /// misread any already-saved catalog that happens to have QueryType == 21 (the vast
+        /// majority, from before this default changed) as 1 instead. The CLI default is what
+        /// actually governs a genuinely new catalog's starting query-type; this is only ever a
+        /// momentary placeholder before that first real assignment.</summary>
         [ProtoMember(3)]
         [DefaultValue(21u)] // k_PublishedFileQueryType_RankedByLastUpdatedDate - see protobuf-net PBN0020
         public uint QueryType { get; set; } = 21;

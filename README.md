@@ -685,6 +685,106 @@ deliberate ~250ms pace between pages, and a graceful exit (progress saved, clear
 retries are still exhausted - a `TaskCanceledException` crashing the whole process outright, losing
 whatever hadn't been checkpointed yet, was a real bug, not expected/acceptable behavior.
 
+**⚠ `QueryFiles`'s ranking choice matters more than it looks for a long scan of a live workshop -
+confirmed empirically, not documented anywhere.** The original choice, `query_type` 21
+(`RankedByLastUpdatedDate`), returns items **descending** by `time_updated` (most-recently-updated
+first) - a live scan against depot 4000 showed timestamps falling from ~19:29 UTC on page 1 to
+~18:52 UTC on page 3, confirming the direction. The problem: that ranking is NOT stable while the
+workshop keeps changing. An item updated *while* the scan is still running jumps toward the front
+of the ranking (it's now more recent than most of what's already been ranked) - observed directly
+as an out-of-order, much-newer timestamp appearing mid-page during a real scan. Since bootstrap
+walks a ranking forward exactly once via `next_cursor` and never revisits earlier pages, an item
+updated concurrently with a multi-hour/multi-day scan could land in a position already passed and
+go unrecorded by that particular run.
+
+**Fixed by switching the default to `query_type` 1 (`RankedByPublicationDate`)** instead - an
+item's creation time never changes once it exists, so this ranking is completely stable regardless
+of concurrent activity elsewhere. Confirmed directly: in the same kind of live scan, an item whose
+`time_updated` had clearly just changed (moments before being observed) still landed in its exact
+correct sorted position by `time_created`, undisturbed - unlike `time_updated`-based ranking, where
+the same kind of live update visibly displaced an item's position. Also confirmed descending
+(newest-published first) - direction doesn't matter for this property, only that the sort key
+itself is immutable does. `-query-type` still accepts either value (or others) if there's ever a
+reason to override it.
+
+This does NOT mean a resumed bootstrap catches everything unconditionally, even under the stable
+ranking - a **brand-new** item published while a scan is already past the "newest" end of the
+ranking lands ahead of wherever the walk currently is, in territory it won't revisit (the walk only
+moves toward older content). That's not a bug specific to either query-type; it's inherent to any
+single forward-only pass over a live, *growing* list, and it's exactly why bootstrap-once-then-
+poll-regularly is the actual design rather than bootstrap alone - `poll`'s `GetItemChanges` doesn't
+care about ranking position at all (a new item's `time_updated` is "now," so it surfaces as `NEW` in
+poll's own delta), so it independently closes this gap as long as it runs within the confirmed
+96h-7-day window.
+
+**A catalog's `QueryType` is pinned on its first-ever bootstrap call and never changes after** -
+this was a real, separate bug found while checking whether it'd be safe to change the default:
+`QueryType` was previously overwritten on *every* invocation regardless of whether the walk was
+brand new or resuming, and the actual `QueryFiles` call used the raw CLI parameter rather than the
+pinned value - so silently resuming an in-progress walk with a different `-query-type` than it
+started with (including just from a changed default, as just happened here) could have paged
+through an already-issued cursor under an entirely different ranking, with undefined results. Fixed
+so a resume always uses the catalog's own recorded `QueryType`, printing a note (and ignoring the
+mismatch) if a different `-query-type` is passed than what's on record. **There's no in-place way
+to switch an in-progress catalog's ranking** - a resumed cursor only means anything relative to the
+ranking it came from, so catching up to the new default requires deleting that app's catalog and
+re-bootstrapping from scratch (safe/idempotent either way, since the catalog is keyed by ID - just
+a time cost for whatever was already scanned).
+
+**Interleaving `bootstrap` and `poll` on the same catalog is always safe**, including pausing a
+multi-day bootstrap to run poll and resuming it afterward - a natural way to keep a huge workshop's
+walk from leaving too large a gap before anything gets checked for recent changes. The two share no
+mutable state capable of interfering with each other: `BootstrapCursor`/`BootstrapCompleted` are
+written in exactly one place (`BootstrapWorkshopCatalogAsync`) and poll never touches them, while
+poll only ever writes `catalog.Items[id] = ...` - a plain overwrite by `PublishedFileId`, safe
+regardless of whether bootstrap already recorded that same id, will later re-visit it, or never
+will. Bootstrap's cursor is an opaque, Steam-issued continuation token bound to the ranking
+(`time_created`, immutable), not a count of items known locally - so nothing poll does to the local
+catalog (recording a change, adding a brand-new item) can shift what that cursor means or where
+bootstrap resumes. This isn't just reasoning: the same live test that confirmed the ranking's
+stability above showed an item visibly updated *during* the scan still sitting in its exact correct
+position - direct evidence that a poll-triggered update can't move anything bootstrap is walking.
+
+**Full history is fetched by default, not just each item's current state** - both `bootstrap` and
+`poll` also call `GetChangeHistory` per item and store the complete result (every version, oldest
+first) on the catalog entry. This exists specifically because `GetItemChanges`' delta only ever
+says "this changed since X," never how many times or through what intermediate versions - without
+it, an item that updated twice between two polls would silently lose the version in between. There
+is no incremental fetch - `GetChangeHistory` has no "since" filter of its own, so every fetch
+(fresh or backfilled) retrieves and overwrites the WHOLE history; nothing here is a merge.
+
+For a brand-new item this costs one extra round-trip PER ITEM, not per page - at depot 4000's ~2M
+items, the ~250ms pacing alone adds up to multiple days on top of bootstrap's existing cost. Pass
+**`-shallow`** to skip it for a huge workshop's first walk: items are recorded with just their
+current version and marked history-incomplete, to be picked up later rather than paid for up front.
+Poll defaults to full history too, but it's normally cheap there since a poll's delta set is a tiny
+fraction of the whole catalog - `-shallow` on poll additionally skips that run's backfill sweep
+(below), not just the per-item fetch.
+
+Incomplete items backfill two ways, and it's worth understanding both since neither is a "confirm
+everything, then continue" gate:
+- **Organically, for anything that keeps changing**: whenever `poll`'s own `GetItemChanges` delta
+  reports an item changed, it *always* does a full `GetChangeHistory` fetch and overwrite for that
+  item, regardless of what `HistoryComplete` currently says - a changed report is itself the reason
+  a stale flag would be wrong, so nothing here ever trusts the flag to decide whether to re-check.
+  This is also why an item that keeps updating never needs the sweep below at all.
+- **Via a bounded sweep, for anything that's gone quiet**: an item recorded `-shallow` that never
+  updates again would never appear in any future poll delta, so nothing would ever organically
+  revisit it. `-backfill-batch <n>` (default 200; 0 disables it) is a separate pass, run once at
+  the *start* of every `bootstrap` or `poll` invocation (whether or not `-shallow` was passed to
+  scrape brand-new items in the same run), that fetches full history for up to `n` items still
+  marked incomplete. It is a per-run CAP, not a "keep going until none remain" loop - with e.g.
+  285,000 items left incomplete and the default batch of 200, clearing the whole backlog this way
+  takes on the order of 1,400+ separate invocations (a large `-backfill-batch` does more per run,
+  at the cost of that run taking longer). The one case where a single invocation really does behave
+  like "just the backfill, nothing else" is once `bootstrap` has already fully completed - there's
+  no more paging left to do, so that run's only work *is* the sweep.
+- An older catalog saved before `History`/`HistoryComplete` existed loads them at their protobuf
+  zero-value defaults (empty list, `false`) - equivalent to every item in it having been recorded
+  `-shallow`, so it backfills the same way. **No rebuild or deletion is required** for an existing
+  catalog to pick this up; confirmed live against a real, in-progress 285,000-item app-4000 catalog
+  predating this feature.
+
 **Download** - the actual content-acquisition step, in two forms:
 - **Catalog-driven** (`-app <appid>`): walks an app's existing catalog (built by `bootstrap`/`poll`)
   and archives its items - optionally narrowed with `-only <id,id2,...>`, or capped with
@@ -744,7 +844,8 @@ anywhere (it isn't part of the public Steamworks Web API at all):**
 - `-page-size <n>` - Items per `QueryFiles` page (default 100)
 - `-max-items <n>` - Stop after at least this many items (testing - leaves bootstrap
   unmarked-complete so a later run continues normally)
-- `-query-type <n>` - `EPublishedFileQueryType` (default 21 = `RankedByLastUpdatedDate`)
+- `-query-type <n>` - `EPublishedFileQueryType` (default 1 = `RankedByPublicationDate` - see above
+  for why 21 = `RankedByLastUpdatedDate` was the original but unsafe choice)
 - `-manifests-only` (alias `-raw-dry-run`) - Also fetch each item's manifest (chunk-based) or log
   its metadata without fetching content (ancient UGC) during this same walk, instead of leaving
   that for a future `download`/`poll` to handle. Reuses the `PublishedFileDetails` this pass
@@ -753,6 +854,9 @@ anywhere (it isn't part of the public Steamworks Web API at all):**
   up fast: a workshop the size of depot 4000's would take **well over a week**. Pair with
   `-max-items` unless the workshop is genuinely small, or just use `download`/`poll` for what's
   actually changed.
+- `-shallow` - Skip fetching full `GetChangeHistory` per item during this walk (see above)
+- `-backfill-batch <n>` - Items to backfill full history for per run (default 200; 0 disables) -
+  see above
 
 **Options (download):**
 - `-history` - Every historical version, not just current (see above)
@@ -765,23 +869,26 @@ anywhere (it isn't part of the public Steamworks Web API at all):**
 **Options (poll):**
 - `-dry-run` - Report what would be checked/downloaded - fetches nothing at all, not even a manifest
 - `-manifests-only` - Same meaning as on `download` above
+- `-shallow` - Same meaning as on `bootstrap` above - also skips this run's `-backfill-batch` sweep
+- `-backfill-batch <n>` - Same meaning as on `bootstrap` above (runs after this poll's own delta)
 
 **Common options:** `-output <dir>`, `-username`/`-remember-password` (bootstrap and ad-hoc
 `download` can run anonymously; catalog-driven `download` inherits whatever the items themselves
 require; `poll` cannot run anonymously - see above).
 
-**Inspecting a catalog:** `status` alone prints only aggregate counts - `workshop_catalog.bin` is
-protobuf/Deflate, not a format meant to be opened directly, so `status -list` is the actual way to
-see what got recorded (one row per item: ID, kind, manifest/content handle, last-update/last-seen
-time, title). Sorted by ID, not dictionary order, so two snapshots print identically and diff
-cleanly. Defaults to the first 200 matching rows (`-limit 0` for all); narrow with `-kind
-chunk|ancient|unknown` and/or `-only <id,id2,...>`. On load, a corrupt/truncated/incompatible-
-version catalog fails loudly with a clear message rather than silently misreading it - protobuf-
-net's wire format is self-describing (field number + wire type per field), so garbled bytes fail to
-parse rather than landing in the wrong typed field, and `CheckpointFile`'s atomic tmp+move save
-(the same pattern this project uses everywhere else) means a crash mid-write can never leave a torn
-file behind in the first place - what's on disk is always either the previous complete save or the
-new one, never a mix.
+**Inspecting a catalog:** `status` alone prints only aggregate counts (including how many items
+have full history known vs. still incomplete) - `workshop_catalog.bin` is protobuf/Deflate, not a
+format meant to be opened directly, so `status -list` is the actual way to see what got recorded
+(one row per item: ID, kind, manifest/content handle, last-update/last-seen time, a `History`
+column showing entry count + whether it's complete or partial, title). Sorted by ID, not dictionary
+order, so two snapshots print identically and diff cleanly. Defaults to the first 200 matching rows
+(`-limit 0` for all); narrow with `-kind chunk|ancient|unknown` and/or `-only <id,id2,...>`. On
+load, a corrupt/truncated/incompatible-version catalog fails loudly with a clear message rather
+than silently misreading it - protobuf-net's wire format is self-describing (field number + wire
+type per field), so garbled bytes fail to parse rather than landing in the wrong typed field, and
+`CheckpointFile`'s atomic tmp+move save (the same pattern this project uses everywhere else) means
+a crash mid-write can never leave a torn file behind in the first place - what's on disk is always
+either the previous complete save or the new one, never a mix.
 
 A brand-new item discovered only via `poll`/ad-hoc `download` (not previously seen during
 `bootstrap`) costs one extra `GetDetails` call to classify it (chunk-based vs. ancient) and learn

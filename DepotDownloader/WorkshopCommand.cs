@@ -58,8 +58,10 @@ namespace DepotDownloader
             var appId = parser.GetNullable<uint>("-app", "-appid");
             var pageSize = parser.Get<uint>(100, "-page-size");
             var maxItems = parser.Get<uint>(0, "-max-items");
-            var queryType = parser.Get<uint>(21, "-query-type"); // k_PublishedFileQueryType_RankedByLastUpdatedDate
+            var queryType = parser.Get<uint>(1, "-query-type"); // k_PublishedFileQueryType_RankedByPublicationDate - see BootstrapWorkshopCatalogAsync
             var manifestsOnly = parser.HasFlag("-manifests-only", "-raw-dry-run");
+            var shallow = parser.HasFlag("-shallow");
+            var backfillBatch = parser.Get<uint>(200, "-backfill-batch");
             var output = parser.Get<string>(null, "-output", "-dir");
             var username = parser.Get<string>(null, "-username", "-user");
             var password = parser.Get<string>(null, "-password", "-pass");
@@ -68,7 +70,7 @@ namespace DepotDownloader
 
             if (appId == null)
             {
-                Console.WriteLine("Usage: depotdownloader workshop bootstrap -app <appid> [-page-size 100] [-max-items N] [-manifests-only] [-output <dir>] [-username <user> [-remember-password]]");
+                Console.WriteLine("Usage: depotdownloader workshop bootstrap -app <appid> [-page-size 100] [-max-items N] [-manifests-only] [-shallow] [-backfill-batch 200] [-output <dir>] [-username <user> [-remember-password]]");
                 return 1;
             }
 
@@ -79,7 +81,7 @@ namespace DepotDownloader
 
             try
             {
-                return await ContentDownloader.BootstrapWorkshopCatalogAsync(appId.Value, output, pageSize, maxItems, queryType, manifestsOnly);
+                return await ContentDownloader.BootstrapWorkshopCatalogAsync(appId.Value, output, pageSize, maxItems, queryType, manifestsOnly, shallow, backfillBatch);
             }
             finally
             {
@@ -95,6 +97,8 @@ namespace DepotDownloader
             var output = parser.Get<string>(null, "-output", "-dir");
             var dryRun = parser.HasFlag("-dry-run");
             var manifestsOnly = parser.HasFlag("-manifests-only", "-raw-dry-run");
+            var shallow = parser.HasFlag("-shallow");
+            var backfillBatch = parser.Get<uint>(200, "-backfill-batch");
             var username = parser.Get<string>(null, "-username", "-user");
             var password = parser.Get<string>(null, "-password", "-pass");
             var rememberPassword = parser.HasFlag("-remember-password");
@@ -102,7 +106,7 @@ namespace DepotDownloader
 
             if (appId == null)
             {
-                Console.WriteLine("Usage: depotdownloader workshop poll -app <appid> [-dry-run | -manifests-only] [-output <dir>] [-username <user> [-remember-password]]");
+                Console.WriteLine("Usage: depotdownloader workshop poll -app <appid> [-dry-run | -manifests-only] [-shallow] [-backfill-batch 200] [-output <dir>] [-username <user> [-remember-password]]");
                 return 1;
             }
 
@@ -118,7 +122,7 @@ namespace DepotDownloader
 
             try
             {
-                return await ContentDownloader.PollWorkshopCatalogAsync(appId.Value, output, dryRun, manifestsOnly);
+                return await ContentDownloader.PollWorkshopCatalogAsync(appId.Value, output, dryRun, manifestsOnly, shallow, backfillBatch);
             }
             finally
             {
@@ -307,7 +311,11 @@ namespace DepotDownloader
             Console.WriteLine("  -page-size <n>     Items per QueryFiles page (default 100)");
             Console.WriteLine("  -max-items <n>     Stop after at least this many items (testing; leaves bootstrap");
             Console.WriteLine("                     unmarked-complete so a later run continues normally)");
-            Console.WriteLine("  -query-type <n>    EPublishedFileQueryType (default 21 = RankedByLastUpdatedDate)");
+            Console.WriteLine("  -query-type <n>    EPublishedFileQueryType (default 1 = RankedByPublicationDate - a");
+            Console.WriteLine("                     stable ranking under concurrent workshop activity, since an");
+            Console.WriteLine("                     item's creation time never changes; confirmed empirically that");
+            Console.WriteLine("                     value 21 = RankedByLastUpdatedDate is NOT stable this way and");
+            Console.WriteLine("                     is no longer the default - see README)");
             Console.WriteLine("  -manifests-only    Also fetch every item's manifest (chunk-based) or log its");
             Console.WriteLine("                     metadata without fetching content (ancient UGC) during this");
             Console.WriteLine("                     walk, not just record it in the catalog. MUCH slower - each");
@@ -315,6 +323,18 @@ namespace DepotDownloader
             Console.WriteLine("                     a workshop the size of depot 4000's (~2M items) would take");
             Console.WriteLine("                     well over a week. Pair with -max-items unless the workshop is");
             Console.WriteLine("                     small, or just use \"download\" for what's actually changed.");
+            Console.WriteLine("  -shallow           Skip fetching each item's full GetChangeHistory during this");
+            Console.WriteLine("                     walk (the default is to fetch it, so an item that updated more");
+            Console.WriteLine("                     than once between checks doesn't silently lose the versions in");
+            Console.WriteLine("                     between). Items are marked history-incomplete and backfilled");
+            Console.WriteLine("                     gradually by later runs instead (see -backfill-batch). Full");
+            Console.WriteLine("                     history costs a whole extra round-trip PER ITEM, not per page -");
+            Console.WriteLine("                     worth using for a huge workshop's very first bootstrap.");
+            Console.WriteLine("  -backfill-batch <n> Items to backfill full history for per run when this catalog");
+            Console.WriteLine("                     already has some marked incomplete (default 200; 0 disables the");
+            Console.WriteLine("                     sweep). Bounded so a large backlog is worked off gradually");
+            Console.WriteLine("                     across runs, not all in one - runs even after bootstrap has");
+            Console.WriteLine("                     already completed, so re-running it later still makes progress.");
             Console.WriteLine();
             Console.WriteLine("DOWNLOAD - the actual content-acquisition step, in two forms:");
             Console.WriteLine("  -app <appid>       Catalog-driven: walk an app's existing catalog (from bootstrap/");
@@ -348,15 +368,24 @@ namespace DepotDownloader
             Console.WriteLine("       back, confirmed rejected (EResult.Ignored) 7 days back on a high-churn app;");
             Console.WriteLine("       poll at least every couple of days. A rejected poll prints instructions to");
             Console.WriteLine("       re-run bootstrap rather than treating it as a fatal error.");
+            Console.WriteLine("       Full history is fetched by default for every changed item, same reasoning as");
+            Console.WriteLine("       bootstrap's own -shallow above - GetItemChanges only ever says \"this changed");
+            Console.WriteLine("       since X,\" never how many times, so without it an item updated twice between");
+            Console.WriteLine("       two polls would silently lose the version in between. Cheap here since poll's");
+            Console.WriteLine("       delta set is normally a tiny fraction of the whole catalog.");
             Console.WriteLine("  -dry-run           Report what would be checked/downloaded - fetches nothing at all");
             Console.WriteLine("  -manifests-only    Same meaning as on \"download\" above");
+            Console.WriteLine("  -shallow           Same meaning as on \"bootstrap\" above - also skips this poll's");
+            Console.WriteLine("                     -backfill-batch sweep of any items still marked incomplete");
+            Console.WriteLine("  -backfill-batch <n> Same meaning as on \"bootstrap\" above - runs after this poll's");
+            Console.WriteLine("                     own delta, so a poll schedule doubles as steady backfill progress");
             Console.WriteLine();
             Console.WriteLine("STATUS - summary counts by default. Add -list for the actual per-item view (there is");
             Console.WriteLine("         no other way to inspect a catalog - workshop_catalog.bin is protobuf/Deflate,");
             Console.WriteLine("         not a text format meant to be opened directly). Sorted by ID for stable,");
             Console.WriteLine("         diffable output across runs.");
             Console.WriteLine("  -list              Print each matching item: ID, kind, manifest ID, last update/seen");
-            Console.WriteLine("                     time, title");
+            Console.WriteLine("                     time, history entry count + complete/partial, title");
             Console.WriteLine("    -kind <k>            Filter: chunk, ancient, or unknown");
             Console.WriteLine("    -only <id,id2,...>   Filter to specific IDs");
             Console.WriteLine("    -limit <n>           Cap rows printed (default 200; 0 = no limit)");
