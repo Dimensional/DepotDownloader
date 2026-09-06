@@ -15,6 +15,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Text.RegularExpressions;
 using System.Threading.Tasks;
 using SteamKit2;
 using SteamKit2.Internal;
@@ -641,7 +642,7 @@ namespace DepotDownloader
         /// real inspection path. Sorted by PublishedFileId (not dictionary/insertion order) so two
         /// snapshots of the same catalog print identically and diff cleanly.
         /// </summary>
-        public static int PrintWorkshopCatalogList(uint appId, string outputRoot, HashSet<ulong> onlyIds, WorkshopItemKind? kindFilter, uint limit)
+        public static int PrintWorkshopCatalogList(uint appId, string outputRoot, HashSet<ulong> onlyIds, WorkshopItemKind? kindFilter, Regex nameFilter, uint limit)
         {
             outputRoot = ResolveOutputRoot(outputRoot);
             var catalogPath = WorkshopCatalog.GetPath(outputRoot, appId);
@@ -663,6 +664,10 @@ namespace DepotDownloader
             {
                 items = items.Where(i => i.Kind == kindFilter.Value);
             }
+            if (nameFilter != null)
+            {
+                items = items.Where(i => nameFilter.IsMatch(i.Title ?? string.Empty));
+            }
 
             var matching = items.OrderBy(i => i.PublishedFileId).ToList();
             var shown = limit == 0 ? matching : matching.Take((int)limit).ToList();
@@ -682,7 +687,7 @@ namespace DepotDownloader
 
             Console.WriteLine();
             Console.WriteLine(shown.Count < matching.Count
-                ? $"Showing {shown.Count:N0} of {matching.Count:N0} matching item(s) - pass -limit 0 to print all, or narrow with -only/-kind."
+                ? $"Showing {shown.Count:N0} of {matching.Count:N0} matching item(s) - pass -limit 0 to print all, or narrow with -only/-kind/-name."
                 : $"{matching.Count:N0} matching item(s).");
 
             return 0;

@@ -897,7 +897,10 @@ directly, so `status -list` is the way to see what was recorded: one row per ite
 manifest/content handle, last-update/last-seen time, a `History` column showing entry count and
 whether it's complete or partial, title). Rows are sorted by ID rather than dictionary order, so two
 snapshots print identically and diff cleanly. Defaults to the first 200 matching rows (`-limit 0`
-for all); narrow with `-kind chunk|ancient|unknown` and/or `-only <id,id2,...>`.
+for all); narrow with `-kind chunk|ancient|unknown`, `-only <id,id2,...>`, and/or `-name <pattern>` -
+a case-insensitive .NET regex matched against title, so plain text works as an ordinary substring
+search and `-name "Mario|Samus|Metroid"` finds any of several names in one pass rather than needing
+a separate multi-term flag.
 
 On load, a corrupt, truncated, or incompatible-version catalog fails loudly with a clear message
 rather than silently misreading it - protobuf-net's wire format is self-describing (field number and
@@ -934,6 +937,7 @@ depotdownloader workshop download -workshop 123456 789012                   # ad
 depotdownloader workshop poll -app 4000 -username myaccount -remember-password
 depotdownloader workshop status -app 4000
 depotdownloader workshop status -app 4000 -list -kind ancient -limit 50      # inspect the actual items
+depotdownloader workshop status -app 4000 -list -name "Mario|Samus|Metroid"  # regex title search
 ```
 
 ---

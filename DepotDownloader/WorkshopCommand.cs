@@ -3,6 +3,7 @@
 
 using System;
 using System.Collections.Generic;
+using System.Text.RegularExpressions;
 using System.Threading.Tasks;
 
 namespace DepotDownloader
@@ -210,13 +211,14 @@ namespace DepotDownloader
             var list = parser.HasFlag("-list");
             var kindRaw = parser.Get<string>(null, "-kind");
             var onlyRaw = parser.Get<string>(null, "-only");
+            var nameRaw = parser.Get<string>(null, "-name");
             var limit = parser.Get<uint>(200, "-limit");
             parser.WarnUnconsumed();
 
             if (appId == null)
             {
                 Console.WriteLine("Usage: depotdownloader workshop status -app <appid> [-output <dir>]");
-                Console.WriteLine("       depotdownloader workshop status -app <appid> -list [-kind chunk|ancient|unknown] [-only <id,id2,...>] [-limit N]");
+                Console.WriteLine("       depotdownloader workshop status -app <appid> -list [-kind chunk|ancient|unknown] [-only <id,id2,...>] [-name <pattern>] [-limit N]");
                 return 1;
             }
 
@@ -253,8 +255,25 @@ namespace DepotDownloader
                 }
             }
 
+            Regex nameFilter = null;
+            if (!string.IsNullOrWhiteSpace(nameRaw))
+            {
+                try
+                {
+                    // Plain text works as an ordinary case-insensitive substring search (IsMatch,
+                    // not a full-string match), and it's real regex - "Mario|Samus|Metroid" finds
+                    // any of several names in one pass without needing a separate multi-term flag.
+                    nameFilter = new Regex(nameRaw, RegexOptions.IgnoreCase);
+                }
+                catch (ArgumentException ex)
+                {
+                    Console.WriteLine($"Error: invalid -name pattern '{nameRaw}': {ex.Message}");
+                    return 1;
+                }
+            }
+
             Console.WriteLine();
-            return ContentDownloader.PrintWorkshopCatalogList(appId.Value, output, onlyIds, kindFilter, limit);
+            return ContentDownloader.PrintWorkshopCatalogList(appId.Value, output, onlyIds, kindFilter, nameFilter, limit);
         }
 
         private static bool LogOn(string username, string password, bool rememberPassword)
@@ -403,6 +422,9 @@ namespace DepotDownloader
             Console.WriteLine("                     time, history entry count + complete/partial, title");
             Console.WriteLine("    -kind <k>            Filter: chunk, ancient, or unknown");
             Console.WriteLine("    -only <id,id2,...>   Filter to specific IDs");
+            Console.WriteLine("    -name <pattern>      Filter by title - a case-insensitive regex (.NET syntax),");
+            Console.WriteLine("                         so plain text matches as a substring and \"Mario|Samus|");
+            Console.WriteLine("                         Metroid\" matches any of several names in one pass");
             Console.WriteLine("    -limit <n>           Cap rows printed (default 200; 0 = no limit)");
             Console.WriteLine();
             Console.WriteLine("COMMON OPTIONS:");
@@ -420,6 +442,7 @@ namespace DepotDownloader
             Console.WriteLine("  depotdownloader workshop poll -app 4000 -username myaccount -remember-password");
             Console.WriteLine("  depotdownloader workshop status -app 4000");
             Console.WriteLine("  depotdownloader workshop status -app 4000 -list -kind ancient -limit 50");
+            Console.WriteLine("  depotdownloader workshop status -app 4000 -list -name \"Mario|Samus|Metroid\"");
         }
     }
 }
