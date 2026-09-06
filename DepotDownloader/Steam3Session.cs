@@ -453,7 +453,7 @@ namespace DepotDownloader
         /// <param name="dateRangeCreatedEnd">
         /// Optional upper bound on time_created (the request's own date_range_created.timestamp_end
         /// - confirmed to exist as a real request field, not something this project added). Exists
-        /// purely for WorkshopCatalog.LastRecordedCreationTime's recovery role: pass it ONLY on a
+        /// purely for WorkshopCatalogDb.LastRecordedCreationTime's recovery role: pass it ONLY on a
         /// fresh/reset "*" query (see "workshop bootstrap -reset-cursor") so it re-enters the
         /// ranking near where an old cursor left off instead of from the very newest item again.
         /// Deliberately NOT something to pass alongside an already-advancing real cursor, even

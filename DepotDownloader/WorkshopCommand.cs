@@ -6,6 +6,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Text.RegularExpressions;
 using System.Threading.Tasks;
+using Microsoft.Data.Sqlite;
 
 namespace DepotDownloader
 {
@@ -16,7 +17,7 @@ namespace DepotDownloader
     /// ancient/direct-URL UGC items (see WorkshopItemKind) - built on SteamKit2's PublishedFile.
     /// QueryFiles/GetItemChanges/GetChangeHistory/GetDetails unified-messages RPCs. See
     /// ContentDownloader.WorkshopTracker.cs for the actual bootstrap/poll/refresh/download logic
-    /// and WorkshopCatalog.cs for the persisted state, and the README for the empirically-
+    /// and WorkshopCatalogDb.cs for the persisted state, and the README for the empirically-
     /// confirmed access/timing restrictions this depends on.
     /// </summary>
     static class WorkshopCommand
@@ -89,7 +90,7 @@ namespace DepotDownloader
             {
                 return await ContentDownloader.BootstrapWorkshopCatalogAsync(appId.Value, output, pageSize, maxItems, queryType, manifestsOnly, shallow, backfillBatch, resetCursor);
             }
-            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or SqliteException)
             {
                 PrintCatalogSaveFailure(ex);
                 return 1;
@@ -136,7 +137,7 @@ namespace DepotDownloader
             {
                 return await ContentDownloader.PollWorkshopCatalogAsync(appId.Value, output, dryRun, manifestsOnly, shallow, backfillBatch, catalogOnly);
             }
-            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or SqliteException)
             {
                 PrintCatalogSaveFailure(ex);
                 return 1;
@@ -197,7 +198,7 @@ namespace DepotDownloader
             {
                 return await ContentDownloader.RefreshWorkshopCatalogAsync(appId.Value, output, onlyIds, batchSize, maxItems);
             }
-            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or SqliteException)
             {
                 PrintCatalogSaveFailure(ex);
                 return 1;
@@ -271,7 +272,7 @@ namespace DepotDownloader
 
                 return await ContentDownloader.DownloadWorkshopCatalogAsync(appId.Value, output, history, onlyIds, manifestsOnly, maxItems);
             }
-            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or SqliteException)
             {
                 PrintCatalogSaveFailure(ex);
                 return 1;
@@ -282,17 +283,17 @@ namespace DepotDownloader
             }
         }
 
-        // Reached only after CheckpointFile's own several-second retry budget is exhausted - by
-        // then this is a real, if usually transient, condition (antivirus scanning a large
-        // catalog file, a backup/cloud-sync tool holding it open, or another instance of this
-        // command running concurrently), not a bug to crash the whole process over with a raw
-        // stack trace. Whatever was last successfully saved is intact on disk either way -
-        // CheckpointFile's tmp+atomic-move save means there is no partial/torn state to worry
-        // about - so the only real cost of stopping here is re-running the same command.
+        // The workshop catalog is a SQLite database in WAL mode (see WorkshopCatalogDb) -
+        // concurrent readers (another "status" call, a SQLite browser tool) don't block a writer
+        // or vice versa, so this is no longer the routine collision it was under the old
+        // whole-file-rewrite design. Reaching here means something more fundamental (disk full,
+        // permissions, a genuinely corrupt database file) - not a bug to crash the whole process
+        // over with a raw stack trace regardless. Every write that already succeeded is durably
+        // committed either way; the only real cost of stopping here is re-running the same command.
         private static void PrintCatalogSaveFailure(Exception ex)
         {
-            Console.WriteLine($"Error: could not save the workshop catalog - {ex.GetType().Name}: {ex.Message}");
-            Console.WriteLine("Something else likely had an unusually long exclusive lock on the catalog file (antivirus scanning it, a backup/cloud-sync tool, or another instance of this command reading it) - saves already retry transient collisions for several seconds before giving up. Your progress through the last successful save is safe on disk; re-run the same command to resume from there.");
+            Console.WriteLine($"Error: could not access the workshop catalog database - {ex.GetType().Name}: {ex.Message}");
+            Console.WriteLine("Check available disk space and file permissions on the catalog's folder. Every change that already succeeded is durably saved; re-run the same command to resume from there.");
         }
 
         private static int StatusAsync(string[] args)
@@ -525,10 +526,10 @@ namespace DepotDownloader
             Console.WriteLine("  -max-items <n>     Stop after checking this many IDs (resumable - re-run to continue,");
             Console.WriteLine("                     or use -only to target specific IDs across separate runs)");
             Console.WriteLine();
-            Console.WriteLine("STATUS - summary counts by default. Add -list for the actual per-item view (there is");
-            Console.WriteLine("         no other way to inspect a catalog - workshop_catalog.bin is protobuf/Deflate,");
-            Console.WriteLine("         not a text format meant to be opened directly). Sorted by ID for stable,");
-            Console.WriteLine("         diffable output across runs.");
+            Console.WriteLine("STATUS - summary counts by default. Add -list for the per-item view - or open");
+            Console.WriteLine("         workshop_catalog.db directly with any SQLite tool (sqlite3, DB Browser for");
+            Console.WriteLine("         SQLite, etc.) for real ad-hoc queries. Sorted by ID for stable, diffable");
+            Console.WriteLine("         output across runs.");
             Console.WriteLine("  -list              Print each matching item: ID, kind, manifest ID, last update/seen");
             Console.WriteLine("                     time, history entry count + complete/partial, title (tagged");
             Console.WriteLine("                     [DELETED], [BANNED], or [NOT PUBLIC] if \"workshop refresh\" found any)");

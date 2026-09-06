@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net9.0</TargetFramework>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Only for reading the OLD protobuf/Deflate workshop_catalog.bin format - the DepotDownloader
+         project itself dropped this dependency for the workshop catalog once it moved to SQLite
+         (see DepotDownloader/WorkshopCatalogDb.cs). This project's own LegacyCatalog.cs carries a
+         self-contained copy of the old wire-format classes so that removal doesn't need undoing
+         just for this one-time tool. -->
+    <PackageReference Include="protobuf-net" Version="3.4.21" />
+    <!-- The NEW format - reused directly rather than reimplemented, so this tool can never drift
+         from what the real application actually reads/writes. -->
+    <ProjectReference Include="..\..\DepotDownloader\DepotDownloader.csproj" />
+  </ItemGroup>
+</Project>

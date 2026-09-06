@@ -3,7 +3,7 @@
 
 // "workshop bootstrap"/"poll": a two-phase automatic-update-tracking pipeline covering an app's
 // entire workshop - both chunk-based items (depot ID == app ID) and ancient/direct-URL UGC items
-// (see WorkshopItemKind in WorkshopCatalog.cs - see README). Bootstrap walks PublishedFile.
+// (see WorkshopItemKind in WorkshopCatalogDb.cs - see README). Bootstrap walks PublishedFile.
 // QueryFiles once to record every item's current state; poll then calls PublishedFile.
 // GetItemChanges to find just what changed since last time, and archives only those via
 // DownloadPubfileRawAsync - the same per-item entry point "download -workshop -raw" uses, so both
@@ -66,10 +66,7 @@ namespace DepotDownloader
         public static async Task<int> BootstrapWorkshopCatalogAsync(uint appId, string outputRoot, uint pageSize, uint maxItems, uint queryType, bool manifestsOnly = false, bool shallow = false, uint backfillBatch = 200, bool resetCursor = false)
         {
             outputRoot = ResolveOutputRoot(outputRoot);
-            var catalogPath = WorkshopCatalog.GetPath(outputRoot, appId);
-            Directory.CreateDirectory(Path.GetDirectoryName(catalogPath));
-
-            var catalog = WorkshopCatalog.LoadOrCreate(catalogPath, appId);
+            using var catalog = WorkshopCatalogDb.Open(outputRoot, appId);
 
             if (resetCursor)
             {
@@ -87,9 +84,9 @@ namespace DepotDownloader
 
                 catalog.BootstrapCursor = "*";
                 Console.WriteLine(catalog.LastRecordedCreationTime > 0
-                    ? $"Cursor reset - re-entering the walk bounded at time_created <= {catalog.LastRecordedCreationTime} ({DateTimeOffset.FromUnixTimeSeconds(catalog.LastRecordedCreationTime):u}). {catalog.Items.Count:N0} already-recorded items are kept."
-                    : $"Cursor reset, but no recorded creation-time anchor exists (query-type isn't RankedByPublicationDate, or nothing was recorded under it yet) - this will restart from the newest item. {catalog.Items.Count:N0} already-recorded items are still kept.");
-                catalog.Save(catalogPath);
+                    ? $"Cursor reset - re-entering the walk bounded at time_created <= {catalog.LastRecordedCreationTime} ({DateTimeOffset.FromUnixTimeSeconds(catalog.LastRecordedCreationTime):u}). {catalog.ItemCount():N0} already-recorded items are kept."
+                    : $"Cursor reset, but no recorded creation-time anchor exists (query-type isn't RankedByPublicationDate, or nothing was recorded under it yet) - this will restart from the newest item. {catalog.ItemCount():N0} already-recorded items are still kept.");
+                catalog.SaveMeta();
             }
 
             // Runs once per invocation, regardless of whether bootstrap itself is complete yet -
@@ -100,13 +97,13 @@ namespace DepotDownloader
             // without needing to delete anything and start over.
             if (!shallow)
             {
-                await BackfillIncompleteHistoryAsync(catalog, catalogPath, backfillBatch);
+                await BackfillIncompleteHistoryAsync(catalog, backfillBatch);
             }
 
             if (catalog.BootstrapCompleted)
             {
-                Console.WriteLine($"Bootstrap already completed for app {appId} ({catalog.Items.Count:N0} items recorded).");
-                Console.WriteLine($"Delete {catalogPath} to force a full re-bootstrap, or run 'workshop poll' to pick up changes since.");
+                Console.WriteLine($"Bootstrap already completed for app {appId} ({catalog.ItemCount():N0} items recorded).");
+                Console.WriteLine($"Delete {WorkshopCatalogDb.GetPath(outputRoot, appId)} to force a full re-bootstrap, or run 'workshop poll' to pick up changes since.");
                 return 0;
             }
 
@@ -127,7 +124,8 @@ namespace DepotDownloader
                 Console.WriteLine($"Note: this catalog's walk started under query-type {catalog.QueryType} - ignoring the different -query-type {queryType} passed here (a resumed cursor is only valid under its original ranking). Delete the catalog to restart under a different query-type.");
             }
 
-            Console.WriteLine($"Bootstrapping workshop catalog for app {appId} (resuming at {catalog.Items.Count:N0} items already recorded)...");
+            var recordedCount = catalog.ItemCount();
+            Console.WriteLine($"Bootstrapping workshop catalog for app {appId} (resuming at {recordedCount:N0} items already recorded)...");
 
             if (manifestsOnly)
             {
@@ -151,7 +149,6 @@ namespace DepotDownloader
                 Console.WriteLine("Full history (GetChangeHistory) will also be fetched for every new item during this walk - safe for a modest workshop, but adds a full extra round-trip PER ITEM. Pass -shallow to skip this for a large workshop's first bootstrap (items are marked history-incomplete and backfilled gradually afterward instead).");
             }
 
-            var pagesSinceSave = 0;
             var safetyPageBudget = int.MaxValue;
 
             try
@@ -177,7 +174,7 @@ namespace DepotDownloader
                     if (result != EResult.OK || body == null)
                     {
                         Console.WriteLine($"QueryFiles failed: {result}. Progress saved - re-run the same command to resume.");
-                        catalog.Save(catalogPath);
+                        catalog.SaveMeta();
                         return 1;
                     }
 
@@ -210,9 +207,10 @@ namespace DepotDownloader
                             TimeUpdated = d.time_updated,
                             LastSeenAt = now,
                         };
-                        catalog.Items[d.publishedfileid] = item;
+                        catalog.UpsertItem(item);
+                        recordedCount++;
 
-                        // Recovery anchor only - see WorkshopCatalog.LastRecordedCreationTime.
+                        // Recovery anchor only - see WorkshopCatalogDb.LastRecordedCreationTime.
                         // Only meaningful under the stable ranking (time_created never reorders
                         // under it, unlike time_updated) - tracking this under query-type 21 would
                         // record a boundary a later date_range_created-bounded re-entry can't
@@ -224,7 +222,7 @@ namespace DepotDownloader
 
                         if (!shallow)
                         {
-                            await FetchAndRecordHistoryAsync(item);
+                            await FetchAndRecordHistoryAsync(catalog, d.publishedfileid);
                             await Task.Delay(WorkshopApiPacingDelay);
                         }
                         else
@@ -232,8 +230,7 @@ namespace DepotDownloader
                             // Seed with just the one entry already known for free (no extra call) -
                             // still marked incomplete regardless, since a single current snapshot
                             // can't tell us whether other versions exist in between.
-                            item.History = [new WorkshopHistoryEntry { Timestamp = d.time_updated, ManifestId = d.hcontent_file }];
-                            item.HistoryComplete = false;
+                            catalog.ReplaceHistory(d.publishedfileid, [new WorkshopHistoryEntry { Timestamp = d.time_updated, ManifestId = d.hcontent_file }], complete: false);
                         }
 
                         if (manifestsOnly)
@@ -256,7 +253,7 @@ namespace DepotDownloader
                         }
                     }
 
-                    Console.WriteLine($"  {catalog.Items.Count:N0} items recorded so far (of ~{body.total:N0} reported by Steam)...");
+                    Console.WriteLine($"  {recordedCount:N0} items recorded so far (of ~{body.total:N0} reported by Steam)...");
 
                     // Compare against the cursor we just queried WITH (not the previous
                     // request's) - this is what actually detects "the server stopped advancing".
@@ -268,33 +265,29 @@ namespace DepotDownloader
                     {
                         catalog.BootstrapCompleted = true;
                         catalog.BootstrapCompletedAt = now;
-                        catalog.Save(catalogPath);
-                        Console.WriteLine($"Bootstrap complete: {catalog.Items.Count:N0} items recorded for app {appId}.");
+                        catalog.SaveMeta();
+                        Console.WriteLine($"Bootstrap complete: {recordedCount:N0} items recorded for app {appId}.");
                         return 0;
                     }
 
                     catalog.BootstrapCursor = body.next_cursor;
 
-                    if (maxItems > 0 && catalog.Items.Count >= maxItems)
+                    if (maxItems > 0 && recordedCount >= maxItems)
                     {
-                        catalog.Save(catalogPath);
+                        catalog.SaveMeta();
                         Console.WriteLine($"Reached -max-items {maxItems} - stopping early (bootstrap NOT marked complete; re-run without -max-items to continue).");
                         return 0;
                     }
 
-                    // Every 5 pages (not 20) - a real multi-hour run losing more than ~500 items'
-                    // worth of already-fetched-but-unsaved progress to an interruption is a real
-                    // cost at this data's scale; the write itself is cheap (small protobuf+deflate
-                    // file).
-                    if (++pagesSinceSave >= 5)
-                    {
-                        catalog.Save(catalogPath);
-                        pagesSinceSave = 0;
-                    }
+                    // Every item upserted above is already durably written on its own (see
+                    // WorkshopCatalogDb's own doc comment) - unlike the old design, there's no
+                    // separate "checkpoint" of item data left to throttle. This only flushes the
+                    // small meta row (cursor/recovery anchor/etc), which is cheap enough now to do
+                    // every page rather than counting pages between saves.
+                    catalog.SaveMeta();
 
                     if (--safetyPageBudget <= 0)
                     {
-                        catalog.Save(catalogPath);
                         Console.WriteLine("Warning: page count far exceeded the expected total - stopping to avoid an unbounded loop. Progress saved; re-run to resume, or investigate before continuing.");
                         return 1;
                     }
@@ -313,8 +306,8 @@ namespace DepotDownloader
                 // too). Progress is saved regardless - the whole point of resumable bootstrap is
                 // that this is a "re-run the same command" situation, not a crash.
                 Console.WriteLine($"Bootstrap stopped after repeated {ex.GetType().Name}s - this looks like throttling or a sustained network issue, not a bug in what's been recorded so far.");
-                catalog.Save(catalogPath);
-                Console.WriteLine($"Progress saved ({catalog.Items.Count:N0} items) - re-run the same command to resume.");
+                catalog.SaveMeta();
+                Console.WriteLine($"Progress saved ({recordedCount:N0} items) - re-run the same command to resume.");
                 return 1;
             }
         }
@@ -322,16 +315,15 @@ namespace DepotDownloader
         public static async Task<int> PollWorkshopCatalogAsync(uint appId, string outputRoot, bool dryRun, bool manifestsOnly = false, bool shallow = false, uint backfillBatch = 200, bool catalogOnly = false)
         {
             outputRoot = ResolveOutputRoot(outputRoot);
-            var catalogPath = WorkshopCatalog.GetPath(outputRoot, appId);
 
-            if (!File.Exists(catalogPath))
+            if (!File.Exists(WorkshopCatalogDb.GetPath(outputRoot, appId)))
             {
-                Console.WriteLine($"No catalog found for app {appId} at {catalogPath}.");
+                Console.WriteLine($"No catalog found for app {appId} at {WorkshopCatalogDb.GetPath(outputRoot, appId)}.");
                 Console.WriteLine($"Run 'workshop bootstrap -app {appId}' first.");
                 return 1;
             }
 
-            var catalog = WorkshopCatalog.LoadOrCreate(catalogPath, appId);
+            using var catalog = WorkshopCatalogDb.Open(outputRoot, appId);
 
             if (!catalog.BootstrapCompleted)
             {
@@ -362,7 +354,7 @@ namespace DepotDownloader
 
             if (result == EResult.Ignored)
             {
-                catalog.Save(catalogPath);
+                catalog.SaveMeta();
                 Console.WriteLine("Result: Ignored - the watermark is older than GetItemChanges will currently honor (empirically somewhere between 96h and 7 days on a high-churn app - see README).");
                 Console.WriteLine($"Run 'workshop bootstrap -app {appId}' again to catch up (it resumes/refreshes the existing catalog) - this also resets the watermark.");
                 return 2;
@@ -370,7 +362,7 @@ namespace DepotDownloader
 
             if (result != EResult.OK || body == null)
             {
-                catalog.Save(catalogPath);
+                catalog.SaveMeta();
                 Console.WriteLine($"GetItemChanges failed: {result}");
                 return 1;
             }
@@ -382,14 +374,14 @@ namespace DepotDownloader
 
             foreach (var change in body.workshop_items)
             {
-                catalog.Items.TryGetValue(change.published_file_id, out var existing);
+                catalog.TryGetItem(change.published_file_id, out var existing);
                 var isNew = existing == null;
 
                 // True preview: no network calls beyond GetItemChanges itself, no catalog
                 // mutation, nothing persisted - reports using only what's already in memory. A
                 // real bug lived here previously: this used to fall through to the same
-                // catalog.Items write / reclassification call / watermark advance / catalog.Save
-                // as a real poll, differing only in skipping the actual archive step - so running
+                // catalog write / reclassification call / watermark advance / meta save as a
+                // real poll, differing only in skipping the actual archive step - so running
                 // "-dry-run" then a real poll later would silently never re-see or archive
                 // whatever it had "previewed," since the watermark had already moved past it and
                 // the catalog already held its new ManifestId.
@@ -447,6 +439,10 @@ namespace DepotDownloader
                     && existing != null
                     && existing.ManifestId == change.manifest_id;
 
+                // History carried forward, not reset - a fresh fetch below (unless -shallow)
+                // overwrites both the entries and these two fields for real; -shallow explicitly
+                // marks incomplete instead, even if it happened to look complete before (a
+                // reported change is itself reason enough not to trust the old history anymore).
                 var newItem = new WorkshopCatalogItem
                 {
                     PublishedFileId = change.published_file_id,
@@ -456,12 +452,10 @@ namespace DepotDownloader
                     ManifestId = change.manifest_id,
                     TimeUpdated = change.time_updated,
                     LastSeenAt = catalog.LastPolledAt,
-                    // Carried forward, not reset - overwritten below only if this pass actually
-                    // fetches history itself.
-                    History = existing?.History ?? [],
-                    HistoryComplete = existing?.HistoryComplete ?? false,
+                    HistoryCount = existing?.HistoryCount ?? 0,
+                    HistoryComplete = !shallow && (existing?.HistoryComplete ?? false),
                 };
-                catalog.Items[change.published_file_id] = newItem;
+                catalog.UpsertItem(newItem);
 
                 if (skip)
                 {
@@ -476,17 +470,13 @@ namespace DepotDownloader
                 // Full history by default - GetItemChanges only ever says "this changed since X,"
                 // never how many times or through what intermediate versions, so without this an
                 // item that updated more than once between polls would silently lose everything
-                // but its latest state. No incremental fetch exists (see
-                // WorkshopCatalogItem.History) - this always re-fetches and overwrites the whole
-                // list, whether or not it was already complete.
+                // but its latest state. No incremental fetch exists (see ReplaceHistory) - this
+                // always re-fetches and overwrites the whole list, whether or not it was already
+                // complete.
                 if (!shallow)
                 {
-                    await FetchAndRecordHistoryAsync(newItem);
+                    await FetchAndRecordHistoryAsync(catalog, change.published_file_id);
                     await Task.Delay(WorkshopApiPacingDelay);
-                }
-                else
-                {
-                    newItem.HistoryComplete = false;
                 }
 
                 // -catalog-only stops here, the same way bootstrap's plain default does: the
@@ -532,14 +522,15 @@ namespace DepotDownloader
             }
 
             // Nothing below this point runs for -dry-run: no watermark advance, no backfill
-            // sweep, no save - a dry run must leave the catalog byte-for-byte as it found it, or
-            // a later real poll could silently never re-see (and so never archive) whatever this
-            // one "previewed."
+            // sweep, no meta save - a dry run must leave the catalog byte-for-byte as it found
+            // it, or a later real poll could silently never re-see (and so never archive)
+            // whatever this one "previewed."
             if (!dryRun)
             {
                 // Advance only to what GetItemChanges itself reported, never to "now" - so a poll
                 // can never silently skip a window it didn't actually ask Steam about.
                 catalog.LastWatermark = body.update_time;
+                catalog.SaveMeta();
 
                 // Beyond this poll's own delta, also chip away at any items still marked
                 // history-incomplete from an earlier "-shallow" pass - not just the ones this
@@ -547,10 +538,8 @@ namespace DepotDownloader
                 // an otherwise-cheap poll into a long sweep by accident.
                 if (!shallow)
                 {
-                    await BackfillIncompleteHistoryAsync(catalog, catalogPath, backfillBatch);
+                    await BackfillIncompleteHistoryAsync(catalog, backfillBatch);
                 }
-
-                catalog.Save(catalogPath);
             }
 
             var verb = catalogOnly ? "Recorded catalog entries for" : manifestsOnly ? "Recorded manifests/metadata for" : "Downloaded";
@@ -580,27 +569,24 @@ namespace DepotDownloader
         public static async Task<int> RefreshWorkshopCatalogAsync(uint appId, string outputRoot, HashSet<ulong> onlyIds, uint batchSize, uint maxItems)
         {
             outputRoot = ResolveOutputRoot(outputRoot);
-            var catalogPath = WorkshopCatalog.GetPath(outputRoot, appId);
 
-            if (!File.Exists(catalogPath))
+            if (!File.Exists(WorkshopCatalogDb.GetPath(outputRoot, appId)))
             {
-                Console.WriteLine($"No catalog found for app {appId} at {catalogPath}.");
+                Console.WriteLine($"No catalog found for app {appId} at {WorkshopCatalogDb.GetPath(outputRoot, appId)}.");
                 Console.WriteLine($"Run 'workshop bootstrap -app {appId}' first.");
                 return 1;
             }
 
-            var catalog = WorkshopCatalog.LoadOrCreate(catalogPath, appId);
-
-            IEnumerable<ulong> candidateIds = catalog.Items.Keys;
-            if (onlyIds is { Count: > 0 })
-            {
-                candidateIds = candidateIds.Where(onlyIds.Contains);
-            }
+            using var catalog = WorkshopCatalogDb.Open(outputRoot, appId);
 
             // Sorted for the same reason "status -list" is: two runs (or a run resumed via
-            // -max-items) walk IDs in a stable, repeatable order rather than whatever a
-            // Dictionary's own enumeration order happens to be.
-            var ids = candidateIds.OrderBy(id => id).ToList();
+            // -max-items) walk IDs in a stable, repeatable order rather than whatever order the
+            // database happened to return them in.
+            var ids = catalog.GetAllIds();
+            if (onlyIds is { Count: > 0 })
+            {
+                ids = ids.Where(onlyIds.Contains).ToList();
+            }
             if (maxItems > 0 && ids.Count > (int)maxItems)
             {
                 ids = ids.Take((int)maxItems).ToList();
@@ -619,7 +605,6 @@ namespace DepotDownloader
             var newlyBanned = 0;
             var newlyDeleted = 0;
             var unresolved = 0;
-            var batchesSinceSave = 0;
             var now = (uint)DateTimeOffset.UtcNow.ToUnixTimeSeconds();
 
             for (var offset = 0; offset < ids.Count; offset += (int)batchSize)
@@ -631,8 +616,9 @@ namespace DepotDownloader
 
                 if (result != EResult.OK || details == null)
                 {
-                    Console.WriteLine($"GetDetails failed for the batch starting at offset {offset}: {result}. Progress saved for everything checked so far - re-run with the same -only/-max-items (or none) to pick up where this left off; already-corrected entries are simply re-verified, not duplicated.");
-                    catalog.Save(catalogPath);
+                    // Nothing buffered in memory to lose here - every item already checked this
+                    // run was already durably written as it was processed (see UpsertItem).
+                    Console.WriteLine($"GetDetails failed for the batch starting at offset {offset}: {result}. Everything checked so far is already saved - re-run with the same -only/-max-items (or none) to pick up where this left off; already-corrected entries are simply re-verified, not duplicated.");
                     return 1;
                 }
 
@@ -642,7 +628,7 @@ namespace DepotDownloader
                 {
                     checkedCount++;
 
-                    if (!catalog.Items.TryGetValue(id, out var item))
+                    if (!catalog.TryGetItem(id, out var item))
                     {
                         continue; // shouldn't happen - every id here came from the catalog itself
                     }
@@ -664,6 +650,7 @@ namespace DepotDownloader
                         if (resultCode == EResult.FileNotFound && !item.Deleted)
                         {
                             item.Deleted = true;
+                            catalog.UpsertItem(item);
                             changedCount++;
                             newlyDeleted++;
                             Console.WriteLine($"  DELETED {id} \"{item.Title}\"");
@@ -683,7 +670,7 @@ namespace DepotDownloader
                     var fileUrl = kind == WorkshopItemKind.AncientUgc ? d.file_url : null;
                     // Normalized before comparing AND storing - GetDetails returns "" for a
                     // non-banned item, but every existing catalog entry predates this field and
-                    // loads it at protobuf's zero-value default (null); treating those as distinct
+                    // loads it at its own zero-value default (null); treating those as distinct
                     // would flag nearly every item as "changed" on its first-ever refresh even
                     // when nothing real differs (caught live: a real refresh against known-good
                     // items reported all three as "corrected" purely from this null-vs-"" gap).
@@ -708,6 +695,10 @@ namespace DepotDownloader
                     item.Visibility = d.visibility;
                     item.Deleted = false;
                     item.LastSeenAt = now;
+                    // History untouched either way - UpsertItem never writes history rows itself
+                    // (see its own doc comment), so item.HistoryComplete/HistoryCount (already
+                    // loaded as-is by TryGetItem) just write back unchanged.
+                    catalog.UpsertItem(item);
 
                     if (changed)
                     {
@@ -728,18 +719,10 @@ namespace DepotDownloader
                     }
                 }
 
-                if (++batchesSinceSave >= 5)
-                {
-                    catalog.Save(catalogPath);
-                    batchesSinceSave = 0;
-                }
-
                 Console.WriteLine($"  {checkedCount:N0} of {ids.Count:N0} checked...");
 
                 await Task.Delay(WorkshopApiPacingDelay);
             }
-
-            catalog.Save(catalogPath);
 
             Console.WriteLine($"Refresh complete: {checkedCount:N0} checked, {changedCount:N0} corrected ({newlyBanned:N0} newly banned, {newlyDeleted:N0} newly deleted), {unresolved:N0} did not resolve at all this run.");
 
@@ -749,7 +732,7 @@ namespace DepotDownloader
         public static int PrintWorkshopCatalogStatus(uint appId, string outputRoot)
         {
             outputRoot = ResolveOutputRoot(outputRoot);
-            var catalogPath = WorkshopCatalog.GetPath(outputRoot, appId);
+            var catalogPath = WorkshopCatalogDb.GetPath(outputRoot, appId);
 
             if (!File.Exists(catalogPath))
             {
@@ -757,32 +740,14 @@ namespace DepotDownloader
                 return 1;
             }
 
-            var catalog = WorkshopCatalog.LoadOrCreate(catalogPath, appId);
-
-            var chunkBased = 0;
-            var ancientUgc = 0;
-            var unknownKind = 0;
-            var historyComplete = 0;
-            foreach (var item in catalog.Items.Values)
-            {
-                switch (item.Kind)
-                {
-                    case WorkshopItemKind.ChunkBased: chunkBased++; break;
-                    case WorkshopItemKind.AncientUgc: ancientUgc++; break;
-                    default: unknownKind++; break;
-                }
-
-                if (item.HistoryComplete)
-                {
-                    historyComplete++;
-                }
-            }
+            using var catalog = WorkshopCatalogDb.Open(outputRoot, appId);
+            var (total, chunkBased, ancientUgc, unknownKind, historyComplete) = catalog.GetStats();
 
             Console.WriteLine($"App:                {catalog.AppId}");
             Console.WriteLine($"Catalog path:       {catalogPath}");
-            Console.WriteLine($"Items recorded:     {catalog.Items.Count:N0}  (chunk-based: {chunkBased:N0}, ancient UGC: {ancientUgc:N0}, unclassified: {unknownKind:N0})");
-            Console.WriteLine($"Full history known: {historyComplete:N0} of {catalog.Items.Count:N0}" +
-                (historyComplete < catalog.Items.Count ? " - the rest will backfill gradually on future bootstrap/poll runs (see -backfill-batch)." : ""));
+            Console.WriteLine($"Items recorded:     {total:N0}  (chunk-based: {chunkBased:N0}, ancient UGC: {ancientUgc:N0}, unclassified: {unknownKind:N0})");
+            Console.WriteLine($"Full history known: {historyComplete:N0} of {total:N0}" +
+                (historyComplete < total ? " - the rest will backfill gradually on future bootstrap/poll runs (see -backfill-batch)." : ""));
             Console.WriteLine($"Bootstrap complete: {catalog.BootstrapCompleted}");
             Console.WriteLine($"Query type:         {catalog.QueryType}" +
                 (catalog.QueryType == 1 ? " (RankedByPublicationDate - stable)" : catalog.QueryType == 21 ? " (RankedByLastUpdatedDate - NOT stable under concurrent activity, see README)" : ""));
@@ -823,14 +788,15 @@ namespace DepotDownloader
         /// <summary>
         /// "workshop status -list" - the actual per-item view of the catalog. Without this, the
         /// only way to see what bootstrap/poll actually recorded was the aggregate counts above or
-        /// opening the protobuf/Deflate .bin file directly, which isn't human-readable and isn't a
-        /// real inspection path. Sorted by PublishedFileId (not dictionary/insertion order) so two
-        /// snapshots of the same catalog print identically and diff cleanly.
+        /// opening the SQLite database directly (a real option now, unlike the old protobuf/Deflate
+        /// blob - see WorkshopCatalogDb - but still not what most people want for a quick look).
+        /// Sorted by PublishedFileId so two snapshots of the same catalog print identically and
+        /// diff cleanly.
         /// </summary>
         public static int PrintWorkshopCatalogList(uint appId, string outputRoot, HashSet<ulong> onlyIds, WorkshopItemKind? kindFilter, Regex nameFilter, bool bannedOnly, bool deletedOnly, bool showHistory, uint limit)
         {
             outputRoot = ResolveOutputRoot(outputRoot);
-            var catalogPath = WorkshopCatalog.GetPath(outputRoot, appId);
+            var catalogPath = WorkshopCatalogDb.GetPath(outputRoot, appId);
 
             if (!File.Exists(catalogPath))
             {
@@ -838,37 +804,9 @@ namespace DepotDownloader
                 return 1;
             }
 
-            var catalog = WorkshopCatalog.LoadOrCreate(catalogPath, appId);
+            using var catalog = WorkshopCatalogDb.Open(outputRoot, appId);
 
-            IEnumerable<WorkshopCatalogItem> items = catalog.Items.Values;
-            if (onlyIds is { Count: > 0 })
-            {
-                items = items.Where(i => onlyIds.Contains(i.PublishedFileId));
-            }
-            if (kindFilter != null)
-            {
-                items = items.Where(i => i.Kind == kindFilter.Value);
-            }
-            if (nameFilter != null)
-            {
-                items = items.Where(i => nameFilter.IsMatch(i.Title ?? string.Empty));
-            }
-            if (bannedOnly)
-            {
-                // Only ever set by "workshop refresh" - an unrefreshed catalog (or one whose
-                // entries all resolved fine last time it ran) shows nothing here even though
-                // Steam-side bans obviously still happen; this reflects what's been checked, not a
-                // live guarantee.
-                items = items.Where(i => i.Banned);
-            }
-            if (deletedOnly)
-            {
-                // Same caveat as -banned-only - reflects what "workshop refresh" has actually
-                // confirmed gone (EResult.FileNotFound), not a live guarantee about anything else.
-                items = items.Where(i => i.Deleted);
-            }
-
-            var matching = items.OrderBy(i => i.PublishedFileId).ToList();
+            var matching = catalog.QueryList(onlyIds, kindFilter, nameFilter, bannedOnly, deletedOnly);
             var shown = limit == 0 ? matching : matching.Take((int)limit).ToList();
 
             Console.WriteLine($"{"PublishedFileId",-20} {"Kind",-11} {"ManifestId",-20} {"TimeUpdated",-20} {"LastSeenAt",-20} {"History",-9} Title");
@@ -880,17 +818,19 @@ namespace DepotDownloader
                 // gap-free; "N? (partial)" for anything recorded "-shallow" or from before these
                 // fields existed - N there is just whatever's known so far (often just the current
                 // version), not a real total.
-                var hist = item.HistoryComplete ? $"{item.History.Count} (complete)" : $"{item.History.Count}? (partial)";
+                var hist = item.HistoryComplete ? $"{item.HistoryCount} (complete)" : $"{item.HistoryCount}? (partial)";
                 // Only ever populated by "workshop refresh" - never touched by bootstrap/poll.
                 var tag = item.Deleted ? " [DELETED]" : item.Banned ? " [BANNED]" : item.Visibility != 0 ? " [NOT PUBLIC]" : "";
                 Console.WriteLine($"{item.PublishedFileId,-20} {item.Kind,-11} {item.ManifestId,-20} {updated,-20} {seen,-20} {hist,-16} {item.Title}{tag}");
 
                 // Verbose by design - only worth combining with a tight filter (-only a handful of
                 // IDs, or a narrow -name) rather than a whole-catalog listing. Oldest first,
-                // matching GetChangeHistory's own order and WorkshopCatalogItem.History's doc
-                // comment - so this reads top-to-bottom as "how this item evolved," not reversed.
+                // matching GetChangeHistory's own order - so this reads top-to-bottom as "how this
+                // item evolved," not reversed. Fetched here, one row at a time, rather than as
+                // part of the main query above - see QueryList's own doc comment for why.
                 if (showHistory)
                 {
+                    catalog.FillHistory(item);
                     if (item.History.Count == 0)
                     {
                         Console.WriteLine("    (no history recorded yet)");
@@ -959,27 +899,26 @@ namespace DepotDownloader
         }
 
         /// <summary>
-        /// Fetches an item's full history via GetChangeHistory and overwrites History/
-        /// HistoryComplete on the given (already-in-catalog) item in place - the shared mechanism
-        /// bootstrap and poll both use, whether this is an item's very first history fetch or a
-        /// backfill of a previously "-shallow" one. Always a full overwrite, never a merge - see
-        /// WorkshopCatalogItem's doc comment for why that's always correct here (GetChangeHistory
-        /// has no "since" filter of its own, so every fetch returns the complete list anyway).
-        /// Returns false (leaving the item untouched) when GetChangeHistory came back empty - a
-        /// real item always has at least its own creation as one entry, so an empty result means
-        /// the fetch failed (already retried internally) rather than "genuinely no history";
-        /// leaving HistoryComplete false lets a later run retry instead of wrongly trusting a
-        /// blank list as the truth.
+        /// Fetches an item's full history via GetChangeHistory and persists it directly via
+        /// ReplaceHistory - the shared mechanism bootstrap and poll both use, whether this is an
+        /// item's very first history fetch or a backfill of a previously "-shallow" one. Always a
+        /// full overwrite, never a merge (GetChangeHistory has no "since" filter of its own, so
+        /// every fetch returns the complete list anyway - see WorkshopCatalogItem's doc comment).
+        /// Does nothing (returns false) when GetChangeHistory came back empty - a real item always
+        /// has at least its own creation as one entry, so an empty result means the fetch failed
+        /// (already retried internally) rather than "genuinely no history"; leaving the item's
+        /// existing HistoryComplete/history untouched lets a later run retry instead of wrongly
+        /// trusting a blank list as the truth.
         /// </summary>
-        private static async Task<bool> FetchAndRecordHistoryAsync(WorkshopCatalogItem item)
+        private static async Task<bool> FetchAndRecordHistoryAsync(WorkshopCatalogDb catalog, ulong publishedFileId)
         {
-            var changes = await GetFullChangeHistoryAsync(item.PublishedFileId);
+            var changes = await GetFullChangeHistoryAsync(publishedFileId);
             if (changes.Count == 0)
             {
                 return false;
             }
 
-            item.History = changes
+            var entries = changes
                 .OrderBy(c => c.timestamp)
                 .Select(c => new WorkshopHistoryEntry
                 {
@@ -988,7 +927,7 @@ namespace DepotDownloader
                     ChangeDescription = c.change_description,
                 })
                 .ToList();
-            item.HistoryComplete = true;
+            catalog.ReplaceHistory(publishedFileId, entries, complete: true);
             return true;
         }
 
@@ -1002,15 +941,21 @@ namespace DepotDownloader
         /// caller-facing "-backfill-batch 0", distinct from "-shallow" - the latter also skips
         /// fetching history for brand-new/changed items this run, this only skips the extra sweep
         /// over already-recorded incomplete ones).
+        ///
+        /// No periodic checkpoint logic here (unlike an earlier version of this function) - each
+        /// FetchAndRecordHistoryAsync call already persists itself immediately via ReplaceHistory,
+        /// so there's nothing left to buffer or throttle saving. A crash mid-sweep loses at most
+        /// whichever single item's fetch was in flight, not a batch of already-fetched-but-unsaved
+        /// ones.
         /// </summary>
-        private static async Task BackfillIncompleteHistoryAsync(WorkshopCatalog catalog, string catalogPath, uint batchSize)
+        private static async Task BackfillIncompleteHistoryAsync(WorkshopCatalogDb catalog, uint batchSize)
         {
             if (batchSize == 0)
             {
                 return;
             }
 
-            var candidates = catalog.Items.Values.Where(i => !i.HistoryComplete).Take((int)batchSize).ToList();
+            var candidates = catalog.GetIncompleteHistoryIds((int)batchSize);
             if (candidates.Count == 0)
             {
                 return;
@@ -1019,39 +964,17 @@ namespace DepotDownloader
             Console.WriteLine($"Backfilling full history for {candidates.Count:N0} item(s) still marked incomplete...");
 
             var fetched = 0;
-            var sinceSave = 0;
-            // Every 20 items was sized when this catalog was small - measured directly against a
-            // real ~2M-item/119MB catalog, a single CheckpointFile.Save (full serialize+Deflate+
-            // write of the WHOLE catalog, not an incremental update - see WorkshopCatalog's own
-            // doc comment) took 6.6-6.7s, versus only ~5s of actual API time between saves at 20
-            // items * this loop's 250ms pacing. Save overhead already exceeded useful work time,
-            // BEFORE accounting for the file only growing larger (and saves only getting slower)
-            // as a long backfill run fills in more history - a real risk of adding days on top of
-            // an already multi-day sweep. Widened to 500 to match bootstrap/refresh's own cadence
-            // (500 items * 250ms = ~125s of API time per save, keeping overhead in the single-
-            // digit percent range instead of exceeding 100%). Still bounded, not "save once at the
-            // end" - a crash mid-sweep loses at most this many items' worth of fetched-but-unsaved
-            // history, not the whole run.
-            const int backfillSaveInterval = 500;
-            foreach (var item in candidates)
+            foreach (var id in candidates)
             {
-                if (await FetchAndRecordHistoryAsync(item))
+                if (await FetchAndRecordHistoryAsync(catalog, id))
                 {
                     fetched++;
-                }
-
-                if (++sinceSave >= backfillSaveInterval)
-                {
-                    catalog.Save(catalogPath);
-                    sinceSave = 0;
                 }
 
                 await Task.Delay(WorkshopApiPacingDelay);
             }
 
-            catalog.Save(catalogPath);
-
-            var remaining = catalog.Items.Values.Count(i => !i.HistoryComplete);
+            var remaining = catalog.CountIncompleteHistory();
             Console.WriteLine(remaining > 0
                 ? $"Backfill: {fetched:N0}/{candidates.Count:N0} succeeded this pass. {remaining:N0} item(s) still incomplete - will continue on future runs."
                 : $"Backfill: {fetched:N0}/{candidates.Count:N0} succeeded this pass. No incomplete items remain.");
@@ -1173,11 +1096,9 @@ namespace DepotDownloader
         /// </summary>
         private static void UpsertCatalogEntry(string outputRoot, PublishedFileDetails details, WorkshopItemKind kind, List<WorkshopHistoryEntry> history = null)
         {
-            var catalogPath = WorkshopCatalog.GetPath(outputRoot, details.consumer_appid);
-            Directory.CreateDirectory(Path.GetDirectoryName(catalogPath));
-            var catalog = WorkshopCatalog.LoadOrCreate(catalogPath, details.consumer_appid);
+            using var catalog = WorkshopCatalogDb.Open(outputRoot, details.consumer_appid);
 
-            catalog.Items[details.publishedfileid] = new WorkshopCatalogItem
+            catalog.UpsertItem(new WorkshopCatalogItem
             {
                 PublishedFileId = details.publishedfileid,
                 Title = details.title,
@@ -1186,12 +1107,16 @@ namespace DepotDownloader
                 ManifestId = details.hcontent_file,
                 TimeUpdated = details.time_updated,
                 LastSeenAt = (uint)DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
-                History = history ?? [],
+                HistoryCount = history?.Count ?? 0,
                 HistoryComplete = history is { Count: > 0 },
-            };
+            });
 
-            catalog.Save(catalogPath);
-            Console.WriteLine($"  Recorded {details.publishedfileid} into app {details.consumer_appid}'s catalog ({catalogPath}).");
+            if (history is { Count: > 0 })
+            {
+                catalog.ReplaceHistory(details.publishedfileid, history, complete: true);
+            }
+
+            Console.WriteLine($"  Recorded {details.publishedfileid} into app {details.consumer_appid}'s catalog ({WorkshopCatalogDb.GetPath(outputRoot, details.consumer_appid)}).");
         }
 
         /// <summary>
@@ -1204,7 +1129,7 @@ namespace DepotDownloader
         public static async Task<int> DownloadWorkshopCatalogAsync(uint appId, string outputRoot, bool history, HashSet<ulong> onlyIds, bool manifestsOnly, uint maxItems)
         {
             outputRoot = ResolveOutputRoot(outputRoot);
-            var catalogPath = WorkshopCatalog.GetPath(outputRoot, appId);
+            var catalogPath = WorkshopCatalogDb.GetPath(outputRoot, appId);
 
             if (!File.Exists(catalogPath))
             {
@@ -1213,24 +1138,19 @@ namespace DepotDownloader
                 return 1;
             }
 
-            var catalog = WorkshopCatalog.LoadOrCreate(catalogPath, appId);
+            using var catalog = WorkshopCatalogDb.Open(outputRoot, appId);
 
             if (!catalog.BootstrapCompleted)
             {
                 Console.WriteLine("Warning: bootstrap has not finished for this app - this only covers what's been recorded so far.");
             }
 
-            var items = catalog.Items.Values.OrderBy(i => i.PublishedFileId).AsEnumerable();
-            if (onlyIds != null && onlyIds.Count > 0)
-            {
-                items = items.Where(i => onlyIds.Contains(i.PublishedFileId));
-            }
+            var items = catalog.QueryList(onlyIds, null, null, false, false);
 
             var options = new RawDownloadOptions { OutputRoot = outputRoot, DryRun = manifestsOnly };
             var processed = 0;
             var downloaded = 0;
             var failed = 0;
-            var catalogChanged = false;
 
             foreach (var item in items)
             {
@@ -1247,15 +1167,8 @@ namespace DepotDownloader
 
                 if (fetchedHistory != null)
                 {
-                    item.History = fetchedHistory;
-                    item.HistoryComplete = true;
-                    catalogChanged = true;
+                    catalog.ReplaceHistory(item.PublishedFileId, fetchedHistory, complete: true);
                 }
-            }
-
-            if (catalogChanged)
-            {
-                catalog.Save(catalogPath);
             }
 
             var verb = manifestsOnly ? "Recorded manifests/metadata for" : "Downloaded";

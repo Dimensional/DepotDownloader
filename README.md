@@ -663,10 +663,50 @@ depotdownloader workshop refresh -app <appid> [OPTIONS...]
 depotdownloader workshop status -app <appid> [-output <dir>] [-list [-kind chunk|ancient|unknown] [-only <id,id2,...>] [-name <pattern>] [-banned-only] [-deleted-only] [-show-history] [-limit N]]
 ```
 
+### Storage
+
+Each app's catalog is a SQLite database, `depot/<appid>/workshop_catalog.db`, in WAL (write-ahead
+log) mode. This replaced an earlier design where the whole catalog was one protobuf/Deflate blob,
+rewritten in full on every checkpoint. That worked but didn't scale: measured directly against a
+real ~2M-item/119MB catalog, a single full-file save took 6.6-6.7s - a cost that scaled with total
+catalog size rather than with how much actually changed, and pure write amplification on real
+storage (rewriting ~120MB to persist a few hundred KB of actual change is a genuine concern for an
+NVMe's finite total-bytes-written life, not just a speed one). A checkpoint cadence sized for a
+small catalog turned out to spend more time re-writing already-saved data than doing useful work
+once the catalog got large - caught directly in the backfill sweep, which was checkpointing every
+20 items against a save that by then cost more than the actual API work between checkpoints.
+
+WAL mode fixes this at the source rather than by tuning an interval: a write only appends the
+changed pages to a separate file - an update touching one row costs roughly one row's worth of
+I/O, not the whole database - and it allows exactly one writer plus unlimited concurrent readers
+with neither blocking the other. That second property is also the direct fix for a real crash hit
+earlier in this project's life (`status` reading the catalog at the same moment a long bootstrap
+run saved a checkpoint, throwing `UnauthorizedAccessException`) - confirmed live: ten concurrent
+`status` reads fired against an actively-writing bootstrap process, all succeeded immediately with
+correct, increasing counts, no retries needed. Every write (a new/changed item, a history fetch,
+a meta field like the bootstrap cursor) commits immediately and independently now - there is no
+separate "checkpoint" left to tune or lose progress from between saves.
+
+Being a real SQLite file is also a genuine upgrade for anyone who wants to look at or build on this
+data beyond what `status` itself prints: open it directly with the `sqlite3` CLI, DB Browser for
+SQLite, or any other standard SQLite tool for ad-hoc queries, instead of it being an opaque blob.
+
+**Migrating an existing catalog from before this change**: a standalone tool at
+`tools/MigrateWorkshopCatalog/` (not part of the main `depotdownloader` binary or its `workshop`
+subcommands - built once, run by hand) converts an old `workshop_catalog.bin` into the new
+`workshop_catalog.db`. It never modifies or deletes the source file, refuses to overwrite an
+existing destination (delete it first to re-run), and does the whole import inside one transaction
+for a real bulk-load speedup. Live-verified against a real ~2M-item catalog, item-for-item.
+
+```bash
+dotnet run --project tools/MigrateWorkshopCatalog -c Release -- <path-to-old-workshop_catalog.bin> <appid> <output-root>
+```
+
 ### Bootstrap
 
 One-time per app, resumable. Pages through the entire workshop via `QueryFiles` and records every
-item's current content handle, title, and update time into `depot/<appid>/workshop_catalog.bin`,
+item's current content handle, title, and update time into `depot/<appid>/workshop_catalog.db` (see
+Storage above),
 classifying each item as chunk-based or ancient UGC as it goes (a genuinely ancient item's
 `hcontent_file` field is still populated, but it's the CDN handle embedded in its `file_url`, not a
 depot manifest ID - classification, not that field, is what `workshop download` relies on to tell
@@ -940,8 +980,9 @@ themselves require; `poll` requires an authenticated login).
 ### Inspecting a catalog
 
 `status` alone prints aggregate counts, including how many items have full history known versus
-still incomplete. `workshop_catalog.bin` is protobuf/Deflate, not a format meant to be opened
-directly, so `status -list` is the way to see what was recorded: one row per item (ID, kind,
+still incomplete. `status -list` is the built-in way to see what was recorded (or open
+`workshop_catalog.db` directly with any SQLite tool - see Storage above - for real ad-hoc queries):
+one row per item (ID, kind,
 manifest/content handle, last-update/last-seen time, a `History` column showing entry count and
 whether it's complete or partial, title - tagged `[DELETED]`, `[BANNED]`, or `[NOT PUBLIC]` if a
 `refresh` found any). Rows are sorted by ID rather than dictionary order, so two snapshots print
@@ -957,12 +998,8 @@ design; pair it with a tight `-only`/`-name` rather than a whole-catalog listing
 stored locally - the same history is also visible straight from Steam for any item at
 `steamcommunity.com/sharedfiles/filedetails/changelog/<id>`.
 
-On load, a corrupt, truncated, or incompatible-version catalog fails loudly with a clear message
-rather than silently misreading it - protobuf-net's wire format is self-describing (field number and
-wire type per field), so garbled bytes fail to parse rather than landing in the wrong typed field.
-`CheckpointFile`'s atomic tmp+move save (the same pattern used throughout this project) means a
-crash mid-write can never leave a torn file behind - what's on disk is always either the previous
-complete save or the new one, never a mix.
+A crash mid-write can't corrupt the catalog or leave it in a torn state - see Storage above for why
+(WAL mode's whole point is exactly this guarantee, alongside the concurrent-access one).
 
 A brand-new item discovered only via `poll`/ad-hoc `download` (not previously seen during
 `bootstrap`) costs one extra `GetDetails` call to classify it (chunk-based vs. ancient) and learn
