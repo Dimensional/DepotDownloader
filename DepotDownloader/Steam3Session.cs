@@ -364,9 +364,11 @@ namespace DepotDownloader
         /// here - nothing in the request shape documents one, so callers should pick a
         /// conservative batch size and confirm it works against a real, large catalog rather than
         /// assuming it scales arbitrarily. A per-item PublishedFileDetails.result in the response
-        /// is NOT the same as this call's own overall Result - see PublishedFileDetails.result for
-        /// whether that specific ID actually resolved (e.g. it doesn't exist at all vs. it exists
-        /// but is banned/private).
+        /// is NOT the same as this call's own overall Result - confirmed live (a real "workshop
+        /// refresh" run against a large, actively-moderated catalog): a genuinely deleted ID comes
+        /// back with result == EResult.FileNotFound (9) and otherwise-empty fields, while a
+        /// banned/private item still resolves (result == OK) with banned/visibility set instead -
+        /// this field is what actually distinguishes the two, not banned/visibility alone.
         /// </summary>
         public async Task<(EResult Result, List<PublishedFileDetails> Details)> GetPublishedFileDetailsBatch(IEnumerable<ulong> pubFiles)
         {

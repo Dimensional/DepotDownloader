@@ -148,6 +148,16 @@ namespace DepotDownloader
         /// distinct reason an item can vanish from bootstrap/poll without ever being banned.</summary>
         [ProtoMember(12)]
         public uint Visibility { get; set; }
+
+        /// <summary>Set by "workshop refresh" when GetDetails returns EResult.FileNotFound (9)
+        /// for this ID - confirmed live (a real refresh run against a large, actively-moderated
+        /// catalog) to mean the item is gone outright, not just banned or made private/unlisted
+        /// (those still resolve normally, with Banned/Visibility set instead - see there). The
+        /// strongest removal signal available, but still only ever learned by asking about this
+        /// specific ID directly; bootstrap/poll never set or clear it. Cleared automatically if a
+        /// later refresh finds the ID resolving again.</summary>
+        [ProtoMember(13)]
+        public bool Deleted { get; set; }
     }
 
     /// <summary>

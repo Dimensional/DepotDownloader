@@ -306,13 +306,15 @@ namespace DepotDownloader
             var onlyRaw = parser.Get<string>(null, "-only");
             var nameRaw = parser.Get<string>(null, "-name");
             var bannedOnly = parser.HasFlag("-banned-only");
+            var deletedOnly = parser.HasFlag("-deleted-only");
+            var showHistory = parser.HasFlag("-show-history");
             var limit = parser.Get<uint>(200, "-limit");
             parser.WarnUnconsumed();
 
             if (appId == null)
             {
                 Console.WriteLine("Usage: depotdownloader workshop status -app <appid> [-output <dir>]");
-                Console.WriteLine("       depotdownloader workshop status -app <appid> -list [-kind chunk|ancient|unknown] [-only <id,id2,...>] [-name <pattern>] [-banned-only] [-limit N]");
+                Console.WriteLine("       depotdownloader workshop status -app <appid> -list [-kind chunk|ancient|unknown] [-only <id,id2,...>] [-name <pattern>] [-banned-only] [-deleted-only] [-show-history] [-limit N]");
                 return 1;
             }
 
@@ -367,7 +369,7 @@ namespace DepotDownloader
             }
 
             Console.WriteLine();
-            return ContentDownloader.PrintWorkshopCatalogList(appId.Value, output, onlyIds, kindFilter, nameFilter, bannedOnly, limit);
+            return ContentDownloader.PrintWorkshopCatalogList(appId.Value, output, onlyIds, kindFilter, nameFilter, bannedOnly, deletedOnly, showHistory, limit);
         }
 
         private static bool LogOn(string username, string password, bool rememberPassword)
@@ -529,7 +531,7 @@ namespace DepotDownloader
             Console.WriteLine("         diffable output across runs.");
             Console.WriteLine("  -list              Print each matching item: ID, kind, manifest ID, last update/seen");
             Console.WriteLine("                     time, history entry count + complete/partial, title (tagged");
-            Console.WriteLine("                     [BANNED] or [NOT PUBLIC] if \"workshop refresh\" found either)");
+            Console.WriteLine("                     [DELETED], [BANNED], or [NOT PUBLIC] if \"workshop refresh\" found any)");
             Console.WriteLine("    -kind <k>            Filter: chunk, ancient, or unknown");
             Console.WriteLine("    -only <id,id2,...>   Filter to specific IDs");
             Console.WriteLine("    -name <pattern>      Filter by title - a case-insensitive regex (.NET syntax),");
@@ -537,6 +539,15 @@ namespace DepotDownloader
             Console.WriteLine("                         Metroid\" matches any of several names in one pass");
             Console.WriteLine("    -banned-only         Only items \"workshop refresh\" found banned - never set");
             Console.WriteLine("                         without having run \"refresh\" at least once");
+            Console.WriteLine("    -deleted-only        Only items \"workshop refresh\" found gone outright (Steam's");
+            Console.WriteLine("                         GetDetails returned FileNotFound) - distinct from banned");
+            Console.WriteLine("                         (that item still exists; this one no longer does)");
+            Console.WriteLine("    -show-history        Print each matching item's full recorded History below its");
+            Console.WriteLine("                         row (timestamp, manifest ID, change note if any), oldest");
+            Console.WriteLine("                         first. Verbose - meant for a tight -only/-name, not a");
+            Console.WriteLine("                         whole-catalog listing. This is what's stored locally; see");
+            Console.WriteLine("                         steamcommunity.com/sharedfiles/filedetails/changelog/<id>");
+            Console.WriteLine("                         for the same history straight from Steam's own site");
             Console.WriteLine("    -limit <n>           Cap rows printed (default 200; 0 = no limit)");
             Console.WriteLine();
             Console.WriteLine("COMMON OPTIONS:");
@@ -554,6 +565,7 @@ namespace DepotDownloader
             Console.WriteLine("  depotdownloader workshop poll -app 4000 -username myaccount -remember-password");
             Console.WriteLine("  depotdownloader workshop refresh -app 4000                       # re-verify/correct everything known");
             Console.WriteLine("  depotdownloader workshop status -app 4000 -list -banned-only     # see what refresh found banned");
+            Console.WriteLine("  depotdownloader workshop status -app 4000 -only 2956730580 -list -show-history  # one item's full history");
             Console.WriteLine("  depotdownloader workshop status -app 4000");
             Console.WriteLine("  depotdownloader workshop status -app 4000 -list -kind ancient -limit 50");
             Console.WriteLine("  depotdownloader workshop status -app 4000 -list -name \"Mario|Samus|Metroid\"");

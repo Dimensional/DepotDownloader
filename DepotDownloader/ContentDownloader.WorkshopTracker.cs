@@ -827,7 +827,7 @@ namespace DepotDownloader
         /// real inspection path. Sorted by PublishedFileId (not dictionary/insertion order) so two
         /// snapshots of the same catalog print identically and diff cleanly.
         /// </summary>
-        public static int PrintWorkshopCatalogList(uint appId, string outputRoot, HashSet<ulong> onlyIds, WorkshopItemKind? kindFilter, Regex nameFilter, bool bannedOnly, bool deletedOnly, uint limit)
+        public static int PrintWorkshopCatalogList(uint appId, string outputRoot, HashSet<ulong> onlyIds, WorkshopItemKind? kindFilter, Regex nameFilter, bool bannedOnly, bool deletedOnly, bool showHistory, uint limit)
         {
             outputRoot = ResolveOutputRoot(outputRoot);
             var catalogPath = WorkshopCatalog.GetPath(outputRoot, appId);
@@ -884,6 +884,27 @@ namespace DepotDownloader
                 // Only ever populated by "workshop refresh" - never touched by bootstrap/poll.
                 var tag = item.Deleted ? " [DELETED]" : item.Banned ? " [BANNED]" : item.Visibility != 0 ? " [NOT PUBLIC]" : "";
                 Console.WriteLine($"{item.PublishedFileId,-20} {item.Kind,-11} {item.ManifestId,-20} {updated,-20} {seen,-20} {hist,-16} {item.Title}{tag}");
+
+                // Verbose by design - only worth combining with a tight filter (-only a handful of
+                // IDs, or a narrow -name) rather than a whole-catalog listing. Oldest first,
+                // matching GetChangeHistory's own order and WorkshopCatalogItem.History's doc
+                // comment - so this reads top-to-bottom as "how this item evolved," not reversed.
+                if (showHistory)
+                {
+                    if (item.History.Count == 0)
+                    {
+                        Console.WriteLine("    (no history recorded yet)");
+                    }
+                    else
+                    {
+                        foreach (var entry in item.History)
+                        {
+                            var when = entry.Timestamp == 0 ? "-" : DateTimeOffset.FromUnixTimeSeconds(entry.Timestamp).ToString("u");
+                            var desc = string.IsNullOrEmpty(entry.ChangeDescription) ? "" : $" - {entry.ChangeDescription}";
+                            Console.WriteLine($"    {when}  manifest {entry.ManifestId}{desc}");
+                        }
+                    }
+                }
             }
 
             Console.WriteLine();

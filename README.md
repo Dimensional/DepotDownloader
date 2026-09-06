@@ -660,7 +660,7 @@ depotdownloader workshop download -app <appid> [OPTIONS...]
 depotdownloader workshop download -workshop <id> [<id>...] [OPTIONS...]
 depotdownloader workshop poll -app <appid> [OPTIONS...]
 depotdownloader workshop refresh -app <appid> [OPTIONS...]
-depotdownloader workshop status -app <appid> [-output <dir>] [-list [-kind chunk|ancient|unknown] [-only <id,id2,...>] [-name <pattern>] [-banned-only] [-limit N]]
+depotdownloader workshop status -app <appid> [-output <dir>] [-list [-kind chunk|ancient|unknown] [-only <id,id2,...>] [-name <pattern>] [-banned-only] [-deleted-only] [-show-history] [-limit N]]
 ```
 
 ### Bootstrap
@@ -878,11 +878,13 @@ filters to just what's been found banned - both reflect only what a `refresh` ha
 not a live guarantee about anything else in the catalog.
 
 A per-item `PublishedFileDetails.result` in the response is distinct from the call's own overall
-result - it's what actually tells the difference between "this ID resolved, and here's its current
-state" (used to correct the catalog entry) and "this ID didn't resolve at all" (logged as
-unresolved and left untouched, since a mostly-empty response isn't something to overwrite good data
-with) - a stronger signal than `banned`/`visibility` alone, since a fully deleted item can fail to
-resolve at all rather than coming back with those fields set.
+result, and is what actually tells apart two different kinds of "gone." Confirmed live against a
+real, actively-moderated 2M-item catalog: a genuinely deleted item comes back with
+`result == EResult.FileNotFound` (9) and otherwise-empty fields (logged as unresolved and left
+untouched, since there's nothing there worth overwriting good data with), while a banned or
+private/unlisted item still resolves normally (`result == OK`) with `banned`/`visibility` set
+instead - `result` is the only field that distinguishes "deleted outright" from "still exists but
+not public," not `banned`/`visibility` alone.
 
 ### Options
 
@@ -941,15 +943,19 @@ themselves require; `poll` requires an authenticated login).
 still incomplete. `workshop_catalog.bin` is protobuf/Deflate, not a format meant to be opened
 directly, so `status -list` is the way to see what was recorded: one row per item (ID, kind,
 manifest/content handle, last-update/last-seen time, a `History` column showing entry count and
-whether it's complete or partial, title - tagged `[BANNED]` or `[NOT PUBLIC]` if a `refresh` found
-either). Rows are sorted by ID rather than dictionary order, so two snapshots print identically and
-diff cleanly. Defaults to the first 200 matching rows (`-limit 0` for all); narrow with
-`-kind chunk|ancient|unknown`, `-only <id,id2,...>`, `-name <pattern>` - a case-insensitive .NET
-regex matched against title, so plain text works as an ordinary substring search and
+whether it's complete or partial, title - tagged `[DELETED]`, `[BANNED]`, or `[NOT PUBLIC]` if a
+`refresh` found any). Rows are sorted by ID rather than dictionary order, so two snapshots print
+identically and diff cleanly. Defaults to the first 200 matching rows (`-limit 0` for all); narrow
+with `-kind chunk|ancient|unknown`, `-only <id,id2,...>`, `-name <pattern>` - a case-insensitive
+.NET regex matched against title, so plain text works as an ordinary substring search and
 `-name "Mario|Samus|Metroid"` finds any of several names in one pass rather than needing a separate
-multi-term flag - and/or `-banned-only`, which shows only what a `refresh` has actually found banned
-(never set on an entry `refresh` hasn't touched, so an empty result here means "not yet checked,"
-not "nothing is banned").
+multi-term flag - `-banned-only`/`-deleted-only`, which show only what a `refresh` has actually
+found (never set on an entry `refresh` hasn't touched, so an empty result means "not yet checked,"
+not "nothing's wrong") - and/or `-show-history`, which prints each matching row's full recorded
+`History` underneath it (timestamp, manifest ID, change note if any - oldest first). Verbose by
+design; pair it with a tight `-only`/`-name` rather than a whole-catalog listing. This is what's
+stored locally - the same history is also visible straight from Steam for any item at
+`steamcommunity.com/sharedfiles/filedetails/changelog/<id>`.
 
 On load, a corrupt, truncated, or incompatible-version catalog fails loudly with a clear message
 rather than silently misreading it - protobuf-net's wire format is self-describing (field number and
@@ -989,6 +995,7 @@ depotdownloader workshop status -app 4000
 depotdownloader workshop status -app 4000 -list -kind ancient -limit 50      # inspect the actual items
 depotdownloader workshop status -app 4000 -list -name "Mario|Samus|Metroid"  # regex title search
 depotdownloader workshop status -app 4000 -list -banned-only                 # see what refresh found banned
+depotdownloader workshop status -app 4000 -only 2956730580 -list -show-history  # one item's full history
 ```
 
 ---
