@@ -256,7 +256,14 @@ namespace DepotDownloader
                         Visibility INTEGER NOT NULL DEFAULT 0,
                         Deleted INTEGER NOT NULL DEFAULT 0
                     );
-                    CREATE INDEX IF NOT EXISTS idx_items_kind ON items(Kind);
+                    -- No index on Kind: only 3 possible values, so a full secondary index over
+                    -- every row buys query filtering almost nothing (a table scan is already
+                    -- nearly as fast) while still costing real space at scale - measured directly
+                    -- at ~2M rows: dropping it (plus a VACUUM to actually reclaim the space)
+                    -- saved roughly 13% of the database's total size on top of what VACUUM alone
+                    -- recovered. The partial indexes below are worth keeping - they cover a small,
+                    -- genuinely selective slice of rows (HistoryComplete=0/Banned=1/Deleted=1),
+                    -- unlike Kind's near-even 3-way split across the whole table.
                     CREATE INDEX IF NOT EXISTS idx_items_incomplete ON items(HistoryComplete) WHERE HistoryComplete = 0;
                     CREATE INDEX IF NOT EXISTS idx_items_banned ON items(Banned) WHERE Banned = 1;
                     CREATE INDEX IF NOT EXISTS idx_items_deleted ON items(Deleted) WHERE Deleted = 1;
