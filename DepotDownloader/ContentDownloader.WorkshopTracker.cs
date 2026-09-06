@@ -617,6 +617,7 @@ namespace DepotDownloader
             var checkedCount = 0;
             var changedCount = 0;
             var newlyBanned = 0;
+            var newlyDeleted = 0;
             var unresolved = 0;
             var batchesSinceSave = 0;
             var now = (uint)DateTimeOffset.UtcNow.ToUnixTimeSeconds();
@@ -646,15 +647,38 @@ namespace DepotDownloader
                         continue; // shouldn't happen - every id here came from the catalog itself
                     }
 
-                    if (!byId.TryGetValue(id, out var d) || d.result != (uint)EResult.OK)
+                    byId.TryGetValue(id, out var d);
+                    var resultCode = d != null ? (EResult)d.result : (EResult?)null;
+
+                    if (d == null || resultCode != EResult.OK)
                     {
                         unresolved++;
-                        var code = byId.TryGetValue(id, out var partial) ? partial.result.ToString() : "no entry returned";
-                        Console.WriteLine($"  {id} \"{item.Title}\" - did not resolve ({code}) - possibly fully deleted rather than just banned/private, which GetDetails can't distinguish from this response alone.");
+
+                        // Confirmed live against a real, actively-moderated 2M-item catalog:
+                        // FileNotFound (9) is what a genuinely deleted item's own entry looks like
+                        // here - distinct from banned/private, which come back OK with
+                        // Banned/Visibility set instead (see the "changed" branch below). Only
+                        // this specific, confirmed result marks Deleted - "no entry returned at
+                        // all" is a different, unconfirmed case, not worth treating the same on a
+                        // guess.
+                        if (resultCode == EResult.FileNotFound && !item.Deleted)
+                        {
+                            item.Deleted = true;
+                            changedCount++;
+                            newlyDeleted++;
+                            Console.WriteLine($"  DELETED {id} \"{item.Title}\"");
+                        }
+                        else
+                        {
+                            var code = d != null ? resultCode.ToString() : "no entry returned";
+                            Console.WriteLine($"  {id} \"{item.Title}\" - did not resolve ({code})");
+                        }
+
                         continue;
                     }
 
                     var wasBanned = item.Banned;
+                    var wasDeleted = item.Deleted;
                     var kind = !string.IsNullOrEmpty(d.file_url) ? WorkshopItemKind.AncientUgc : WorkshopItemKind.ChunkBased;
                     var fileUrl = kind == WorkshopItemKind.AncientUgc ? d.file_url : null;
                     // Normalized before comparing AND storing - GetDetails returns "" for a
@@ -671,7 +695,8 @@ namespace DepotDownloader
                         || item.ManifestId != d.hcontent_file
                         || item.Banned != d.banned
                         || item.BanReason != banReason
-                        || item.Visibility != d.visibility;
+                        || item.Visibility != d.visibility
+                        || wasDeleted;
 
                     item.Title = d.title;
                     item.Kind = kind;
@@ -681,6 +706,7 @@ namespace DepotDownloader
                     item.Banned = d.banned;
                     item.BanReason = banReason;
                     item.Visibility = d.visibility;
+                    item.Deleted = false;
                     item.LastSeenAt = now;
 
                     if (changed)
@@ -690,6 +716,10 @@ namespace DepotDownloader
                         {
                             newlyBanned++;
                             Console.WriteLine($"  BANNED {id} \"{d.title}\"{(string.IsNullOrEmpty(d.ban_reason) ? "" : $" - {d.ban_reason}")}");
+                        }
+                        else if (wasDeleted)
+                        {
+                            Console.WriteLine($"  RESTORED {id} \"{d.title}\" - a previous refresh had found this deleted; it resolves again now.");
                         }
                         else
                         {
@@ -711,7 +741,7 @@ namespace DepotDownloader
 
             catalog.Save(catalogPath);
 
-            Console.WriteLine($"Refresh complete: {checkedCount:N0} checked, {changedCount:N0} corrected ({newlyBanned:N0} newly banned), {unresolved:N0} did not resolve at all.");
+            Console.WriteLine($"Refresh complete: {checkedCount:N0} checked, {changedCount:N0} corrected ({newlyBanned:N0} newly banned, {newlyDeleted:N0} newly deleted), {unresolved:N0} did not resolve at all this run.");
 
             return 0;
         }
@@ -797,7 +827,7 @@ namespace DepotDownloader
         /// real inspection path. Sorted by PublishedFileId (not dictionary/insertion order) so two
         /// snapshots of the same catalog print identically and diff cleanly.
         /// </summary>
-        public static int PrintWorkshopCatalogList(uint appId, string outputRoot, HashSet<ulong> onlyIds, WorkshopItemKind? kindFilter, Regex nameFilter, bool bannedOnly, uint limit)
+        public static int PrintWorkshopCatalogList(uint appId, string outputRoot, HashSet<ulong> onlyIds, WorkshopItemKind? kindFilter, Regex nameFilter, bool bannedOnly, bool deletedOnly, uint limit)
         {
             outputRoot = ResolveOutputRoot(outputRoot);
             var catalogPath = WorkshopCatalog.GetPath(outputRoot, appId);
@@ -831,6 +861,12 @@ namespace DepotDownloader
                 // live guarantee.
                 items = items.Where(i => i.Banned);
             }
+            if (deletedOnly)
+            {
+                // Same caveat as -banned-only - reflects what "workshop refresh" has actually
+                // confirmed gone (EResult.FileNotFound), not a live guarantee about anything else.
+                items = items.Where(i => i.Deleted);
+            }
 
             var matching = items.OrderBy(i => i.PublishedFileId).ToList();
             var shown = limit == 0 ? matching : matching.Take((int)limit).ToList();
@@ -846,7 +882,7 @@ namespace DepotDownloader
                 // version), not a real total.
                 var hist = item.HistoryComplete ? $"{item.History.Count} (complete)" : $"{item.History.Count}? (partial)";
                 // Only ever populated by "workshop refresh" - never touched by bootstrap/poll.
-                var tag = item.Banned ? " [BANNED]" : item.Visibility != 0 ? " [NOT PUBLIC]" : "";
+                var tag = item.Deleted ? " [DELETED]" : item.Banned ? " [BANNED]" : item.Visibility != 0 ? " [NOT PUBLIC]" : "";
                 Console.WriteLine($"{item.PublishedFileId,-20} {item.Kind,-11} {item.ManifestId,-20} {updated,-20} {seen,-20} {hist,-16} {item.Title}{tag}");
             }
 
@@ -963,6 +999,19 @@ namespace DepotDownloader
 
             var fetched = 0;
             var sinceSave = 0;
+            // Every 20 items was sized when this catalog was small - measured directly against a
+            // real ~2M-item/119MB catalog, a single CheckpointFile.Save (full serialize+Deflate+
+            // write of the WHOLE catalog, not an incremental update - see WorkshopCatalog's own
+            // doc comment) took 6.6-6.7s, versus only ~5s of actual API time between saves at 20
+            // items * this loop's 250ms pacing. Save overhead already exceeded useful work time,
+            // BEFORE accounting for the file only growing larger (and saves only getting slower)
+            // as a long backfill run fills in more history - a real risk of adding days on top of
+            // an already multi-day sweep. Widened to 500 to match bootstrap/refresh's own cadence
+            // (500 items * 250ms = ~125s of API time per save, keeping overhead in the single-
+            // digit percent range instead of exceeding 100%). Still bounded, not "save once at the
+            // end" - a crash mid-sweep loses at most this many items' worth of fetched-but-unsaved
+            // history, not the whole run.
+            const int backfillSaveInterval = 500;
             foreach (var item in candidates)
             {
                 if (await FetchAndRecordHistoryAsync(item))
@@ -970,7 +1019,7 @@ namespace DepotDownloader
                     fetched++;
                 }
 
-                if (++sinceSave >= 20)
+                if (++sinceSave >= backfillSaveInterval)
                 {
                     catalog.Save(catalogPath);
                     sinceSave = 0;
