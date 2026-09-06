@@ -2,6 +2,7 @@
 // in file 'LICENSE', which is part of this source code package.
 
 using System;
+using System.IO;
 using System.Linq;
 using System.Reflection;
 using System.Runtime.InteropServices;
@@ -13,6 +14,40 @@ namespace DepotDownloader
     {
         static async Task<int> Main(string[] args)
         {
+            // Titles/paths routinely contain non-Latin scripts (workshop items are published from
+            // every region) - .NET strings and protobuf-net's wire format already carry these
+            // correctly regardless of this setting (confirmed: neither the catalog's serialized
+            // strings nor Path.GetInvalidFileNameChars()-based filename sanitization ever touch
+            // valid Unicode characters), but Console.Out defaults to the OS's legacy console code
+            // page on Windows, which can't represent most of them - anything outside it gets
+            // silently replaced with '?' purely for display, not stored that way.
+            //
+            // Windows-only: non-Windows terminals already default to UTF-8, so this would be a
+            // no-op there anyway, and narrowing it to where it's actually needed avoids touching a
+            // working default on a platform this wasn't tested against. A comparable project in
+            // this same space (steam-lancache-prefill) documents this exact issue but deliberately
+            // does NOT set it programmatically - it tells users to switch to Windows Terminal and
+            // opt in themselves (see their Linux/Windows setup docs) - because their output is a
+            // Spectre.Console TUI (live progress bars/animations) that a font/encoding mismatch on
+            // a legacy console can visibly break. This project's workshop output is plain
+            // sequential Console.WriteLine text with no such rendering to protect: on a legacy
+            // raster-font console that can't render a given glyph, the worst case is a tofu/box
+            // per character (same "can't show this glyph" outcome either way) instead of '?' - not
+            // a regression - while every modern host (Windows Terminal, VS Code, PowerShell 7,
+            // redirected output/log files) gets it right automatically instead of needing a manual
+            // opt-in step. Best-effort: some hosts (certain redirected pipes) reject setting this,
+            // and that's not worth failing startup over.
+            if (OperatingSystem.IsWindows())
+            {
+                try
+                {
+                    Console.OutputEncoding = System.Text.Encoding.UTF8;
+                }
+                catch (IOException)
+                {
+                }
+            }
+
             if (args.Length == 0)
             {
                 PrintVersion();

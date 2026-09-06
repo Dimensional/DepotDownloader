@@ -3,20 +3,21 @@
 
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Text.RegularExpressions;
 using System.Threading.Tasks;
 
 namespace DepotDownloader
 {
     /// <summary>
-    /// "workshop bootstrap"/"poll"/"download"/"status" - the single place all workshop
+    /// "workshop bootstrap"/"poll"/"refresh"/"download"/"status" - the single place all workshop
     /// acquisition AND recording happens (this is where the old workshop-related "download"
     /// flags moved to). Covers both chunk-based items (depot ID == app ID) and
     /// ancient/direct-URL UGC items (see WorkshopItemKind) - built on SteamKit2's PublishedFile.
-    /// QueryFiles/GetItemChanges/GetChangeHistory unified-messages RPCs. See
-    /// ContentDownloader.WorkshopTracker.cs for the actual bootstrap/poll/download logic and
-    /// WorkshopCatalog.cs for the persisted state, and the README for the empirically-confirmed
-    /// access/timing restrictions this depends on.
+    /// QueryFiles/GetItemChanges/GetChangeHistory/GetDetails unified-messages RPCs. See
+    /// ContentDownloader.WorkshopTracker.cs for the actual bootstrap/poll/refresh/download logic
+    /// and WorkshopCatalog.cs for the persisted state, and the README for the empirically-
+    /// confirmed access/timing restrictions this depends on.
     /// </summary>
     static class WorkshopCommand
     {
@@ -38,6 +39,9 @@ namespace DepotDownloader
 
                 case "poll":
                     return await PollAsync(rest);
+
+                case "refresh":
+                    return await RefreshAsync(rest);
 
                 case "download":
                     return await DownloadAsync(rest);
@@ -85,6 +89,11 @@ namespace DepotDownloader
             {
                 return await ContentDownloader.BootstrapWorkshopCatalogAsync(appId.Value, output, pageSize, maxItems, queryType, manifestsOnly, shallow, backfillBatch, resetCursor);
             }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                PrintCatalogSaveFailure(ex);
+                return 1;
+            }
             finally
             {
                 LogOff(rememberPassword);
@@ -126,6 +135,72 @@ namespace DepotDownloader
             try
             {
                 return await ContentDownloader.PollWorkshopCatalogAsync(appId.Value, output, dryRun, manifestsOnly, shallow, backfillBatch, catalogOnly);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                PrintCatalogSaveFailure(ex);
+                return 1;
+            }
+            finally
+            {
+                LogOff(rememberPassword);
+            }
+        }
+
+        private static async Task<int> RefreshAsync(string[] args)
+        {
+            var parser = new ArgParser(args);
+
+            var appId = parser.GetNullable<uint>("-app", "-appid");
+            var output = parser.Get<string>(null, "-output", "-dir");
+            var onlyRaw = parser.Get<string>(null, "-only");
+            var batchSize = parser.Get<uint>(100, "-batch-size");
+            var maxItems = parser.Get<uint>(0, "-max-items");
+            var username = parser.Get<string>(null, "-username", "-user");
+            var password = parser.Get<string>(null, "-password", "-pass");
+            var rememberPassword = parser.HasFlag("-remember-password");
+            parser.WarnUnconsumed();
+
+            if (appId == null)
+            {
+                Console.WriteLine("Usage: depotdownloader workshop refresh -app <appid> [-only <id,id2,...>] [-batch-size 100] [-max-items N] [-output <dir>]");
+                return 1;
+            }
+
+            if (batchSize == 0)
+            {
+                Console.WriteLine("Error: -batch-size must be at least 1.");
+                return 1;
+            }
+
+            // Confirmed anonymous-friendly (same GetDetails RPC ad-hoc "download -workshop" already
+            // uses without a login) - -username is accepted but never required, unlike "poll".
+            if (!LogOn(username, password, rememberPassword))
+            {
+                return 1;
+            }
+
+            HashSet<ulong> onlyIds = null;
+            if (!string.IsNullOrWhiteSpace(onlyRaw))
+            {
+                onlyIds = [];
+                foreach (var part in onlyRaw.Split(','))
+                {
+                    if (ulong.TryParse(part.Trim(), out var id))
+                    {
+                        onlyIds.Add(id);
+                    }
+                }
+            }
+
+            try
+            {
+                return await ContentDownloader.RefreshWorkshopCatalogAsync(appId.Value, output, onlyIds, batchSize, maxItems);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                PrintCatalogSaveFailure(ex);
+                return 1;
             }
             finally
             {
@@ -196,10 +271,28 @@ namespace DepotDownloader
 
                 return await ContentDownloader.DownloadWorkshopCatalogAsync(appId.Value, output, history, onlyIds, manifestsOnly, maxItems);
             }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                PrintCatalogSaveFailure(ex);
+                return 1;
+            }
             finally
             {
                 LogOff(rememberPassword);
             }
+        }
+
+        // Reached only after CheckpointFile's own several-second retry budget is exhausted - by
+        // then this is a real, if usually transient, condition (antivirus scanning a large
+        // catalog file, a backup/cloud-sync tool holding it open, or another instance of this
+        // command running concurrently), not a bug to crash the whole process over with a raw
+        // stack trace. Whatever was last successfully saved is intact on disk either way -
+        // CheckpointFile's tmp+atomic-move save means there is no partial/torn state to worry
+        // about - so the only real cost of stopping here is re-running the same command.
+        private static void PrintCatalogSaveFailure(Exception ex)
+        {
+            Console.WriteLine($"Error: could not save the workshop catalog - {ex.GetType().Name}: {ex.Message}");
+            Console.WriteLine("Something else likely had an unusually long exclusive lock on the catalog file (antivirus scanning it, a backup/cloud-sync tool, or another instance of this command reading it) - saves already retry transient collisions for several seconds before giving up. Your progress through the last successful save is safe on disk; re-run the same command to resume from there.");
         }
 
         private static int StatusAsync(string[] args)
@@ -212,13 +305,14 @@ namespace DepotDownloader
             var kindRaw = parser.Get<string>(null, "-kind");
             var onlyRaw = parser.Get<string>(null, "-only");
             var nameRaw = parser.Get<string>(null, "-name");
+            var bannedOnly = parser.HasFlag("-banned-only");
             var limit = parser.Get<uint>(200, "-limit");
             parser.WarnUnconsumed();
 
             if (appId == null)
             {
                 Console.WriteLine("Usage: depotdownloader workshop status -app <appid> [-output <dir>]");
-                Console.WriteLine("       depotdownloader workshop status -app <appid> -list [-kind chunk|ancient|unknown] [-only <id,id2,...>] [-name <pattern>] [-limit N]");
+                Console.WriteLine("       depotdownloader workshop status -app <appid> -list [-kind chunk|ancient|unknown] [-only <id,id2,...>] [-name <pattern>] [-banned-only] [-limit N]");
                 return 1;
             }
 
@@ -273,7 +367,7 @@ namespace DepotDownloader
             }
 
             Console.WriteLine();
-            return ContentDownloader.PrintWorkshopCatalogList(appId.Value, output, onlyIds, kindFilter, nameFilter, limit);
+            return ContentDownloader.PrintWorkshopCatalogList(appId.Value, output, onlyIds, kindFilter, nameFilter, bannedOnly, limit);
         }
 
         private static bool LogOn(string username, string password, bool rememberPassword)
@@ -319,6 +413,7 @@ namespace DepotDownloader
             Console.WriteLine("USAGE:");
             Console.WriteLine("  depotdownloader workshop bootstrap -app <appid> [OPTIONS...]");
             Console.WriteLine("  depotdownloader workshop poll -app <appid> [OPTIONS...]");
+            Console.WriteLine("  depotdownloader workshop refresh -app <appid> [OPTIONS...]");
             Console.WriteLine("  depotdownloader workshop download -app <appid> [OPTIONS...]");
             Console.WriteLine("  depotdownloader workshop download -workshop <id> [<id>...] [OPTIONS...]");
             Console.WriteLine("  depotdownloader workshop status -app <appid> [-output <dir>] [-list [OPTIONS...]]");
@@ -414,24 +509,41 @@ namespace DepotDownloader
             Console.WriteLine("  -backfill-batch <n> Same meaning as on \"bootstrap\" above - runs after this poll's");
             Console.WriteLine("                     own delta, so a poll schedule doubles as steady backfill progress");
             Console.WriteLine();
+            Console.WriteLine("REFRESH - re-verifies already-known catalog entries directly against GetDetails,");
+            Console.WriteLine("          batched, instead of relying on bootstrap's ranking walk or poll's delta to");
+            Console.WriteLine("          notice anything. The only way to catch two things neither of those can:");
+            Console.WriteLine("          a stale/wrong title or kind that was never re-detected by either mechanism,");
+            Console.WriteLine("          and an item Steam banned or its author made private/unlisted - which simply");
+            Console.WriteLine("          stops appearing everywhere else with no signal as to why. Catalog-only, like");
+            Console.WriteLine("          bootstrap's plain default - never downloads content. Anonymous (unlike poll).");
+            Console.WriteLine("  -only <id,id2,...> Restrict to specific catalog IDs instead of the whole thing");
+            Console.WriteLine("  -batch-size <n>    IDs per GetDetails request (default 100). Steam's real per-");
+            Console.WriteLine("                     request limit isn't established here - lower this if a run");
+            Console.WriteLine("                     starts failing outright rather than for individual IDs");
+            Console.WriteLine("  -max-items <n>     Stop after checking this many IDs (resumable - re-run to continue,");
+            Console.WriteLine("                     or use -only to target specific IDs across separate runs)");
+            Console.WriteLine();
             Console.WriteLine("STATUS - summary counts by default. Add -list for the actual per-item view (there is");
             Console.WriteLine("         no other way to inspect a catalog - workshop_catalog.bin is protobuf/Deflate,");
             Console.WriteLine("         not a text format meant to be opened directly). Sorted by ID for stable,");
             Console.WriteLine("         diffable output across runs.");
             Console.WriteLine("  -list              Print each matching item: ID, kind, manifest ID, last update/seen");
-            Console.WriteLine("                     time, history entry count + complete/partial, title");
+            Console.WriteLine("                     time, history entry count + complete/partial, title (tagged");
+            Console.WriteLine("                     [BANNED] or [NOT PUBLIC] if \"workshop refresh\" found either)");
             Console.WriteLine("    -kind <k>            Filter: chunk, ancient, or unknown");
             Console.WriteLine("    -only <id,id2,...>   Filter to specific IDs");
             Console.WriteLine("    -name <pattern>      Filter by title - a case-insensitive regex (.NET syntax),");
             Console.WriteLine("                         so plain text matches as a substring and \"Mario|Samus|");
             Console.WriteLine("                         Metroid\" matches any of several names in one pass");
+            Console.WriteLine("    -banned-only         Only items \"workshop refresh\" found banned - never set");
+            Console.WriteLine("                         without having run \"refresh\" at least once");
             Console.WriteLine("    -limit <n>           Cap rows printed (default 200; 0 = no limit)");
             Console.WriteLine();
             Console.WriteLine("COMMON OPTIONS:");
             Console.WriteLine("  -output <dir>      Root output directory (default: current directory, same as");
             Console.WriteLine("                     \"download -raw\" - catalog and manifests land under depot/<appid>/)");
-            Console.WriteLine("  -username <user>   Steam account (bootstrap/ad-hoc download can run anonymously;");
-            Console.WriteLine("                     poll cannot - see above)");
+            Console.WriteLine("  -username <user>   Steam account (bootstrap/refresh/ad-hoc download can run");
+            Console.WriteLine("                     anonymously; poll cannot - see above)");
             Console.WriteLine("  -remember-password Save a login token for reuse on the next run");
             Console.WriteLine();
             Console.WriteLine("EXAMPLES:");
@@ -440,6 +552,8 @@ namespace DepotDownloader
             Console.WriteLine("  depotdownloader workshop download -app 4000 -history -only 2956730580");
             Console.WriteLine("  depotdownloader workshop download -workshop 123456 789012        # ad-hoc, no bootstrap needed");
             Console.WriteLine("  depotdownloader workshop poll -app 4000 -username myaccount -remember-password");
+            Console.WriteLine("  depotdownloader workshop refresh -app 4000                       # re-verify/correct everything known");
+            Console.WriteLine("  depotdownloader workshop status -app 4000 -list -banned-only     # see what refresh found banned");
             Console.WriteLine("  depotdownloader workshop status -app 4000");
             Console.WriteLine("  depotdownloader workshop status -app 4000 -list -kind ancient -limit 50");
             Console.WriteLine("  depotdownloader workshop status -app 4000 -list -name \"Mario|Samus|Metroid\"");
