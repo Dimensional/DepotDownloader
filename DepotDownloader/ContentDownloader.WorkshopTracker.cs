@@ -561,6 +561,161 @@ namespace DepotDownloader
             return failed > 0 ? 1 : 0;
         }
 
+        /// <summary>
+        /// "workshop refresh" - re-verifies already-known catalog entries directly against
+        /// PublishedFile.GetDetails, batched, instead of relying on bootstrap's ranking walk or
+        /// poll's GetItemChanges delta to notice anything. Exists for two things neither of those
+        /// can do: (1) correcting a stale or wrong title/kind/manifest handle for an item that's
+        /// still perfectly resolvable but wasn't caught by either mechanism, and (2) positively
+        /// detecting a removal - an item Steam moderation banned, or its own author made
+        /// private/unlisted - which simply stops appearing in QueryFiles pages and GetItemChanges
+        /// deltas with no signal distinguishing it from any other reason an item might not show up
+        /// there. GetDetails answers about a specific ID directly, so it's the only one of the
+        /// three RPCs this feature can be built on.
+        ///
+        /// Confirmed anonymous-friendly (same GetDetails RPC ad-hoc "download -workshop" already
+        /// uses without a login) - unlike "poll", this never requires -username. Purely a metadata
+        /// pass - it never downloads content, same as bootstrap's own plain default.
+        /// </summary>
+        public static async Task<int> RefreshWorkshopCatalogAsync(uint appId, string outputRoot, HashSet<ulong> onlyIds, uint batchSize, uint maxItems)
+        {
+            outputRoot = ResolveOutputRoot(outputRoot);
+            var catalogPath = WorkshopCatalog.GetPath(outputRoot, appId);
+
+            if (!File.Exists(catalogPath))
+            {
+                Console.WriteLine($"No catalog found for app {appId} at {catalogPath}.");
+                Console.WriteLine($"Run 'workshop bootstrap -app {appId}' first.");
+                return 1;
+            }
+
+            var catalog = WorkshopCatalog.LoadOrCreate(catalogPath, appId);
+
+            IEnumerable<ulong> candidateIds = catalog.Items.Keys;
+            if (onlyIds is { Count: > 0 })
+            {
+                candidateIds = candidateIds.Where(onlyIds.Contains);
+            }
+
+            // Sorted for the same reason "status -list" is: two runs (or a run resumed via
+            // -max-items) walk IDs in a stable, repeatable order rather than whatever a
+            // Dictionary's own enumeration order happens to be.
+            var ids = candidateIds.OrderBy(id => id).ToList();
+            if (maxItems > 0 && ids.Count > (int)maxItems)
+            {
+                ids = ids.Take((int)maxItems).ToList();
+            }
+
+            if (ids.Count == 0)
+            {
+                Console.WriteLine("Nothing to refresh - no matching items in the catalog.");
+                return 0;
+            }
+
+            Console.WriteLine($"Refreshing {ids.Count:N0} item(s) in batches of {batchSize}...");
+
+            var checkedCount = 0;
+            var changedCount = 0;
+            var newlyBanned = 0;
+            var unresolved = 0;
+            var batchesSinceSave = 0;
+            var now = (uint)DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+
+            for (var offset = 0; offset < ids.Count; offset += (int)batchSize)
+            {
+                var batchIds = ids.Skip(offset).Take((int)batchSize).ToList();
+
+                var (result, details) = await WithTransientRetryAsync("GetDetails",
+                    () => steam3.GetPublishedFileDetailsBatch(batchIds));
+
+                if (result != EResult.OK || details == null)
+                {
+                    Console.WriteLine($"GetDetails failed for the batch starting at offset {offset}: {result}. Progress saved for everything checked so far - re-run with the same -only/-max-items (or none) to pick up where this left off; already-corrected entries are simply re-verified, not duplicated.");
+                    catalog.Save(catalogPath);
+                    return 1;
+                }
+
+                var byId = details.ToDictionary(d => d.publishedfileid);
+
+                foreach (var id in batchIds)
+                {
+                    checkedCount++;
+
+                    if (!catalog.Items.TryGetValue(id, out var item))
+                    {
+                        continue; // shouldn't happen - every id here came from the catalog itself
+                    }
+
+                    if (!byId.TryGetValue(id, out var d) || d.result != (uint)EResult.OK)
+                    {
+                        unresolved++;
+                        var code = byId.TryGetValue(id, out var partial) ? partial.result.ToString() : "no entry returned";
+                        Console.WriteLine($"  {id} \"{item.Title}\" - did not resolve ({code}) - possibly fully deleted rather than just banned/private, which GetDetails can't distinguish from this response alone.");
+                        continue;
+                    }
+
+                    var wasBanned = item.Banned;
+                    var kind = !string.IsNullOrEmpty(d.file_url) ? WorkshopItemKind.AncientUgc : WorkshopItemKind.ChunkBased;
+                    var fileUrl = kind == WorkshopItemKind.AncientUgc ? d.file_url : null;
+                    // Normalized before comparing AND storing - GetDetails returns "" for a
+                    // non-banned item, but every existing catalog entry predates this field and
+                    // loads it at protobuf's zero-value default (null); treating those as distinct
+                    // would flag nearly every item as "changed" on its first-ever refresh even
+                    // when nothing real differs (caught live: a real refresh against known-good
+                    // items reported all three as "corrected" purely from this null-vs-"" gap).
+                    var banReason = string.IsNullOrEmpty(d.ban_reason) ? null : d.ban_reason;
+
+                    var changed = item.Title != d.title
+                        || item.Kind != kind
+                        || item.FileUrl != fileUrl
+                        || item.ManifestId != d.hcontent_file
+                        || item.Banned != d.banned
+                        || item.BanReason != banReason
+                        || item.Visibility != d.visibility;
+
+                    item.Title = d.title;
+                    item.Kind = kind;
+                    item.FileUrl = fileUrl;
+                    item.ManifestId = d.hcontent_file;
+                    item.TimeUpdated = d.time_updated;
+                    item.Banned = d.banned;
+                    item.BanReason = banReason;
+                    item.Visibility = d.visibility;
+                    item.LastSeenAt = now;
+
+                    if (changed)
+                    {
+                        changedCount++;
+                        if (d.banned && !wasBanned)
+                        {
+                            newlyBanned++;
+                            Console.WriteLine($"  BANNED {id} \"{d.title}\"{(string.IsNullOrEmpty(d.ban_reason) ? "" : $" - {d.ban_reason}")}");
+                        }
+                        else
+                        {
+                            Console.WriteLine($"  CORRECTED {id} \"{d.title}\"");
+                        }
+                    }
+                }
+
+                if (++batchesSinceSave >= 5)
+                {
+                    catalog.Save(catalogPath);
+                    batchesSinceSave = 0;
+                }
+
+                Console.WriteLine($"  {checkedCount:N0} of {ids.Count:N0} checked...");
+
+                await Task.Delay(WorkshopApiPacingDelay);
+            }
+
+            catalog.Save(catalogPath);
+
+            Console.WriteLine($"Refresh complete: {checkedCount:N0} checked, {changedCount:N0} corrected ({newlyBanned:N0} newly banned), {unresolved:N0} did not resolve at all.");
+
+            return 0;
+        }
+
         public static int PrintWorkshopCatalogStatus(uint appId, string outputRoot)
         {
             outputRoot = ResolveOutputRoot(outputRoot);
@@ -642,7 +797,7 @@ namespace DepotDownloader
         /// real inspection path. Sorted by PublishedFileId (not dictionary/insertion order) so two
         /// snapshots of the same catalog print identically and diff cleanly.
         /// </summary>
-        public static int PrintWorkshopCatalogList(uint appId, string outputRoot, HashSet<ulong> onlyIds, WorkshopItemKind? kindFilter, Regex nameFilter, uint limit)
+        public static int PrintWorkshopCatalogList(uint appId, string outputRoot, HashSet<ulong> onlyIds, WorkshopItemKind? kindFilter, Regex nameFilter, bool bannedOnly, uint limit)
         {
             outputRoot = ResolveOutputRoot(outputRoot);
             var catalogPath = WorkshopCatalog.GetPath(outputRoot, appId);
@@ -668,6 +823,14 @@ namespace DepotDownloader
             {
                 items = items.Where(i => nameFilter.IsMatch(i.Title ?? string.Empty));
             }
+            if (bannedOnly)
+            {
+                // Only ever set by "workshop refresh" - an unrefreshed catalog (or one whose
+                // entries all resolved fine last time it ran) shows nothing here even though
+                // Steam-side bans obviously still happen; this reflects what's been checked, not a
+                // live guarantee.
+                items = items.Where(i => i.Banned);
+            }
 
             var matching = items.OrderBy(i => i.PublishedFileId).ToList();
             var shown = limit == 0 ? matching : matching.Take((int)limit).ToList();
@@ -682,7 +845,9 @@ namespace DepotDownloader
                 // fields existed - N there is just whatever's known so far (often just the current
                 // version), not a real total.
                 var hist = item.HistoryComplete ? $"{item.History.Count} (complete)" : $"{item.History.Count}? (partial)";
-                Console.WriteLine($"{item.PublishedFileId,-20} {item.Kind,-11} {item.ManifestId,-20} {updated,-20} {seen,-20} {hist,-16} {item.Title}");
+                // Only ever populated by "workshop refresh" - never touched by bootstrap/poll.
+                var tag = item.Banned ? " [BANNED]" : item.Visibility != 0 ? " [NOT PUBLIC]" : "";
+                Console.WriteLine($"{item.PublishedFileId,-20} {item.Kind,-11} {item.ManifestId,-20} {updated,-20} {seen,-20} {hist,-16} {item.Title}{tag}");
             }
 
             Console.WriteLine();

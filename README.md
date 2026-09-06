@@ -659,7 +659,8 @@ depotdownloader workshop bootstrap -app <appid> [OPTIONS...]
 depotdownloader workshop download -app <appid> [OPTIONS...]
 depotdownloader workshop download -workshop <id> [<id>...] [OPTIONS...]
 depotdownloader workshop poll -app <appid> [OPTIONS...]
-depotdownloader workshop status -app <appid> [-output <dir>] [-list [-kind chunk|ancient|unknown] [-only <id,id2,...>] [-limit N]]
+depotdownloader workshop refresh -app <appid> [OPTIONS...]
+depotdownloader workshop status -app <appid> [-output <dir>] [-list [-kind chunk|ancient|unknown] [-only <id,id2,...>] [-name <pattern>] [-banned-only] [-limit N]]
 ```
 
 ### Bootstrap
@@ -844,6 +845,45 @@ isn't documented; observed behavior against a high-churn app (Garry's Mod, depot
 - `poll` treats a rejected watermark as "re-run bootstrap," not a fatal error - it prints that
   instruction and exits rather than retrying the same request.
 
+### Refresh
+
+Re-verifies already-known catalog entries directly against `PublishedFile.GetDetails`, batched,
+instead of relying on `bootstrap`'s ranking walk or `poll`'s `GetItemChanges` delta to notice
+anything. This closes two gaps neither of those can: correcting a stale or wrong title/kind/manifest
+handle for an item that's still perfectly resolvable but wasn't caught by either mechanism, and
+positively detecting a removal - an item Steam moderation banned, or its own author made
+private/unlisted, simply stops appearing in `QueryFiles` pages and `GetItemChanges` deltas with no
+signal distinguishing it from any other reason an item might not show up there. `GetDetails` answers
+about a specific ID directly, so it's the only one of the three RPCs this can be built on.
+
+`CPublishedFile_GetDetails_Request.publishedfileids` is a genuine repeated field (confirmed via
+reflection against the SteamKit2 package) - every other caller in this project only ever asks about
+one ID at a time, but `refresh` walks the catalog's own known IDs in batches, far cheaper than a
+round trip per item. Confirmed anonymous-friendly, same as the single-ID lookup ad-hoc
+`download -workshop` already uses without a login - unlike `poll`, `refresh` never requires
+`-username`. It's catalog-only, like `bootstrap`'s plain default - it never downloads content.
+
+Steam's own practical limit on how many IDs one `GetDetails` request can carry isn't established
+here; nothing in the request shape documents one. `-batch-size` defaults to 100 - lower it if a run
+starts failing outright rather than failing for individual IDs.
+
+Two new per-item fields exist solely for this command's use, both left at their zero-value default
+(`false`/`null`/`0`, meaning "never refreshed") until a `refresh` actually touches that item: `Banned`
+(+ `BanReason`) from `PublishedFileDetails.banned`/`ban_reason`, and `Visibility` from
+`PublishedFileDetails.visibility` (Steam's published SDK documents 0=Public, 1=FriendsOnly,
+2=Private, 3=Unlisted for this field - not independently re-verified here, so `status -list` and
+`-banned-only` treat any nonzero value as simply "not public" rather than leaning on the exact
+number). `status -list` tags an affected row `[BANNED]` or `[NOT PUBLIC]`, and `-banned-only`
+filters to just what's been found banned - both reflect only what a `refresh` has actually checked,
+not a live guarantee about anything else in the catalog.
+
+A per-item `PublishedFileDetails.result` in the response is distinct from the call's own overall
+result - it's what actually tells the difference between "this ID resolved, and here's its current
+state" (used to correct the catalog entry) and "this ID didn't resolve at all" (logged as
+unresolved and left untouched, since a mostly-empty response isn't something to overwrite good data
+with) - a stronger signal than `banned`/`visibility` alone, since a fully deleted item can fail to
+resolve at all rather than coming back with those fields set.
+
 ### Options
 
 **bootstrap:**
@@ -885,9 +925,15 @@ isn't documented; observed behavior against a high-churn app (Garry's Mod, depot
 - `-shallow` - Same meaning as on `bootstrap` above - also skips this run's `-backfill-batch` sweep
 - `-backfill-batch <n>` - Same meaning as on `bootstrap` above (runs after this poll's own delta)
 
-**Common options:** `-output <dir>`, `-username`/`-remember-password` (bootstrap and ad-hoc
-`download` can run anonymously; catalog-driven `download` inherits whatever the items themselves
-require; `poll` requires an authenticated login).
+**refresh:**
+- `-only <id,id2,...>` - Restrict to specific catalog IDs instead of the whole thing
+- `-batch-size <n>` - IDs per `GetDetails` request (default 100 - see Refresh above)
+- `-max-items <n>` - Stop after checking this many IDs (resumable - re-run to continue, or use
+  `-only` to target specific IDs across separate runs)
+
+**Common options:** `-output <dir>`, `-username`/`-remember-password` (bootstrap, refresh, and
+ad-hoc `download` can run anonymously; catalog-driven `download` inherits whatever the items
+themselves require; `poll` requires an authenticated login).
 
 ### Inspecting a catalog
 
@@ -895,12 +941,15 @@ require; `poll` requires an authenticated login).
 still incomplete. `workshop_catalog.bin` is protobuf/Deflate, not a format meant to be opened
 directly, so `status -list` is the way to see what was recorded: one row per item (ID, kind,
 manifest/content handle, last-update/last-seen time, a `History` column showing entry count and
-whether it's complete or partial, title). Rows are sorted by ID rather than dictionary order, so two
-snapshots print identically and diff cleanly. Defaults to the first 200 matching rows (`-limit 0`
-for all); narrow with `-kind chunk|ancient|unknown`, `-only <id,id2,...>`, and/or `-name <pattern>` -
-a case-insensitive .NET regex matched against title, so plain text works as an ordinary substring
-search and `-name "Mario|Samus|Metroid"` finds any of several names in one pass rather than needing
-a separate multi-term flag.
+whether it's complete or partial, title - tagged `[BANNED]` or `[NOT PUBLIC]` if a `refresh` found
+either). Rows are sorted by ID rather than dictionary order, so two snapshots print identically and
+diff cleanly. Defaults to the first 200 matching rows (`-limit 0` for all); narrow with
+`-kind chunk|ancient|unknown`, `-only <id,id2,...>`, `-name <pattern>` - a case-insensitive .NET
+regex matched against title, so plain text works as an ordinary substring search and
+`-name "Mario|Samus|Metroid"` finds any of several names in one pass rather than needing a separate
+multi-term flag - and/or `-banned-only`, which shows only what a `refresh` has actually found banned
+(never set on an entry `refresh` hasn't touched, so an empty result here means "not yet checked,"
+not "nothing is banned").
 
 On load, a corrupt, truncated, or incompatible-version catalog fails loudly with a clear message
 rather than silently misreading it - protobuf-net's wire format is self-describing (field number and
@@ -935,9 +984,11 @@ depotdownloader workshop download -app 4000                                 # cu
 depotdownloader workshop download -app 4000 -history -only 2956730580       # full version history, one item
 depotdownloader workshop download -workshop 123456 789012                   # ad-hoc, no bootstrap needed
 depotdownloader workshop poll -app 4000 -username myaccount -remember-password
+depotdownloader workshop refresh -app 4000                                   # re-verify/correct everything known
 depotdownloader workshop status -app 4000
 depotdownloader workshop status -app 4000 -list -kind ancient -limit 50      # inspect the actual items
 depotdownloader workshop status -app 4000 -list -name "Mario|Samus|Metroid"  # regex title search
+depotdownloader workshop status -app 4000 -list -banned-only                 # see what refresh found banned
 ```
 
 ---

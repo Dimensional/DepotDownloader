@@ -123,6 +123,31 @@ namespace DepotDownloader
         /// touch, until it changes again - which the change-triggered fetch above already handles).</summary>
         [ProtoMember(9)]
         public bool HistoryComplete { get; set; }
+
+        /// <summary>Set by "workshop refresh" (PublishedFileDetails.banned) - Steam moderation
+        /// removed this item. Unlike everything else bootstrap/poll record, this can only be
+        /// learned by asking about this specific ID directly via GetDetails: a banned item simply
+        /// stops appearing in QueryFiles pages and GetItemChanges deltas, indistinguishable from
+        /// any other reason an item might not show up there. Not touched by bootstrap or poll -
+        /// only "workshop refresh" ever sets this (or clears it, if a later refresh finds the ban
+        /// lifted).</summary>
+        [ProtoMember(10)]
+        public bool Banned { get; set; }
+
+        /// <summary>PublishedFileDetails.ban_reason, if Banned - whatever text (if any) Steam
+        /// moderation attached, not otherwise interpreted.</summary>
+        [ProtoMember(11)]
+        public string BanReason { get; set; }
+
+        /// <summary>PublishedFileDetails.visibility, raw (0 observed for a normal public item on
+        /// depot 4000). Steam's published SDK documents ERemoteStoragePublishedFileVisibility as
+        /// 0=Public, 1=FriendsOnly, 2=Private, 3=Unlisted - not independently re-verified against
+        /// this project's own testing, so treat any nonzero value as "not public" rather than
+        /// leaning on the exact number. Set only by "workshop refresh", same as Banned/BanReason -
+        /// a non-public item (made friends-only/private/unlisted by its own author) is a second,
+        /// distinct reason an item can vanish from bootstrap/poll without ever being banned.</summary>
+        [ProtoMember(12)]
+        public uint Visibility { get; set; }
     }
 
     /// <summary>

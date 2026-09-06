@@ -350,6 +350,38 @@ namespace DepotDownloader
         }
 
         /// <summary>
+        /// The same PublishedFile.GetDetails RPC as GetPublishedFileDetails above, but for many
+        /// IDs in one round trip - CPublishedFile_GetDetails_Request.publishedfileids is a real
+        /// repeated field (confirmed via reflection against the SteamKit2 package, not just
+        /// assumed), and the response returns a matching list of PublishedFileDetails, one per
+        /// requested ID. Every existing caller only ever asks about one ID at a time; this exists
+        /// specifically for "workshop refresh" walking a whole catalog's already-known IDs, where
+        /// paying a full round trip per item would be needlessly expensive. Confirmed anonymous-
+        /// friendly, same as the single-ID overload (ad-hoc "download -workshop" already relies on
+        /// that without a login).
+        ///
+        /// Steam's own practical limit on how many IDs one request can carry is not established
+        /// here - nothing in the request shape documents one, so callers should pick a
+        /// conservative batch size and confirm it works against a real, large catalog rather than
+        /// assuming it scales arbitrarily. A per-item PublishedFileDetails.result in the response
+        /// is NOT the same as this call's own overall Result - see PublishedFileDetails.result for
+        /// whether that specific ID actually resolved (e.g. it doesn't exist at all vs. it exists
+        /// but is banned/private).
+        /// </summary>
+        public async Task<(EResult Result, List<PublishedFileDetails> Details)> GetPublishedFileDetailsBatch(IEnumerable<ulong> pubFiles)
+        {
+            var request = new CPublishedFile_GetDetails_Request
+            {
+                includechildren = true,
+            };
+            request.publishedfileids.AddRange(pubFiles);
+
+            var response = await steamPublishedFile.GetDetails(request);
+
+            return (response.Result, response.Body?.publishedfiledetails);
+        }
+
+        /// <summary>
         /// PublishedFile.GetItemChanges - a per-app delta feed ("items updated since
         /// last_time_updated", each with its new manifest_id already attached - no per-item
         /// follow-up needed). What "workshop poll" calls on every run.
