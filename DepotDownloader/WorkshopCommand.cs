@@ -98,6 +98,7 @@ namespace DepotDownloader
             var output = parser.Get<string>(null, "-output", "-dir");
             var dryRun = parser.HasFlag("-dry-run");
             var manifestsOnly = parser.HasFlag("-manifests-only", "-raw-dry-run");
+            var catalogOnly = parser.HasFlag("-catalog-only");
             var shallow = parser.HasFlag("-shallow");
             var backfillBatch = parser.Get<uint>(200, "-backfill-batch");
             var username = parser.Get<string>(null, "-username", "-user");
@@ -107,7 +108,7 @@ namespace DepotDownloader
 
             if (appId == null)
             {
-                Console.WriteLine("Usage: depotdownloader workshop poll -app <appid> [-dry-run | -manifests-only] [-shallow] [-backfill-batch 200] [-output <dir>] [-username <user> [-remember-password]]");
+                Console.WriteLine("Usage: depotdownloader workshop poll -app <appid> [-dry-run | -manifests-only | -catalog-only] [-shallow] [-backfill-batch 200] [-output <dir>] [-username <user> [-remember-password]]");
                 return 1;
             }
 
@@ -123,7 +124,7 @@ namespace DepotDownloader
 
             try
             {
-                return await ContentDownloader.PollWorkshopCatalogAsync(appId.Value, output, dryRun, manifestsOnly, shallow, backfillBatch);
+                return await ContentDownloader.PollWorkshopCatalogAsync(appId.Value, output, dryRun, manifestsOnly, shallow, backfillBatch, catalogOnly);
             }
             finally
             {
@@ -381,7 +382,13 @@ namespace DepotDownloader
             Console.WriteLine("       since X,\" never how many times, so without it an item updated twice between");
             Console.WriteLine("       two polls would silently lose the version in between. Cheap here since poll's");
             Console.WriteLine("       delta set is normally a tiny fraction of the whole catalog.");
-            Console.WriteLine("  -dry-run           Report what would be checked/downloaded - fetches nothing at all");
+            Console.WriteLine("  -dry-run           Report what would be checked/downloaded - fetches and changes");
+            Console.WriteLine("                     nothing: no catalog update, no watermark advance, no backfill");
+            Console.WriteLine("                     sweep. Safe to run repeatedly before a real poll.");
+            Console.WriteLine("  -catalog-only      Update the catalog (and, unless -shallow, full history) for");
+            Console.WriteLine("                     every changed item exactly as a real poll would, but never call");
+            Console.WriteLine("                     the archive step - no manifest fetch, no content/chunk download.");
+            Console.WriteLine("                     The poll equivalent of bootstrap's own plain (no-flags) default.");
             Console.WriteLine("  -manifests-only    Same meaning as on \"download\" above");
             Console.WriteLine("  -shallow           Same meaning as on \"bootstrap\" above - also skips this poll's");
             Console.WriteLine("                     -backfill-batch sweep of any items still marked incomplete");

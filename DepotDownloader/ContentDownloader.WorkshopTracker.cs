@@ -318,7 +318,7 @@ namespace DepotDownloader
             }
         }
 
-        public static async Task<int> PollWorkshopCatalogAsync(uint appId, string outputRoot, bool dryRun, bool manifestsOnly = false, bool shallow = false, uint backfillBatch = 200)
+        public static async Task<int> PollWorkshopCatalogAsync(uint appId, string outputRoot, bool dryRun, bool manifestsOnly = false, bool shallow = false, uint backfillBatch = 200, bool catalogOnly = false)
         {
             outputRoot = ResolveOutputRoot(outputRoot);
             var catalogPath = WorkshopCatalog.GetPath(outputRoot, appId);
@@ -383,6 +383,25 @@ namespace DepotDownloader
             {
                 catalog.Items.TryGetValue(change.published_file_id, out var existing);
                 var isNew = existing == null;
+
+                // True preview: no network calls beyond GetItemChanges itself, no catalog
+                // mutation, nothing persisted - reports using only what's already in memory. A
+                // real bug lived here previously: this used to fall through to the same
+                // catalog.Items write / reclassification call / watermark advance / catalog.Save
+                // as a real poll, differing only in skipping the actual archive step - so running
+                // "-dry-run" then a real poll later would silently never re-see or archive
+                // whatever it had "previewed," since the watermark had already moved past it and
+                // the catalog already held its new ManifestId.
+                if (dryRun)
+                {
+                    var skipDry = existing?.Kind == WorkshopItemKind.ChunkBased && existing.ManifestId == change.manifest_id;
+                    if (!skipDry)
+                    {
+                        Console.WriteLine($"  {(isNew ? "NEW" : "CHANGED")} {change.published_file_id} \"{existing?.Title ?? $"unknown_{change.published_file_id}"}\" [{existing?.Kind ?? WorkshopItemKind.Unknown}]");
+                    }
+                    continue;
+                }
+
                 var title = existing?.Title;
                 var kind = existing?.Kind ?? WorkshopItemKind.Unknown;
                 var fileUrl = existing?.FileUrl;
@@ -453,11 +472,6 @@ namespace DepotDownloader
 
                 Console.WriteLine($"  {(isNew ? "NEW" : "CHANGED")} {change.published_file_id} \"{title}\" [{kind}]");
 
-                if (dryRun)
-                {
-                    continue;
-                }
-
                 // Full history by default - GetItemChanges only ever says "this changed since X,"
                 // never how many times or through what intermediate versions, so without this an
                 // item that updated more than once between polls would silently lose everything
@@ -474,50 +488,71 @@ namespace DepotDownloader
                     newItem.HistoryComplete = false;
                 }
 
-                try
+                // -catalog-only stops here, the same way bootstrap's plain default does: the
+                // catalog entry (and, unless -shallow, its full history) is already recorded
+                // above - what's skipped is the archive step below, not the catalog update
+                // itself. This is the one poll mode with no network cost proportional to file
+                // size, only to item count - useful for tracking a workshop's changes without
+                // committing to storing its content.
+                if (!catalogOnly)
                 {
-                    // Deliberately the same per-item entry point "download -workshop -raw" uses,
-                    // not a hand-rolled DownloadAppRawAsync call - it does its own file_url/
-                    // hcontent_file dispatch internally, so both ChunkBased and AncientUgc items
-                    // land correctly without duplicating that logic here. Reuse freshDetails when
-                    // the reclassification step above already fetched it, rather than fetching the
-                    // same PublishedFileDetails twice. manifestsOnly maps to RawDownloadOptions.
-                    // DryRun - manifest-only for ChunkBased, metadata-logged-not-fetched for
-                    // AncientUgc (see DownloadWebFileToUGCAsync).
-                    var options = new RawDownloadOptions { OutputRoot = outputRoot, DryRun = manifestsOnly };
-                    if (freshDetails != null)
+                    try
                     {
-                        await DownloadPubfileRawAsync(change.published_file_id, freshDetails, options);
+                        // Deliberately the same per-item entry point "download -workshop -raw"
+                        // uses, not a hand-rolled DownloadAppRawAsync call - it does its own
+                        // file_url/hcontent_file dispatch internally, so both ChunkBased and
+                        // AncientUgc items land correctly without duplicating that logic here.
+                        // Reuse freshDetails when the reclassification step above already
+                        // fetched it, rather than fetching the same PublishedFileDetails twice.
+                        // manifestsOnly maps to RawDownloadOptions.DryRun - manifest-only for
+                        // ChunkBased, metadata-logged-not-fetched for AncientUgc (see
+                        // DownloadWebFileToUGCAsync).
+                        var options = new RawDownloadOptions { OutputRoot = outputRoot, DryRun = manifestsOnly };
+                        if (freshDetails != null)
+                        {
+                            await DownloadPubfileRawAsync(change.published_file_id, freshDetails, options);
+                        }
+                        else
+                        {
+                            await DownloadPubfileRawAsync(change.published_file_id, options);
+                        }
+                        downloaded++;
                     }
-                    else
+                    catch (Exception ex)
                     {
-                        await DownloadPubfileRawAsync(change.published_file_id, options);
+                        failed++;
+                        Console.WriteLine($"    ERROR downloading {change.published_file_id}: {ex.Message}");
                     }
+                }
+                else
+                {
                     downloaded++;
                 }
-                catch (Exception ex)
-                {
-                    failed++;
-                    Console.WriteLine($"    ERROR downloading {change.published_file_id}: {ex.Message}");
-                }
             }
 
-            // Advance only to what GetItemChanges itself reported, never to "now" - so a poll can
-            // never silently skip a window it didn't actually ask Steam about.
-            catalog.LastWatermark = body.update_time;
-
-            // Beyond this poll's own delta, also chip away at any items still marked
-            // history-incomplete from an earlier "-shallow" pass - not just the ones this
-            // particular poll happened to touch. Bounded (-backfill-batch) so this can't turn an
-            // otherwise-cheap poll into a long sweep by accident.
-            if (!shallow)
+            // Nothing below this point runs for -dry-run: no watermark advance, no backfill
+            // sweep, no save - a dry run must leave the catalog byte-for-byte as it found it, or
+            // a later real poll could silently never re-see (and so never archive) whatever this
+            // one "previewed."
+            if (!dryRun)
             {
-                await BackfillIncompleteHistoryAsync(catalog, catalogPath, backfillBatch);
+                // Advance only to what GetItemChanges itself reported, never to "now" - so a poll
+                // can never silently skip a window it didn't actually ask Steam about.
+                catalog.LastWatermark = body.update_time;
+
+                // Beyond this poll's own delta, also chip away at any items still marked
+                // history-incomplete from an earlier "-shallow" pass - not just the ones this
+                // particular poll happened to touch. Bounded (-backfill-batch) so this can't turn
+                // an otherwise-cheap poll into a long sweep by accident.
+                if (!shallow)
+                {
+                    await BackfillIncompleteHistoryAsync(catalog, catalogPath, backfillBatch);
+                }
+
+                catalog.Save(catalogPath);
             }
 
-            catalog.Save(catalogPath);
-
-            var verb = manifestsOnly ? "Recorded manifests/metadata for" : "Downloaded";
+            var verb = catalogOnly ? "Recorded catalog entries for" : manifestsOnly ? "Recorded manifests/metadata for" : "Downloaded";
             Console.WriteLine(dryRun
                 ? $"Dry run: {body.workshop_items.Count:N0} item(s) would be checked/downloaded - nothing was actually fetched."
                 : $"{verb} {downloaded:N0} item(s), {failed:N0} failed. Watermark advanced to {catalog.LastWatermark} ({DateTimeOffset.FromUnixTimeSeconds(catalog.LastWatermark):u}).");

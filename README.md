@@ -818,6 +818,16 @@ everything changed since the catalog's watermark, then archives just those items
 `download -app` would. The watermark only ever advances to what `GetItemChanges` itself reports
 back, never to "now," so a poll can't silently skip a window it never actually asked about.
 
+This default (actually archiving each changed item) is a deliberate difference from `bootstrap`,
+which is catalog-only unless `-manifests-only` is passed. `bootstrap` walks the entire workshop, so
+downloading everything by default would be prohibitively expensive; `poll`'s delta is normally a
+small fraction of the catalog, so having a scheduled poll also keep local content in sync is what
+makes it useful without a manual follow-up step. To track changes without archiving any content,
+pass **`-catalog-only`**: the catalog entry (and, unless `-shallow`, its full history) is updated
+exactly as a real poll would, but the archive step itself - including any manifest fetch - is never
+called. This is the poll equivalent of bootstrap's own plain, no-flags default, scoped to just the
+current delta instead of the whole workshop.
+
 Item classification isn't assumed permanent: since an ancient item could conceivably be replaced by
 a chunk-based one on some future update, `poll` re-classifies any changed item that isn't already
 confirmed `ChunkBased` rather than trusting a cached `Kind` indefinitely - a confirmed `ChunkBased`
@@ -866,7 +876,11 @@ isn't documented; observed behavior against a high-churn app (Garry's Mod, depot
   work and updates records, just skips the large/expensive payload
 
 **poll:**
-- `-dry-run` - Report what would be checked/downloaded - fetches nothing at all, not even a manifest
+- `-dry-run` - Report what would be checked/downloaded - fetches and changes nothing (no catalog
+  update, no watermark advance, no backfill sweep), so it's safe to run repeatedly before a real poll
+- `-catalog-only` - Update the catalog (and full history, unless `-shallow`) for every changed item,
+  same as a real poll, but never call the archive step - no manifest fetch, no content/chunk
+  download. The poll equivalent of `bootstrap`'s own plain default (see Poll above)
 - `-manifests-only` - Same meaning as on `download` above
 - `-shallow` - Same meaning as on `bootstrap` above - also skips this run's `-backfill-batch` sweep
 - `-backfill-batch <n>` - Same meaning as on `bootstrap` above (runs after this poll's own delta)
