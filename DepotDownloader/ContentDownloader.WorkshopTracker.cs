@@ -139,6 +139,13 @@ namespace DepotDownloader
             if (catalog.BootstrapCompleted)
             {
                 Console.WriteLine($"Bootstrap already completed for app {appId} ({catalog.ItemCount():N0} items recorded).");
+
+                var incompatibleResult = await WalkIncompatibleItemsAsync(catalog, appId, outputRoot, pageSize, manifestsOnly, shallow);
+                if (incompatibleResult != 0)
+                {
+                    return incompatibleResult;
+                }
+
                 Console.WriteLine($"Delete {WorkshopCatalogDb.GetPath(outputRoot, appId)} to force a full re-bootstrap, or run 'workshop poll' to pick up changes since.");
                 return 0;
             }
@@ -226,66 +233,9 @@ namespace DepotDownloader
                     var now = (uint)DateTimeOffset.UtcNow.ToUnixTimeSeconds();
                     foreach (var d in body.publishedfiledetails)
                     {
-                        // Same classification DownloadPubfileRawAsync itself uses - file_url wins
-                        // first. Confirmed empirically that ancient (2012-era) items still have
-                        // hcontent_file populated too, but it's just the CDN handle embedded in
-                        // that URL, not a depot manifest ID - Kind is what keeps "poll" from
-                        // confusing them.
-                        var kind = !string.IsNullOrEmpty(d.file_url) ? WorkshopItemKind.AncientUgc : WorkshopItemKind.ChunkBased;
-
-                        var item = new WorkshopCatalogItem
+                        if (await ProcessQueryFilesItemAsync(catalog, outputRoot, d, shallow, manifestsOnly, now, trackRecoveryAnchor: true))
                         {
-                            PublishedFileId = d.publishedfileid,
-                            Title = d.title,
-                            Kind = kind,
-                            FileUrl = kind == WorkshopItemKind.AncientUgc ? d.file_url : null,
-                            ManifestId = d.hcontent_file,
-                            TimeUpdated = d.time_updated,
-                            LastSeenAt = now,
-                        };
-                        catalog.UpsertItem(item);
-                        recordedCount++;
-
-                        // Recovery anchor only - see WorkshopCatalogDb.LastRecordedCreationTime.
-                        // Only meaningful under the stable ranking (time_created never reorders
-                        // under it, unlike time_updated) - tracking this under query-type 21 would
-                        // record a boundary a later date_range_created-bounded re-entry can't
-                        // actually trust, so don't bother.
-                        if (catalog.QueryType == 1 && (catalog.LastRecordedCreationTime == 0 || d.time_created < catalog.LastRecordedCreationTime))
-                        {
-                            catalog.LastRecordedCreationTime = d.time_created;
-                        }
-
-                        if (!shallow)
-                        {
-                            await FetchAndRecordHistoryAsync(catalog, d.publishedfileid);
-                            await Task.Delay(WorkshopApiPacingDelay);
-                        }
-                        else
-                        {
-                            // Seed with just the one entry already known for free (no extra call) -
-                            // still marked incomplete regardless, since a single current snapshot
-                            // can't tell us whether other versions exist in between.
-                            catalog.ReplaceHistory(d.publishedfileid, [new WorkshopHistoryEntry { Timestamp = d.time_updated, ManifestId = d.hcontent_file }], complete: false);
-                        }
-
-                        if (manifestsOnly)
-                        {
-                            try
-                            {
-                                // Reuses "d" (already fetched by this page's QueryFiles call)
-                                // rather than the single-argument overload, which would
-                                // redundantly re-fetch the same PublishedFileDetails via
-                                // GetPublishedFileDetails per item - doubling an already-expensive
-                                // walk. Manifest-only for ChunkBased (RawDownloadOptions.DryRun),
-                                // metadata-logged-not-fetched for AncientUgc (see
-                                // DownloadWebFileToUGCAsync's dryRun handling).
-                                await DownloadPubfileRawAsync(d.publishedfileid, d, new RawDownloadOptions { OutputRoot = outputRoot, DryRun = true });
-                            }
-                            catch (Exception ex)
-                            {
-                                Console.WriteLine($"    Warning: manifest/metadata fetch failed for {d.publishedfileid}: {ex.Message}");
-                            }
+                            recordedCount++;
                         }
                     }
 
@@ -303,7 +253,8 @@ namespace DepotDownloader
                         catalog.BootstrapCompletedAt = now;
                         catalog.SaveMeta();
                         Console.WriteLine($"Bootstrap complete: {recordedCount:N0} items recorded for app {appId}.");
-                        return 0;
+
+                        return await WalkIncompatibleItemsAsync(catalog, appId, outputRoot, pageSize, manifestsOnly, shallow);
                     }
 
                     catalog.BootstrapCursor = body.next_cursor;
@@ -344,6 +295,176 @@ namespace DepotDownloader
                 Console.WriteLine($"Bootstrap stopped after repeated {ex.GetType().Name}s - this looks like throttling or a sustained network issue, not a bug in what's been recorded so far.");
                 catalog.SaveMeta();
                 Console.WriteLine($"Progress saved ({recordedCount:N0} items) - re-run the same command to resume.");
+                return 1;
+            }
+        }
+
+        /// <summary>Records one QueryFiles result item into the catalog - shared between the main
+        /// walk above and WalkIncompatibleItemsAsync below. Returns false (without upserting
+        /// anything) for a result carrying no title, no manifest handle, and no update time - all
+        /// three at once, confirmed live (app 4704690, id 3753225706) to be a real, enumerable
+        /// PublishedFileId that no other endpoint (GetDetails, or even Steam's own community site)
+        /// can actually resolve, not a normal sparse-but-real item. Recording that blindly as a
+        /// catalog entry previously inflated the item count with a phantom that looks legitimate at
+        /// a glance (a real-looking PublishedFileId) but carries no usable data at all.</summary>
+        private static async Task<bool> ProcessQueryFilesItemAsync(WorkshopCatalogDb catalog, string outputRoot, PublishedFileDetails d, bool shallow, bool manifestsOnly, uint now, bool trackRecoveryAnchor)
+        {
+            if (string.IsNullOrEmpty(d.title) && d.hcontent_file == 0 && d.time_updated == 0)
+            {
+                Console.WriteLine($"  Warning: skipping {d.publishedfileid} - QueryFiles returned no title, manifest, or update time for it (a known Steam-side anomaly, not a normal item - see README).");
+                return false;
+            }
+
+            // Same classification DownloadPubfileRawAsync itself uses - file_url wins first.
+            // Confirmed empirically that ancient (2012-era) items still have hcontent_file
+            // populated too, but it's just the CDN handle embedded in that URL, not a depot
+            // manifest ID - Kind is what keeps "poll" from confusing them.
+            var kind = !string.IsNullOrEmpty(d.file_url) ? WorkshopItemKind.AncientUgc : WorkshopItemKind.ChunkBased;
+
+            var item = new WorkshopCatalogItem
+            {
+                PublishedFileId = d.publishedfileid,
+                Title = d.title,
+                Kind = kind,
+                FileUrl = kind == WorkshopItemKind.AncientUgc ? d.file_url : null,
+                ManifestId = d.hcontent_file,
+                TimeUpdated = d.time_updated,
+                LastSeenAt = now,
+            };
+            catalog.UpsertItem(item);
+
+            // Recovery anchor only - see WorkshopCatalogDb.LastRecordedCreationTime. Only
+            // meaningful for the main walk under the stable ranking (time_created never reorders
+            // under it, unlike time_updated) - the incompatible-items pass below has no cursor-
+            // recovery story of its own, and query-type 21 can't trust this boundary either, so
+            // both leave trackRecoveryAnchor false.
+            if (trackRecoveryAnchor && catalog.QueryType == 1 && (catalog.LastRecordedCreationTime == 0 || d.time_created < catalog.LastRecordedCreationTime))
+            {
+                catalog.LastRecordedCreationTime = d.time_created;
+            }
+
+            if (!shallow)
+            {
+                await FetchAndRecordHistoryAsync(catalog, d.publishedfileid);
+                await Task.Delay(WorkshopApiPacingDelay);
+            }
+            else
+            {
+                // Seed with just the one entry already known for free (no extra call) - still
+                // marked incomplete regardless, since a single current snapshot can't tell us
+                // whether other versions exist in between.
+                catalog.ReplaceHistory(d.publishedfileid, [new WorkshopHistoryEntry { Timestamp = d.time_updated, ManifestId = d.hcontent_file }], complete: false);
+            }
+
+            if (manifestsOnly)
+            {
+                try
+                {
+                    // Reuses "d" (already fetched by this page's QueryFiles call) rather than the
+                    // single-argument overload, which would redundantly re-fetch the same
+                    // PublishedFileDetails via GetPublishedFileDetails per item - doubling an
+                    // already-expensive walk. Manifest-only for ChunkBased (RawDownloadOptions.
+                    // DryRun), metadata-logged-not-fetched for AncientUgc (see
+                    // DownloadWebFileToUGCAsync's dryRun handling).
+                    await DownloadPubfileRawAsync(d.publishedfileid, d, new RawDownloadOptions { OutputRoot = outputRoot, DryRun = true });
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"    Warning: manifest/metadata fetch failed for {d.publishedfileid}: {ex.Message}");
+                }
+            }
+
+            return true;
+        }
+
+        /// <summary>Second QueryFiles pass, required_flags=["incompatible"] - runs every time the
+        /// main walk above is complete (or already was), tracked via its own independent cursor/
+        /// completion state (IncompatibleWalkCursor/IncompatibleWalkCompleted) since this is a
+        /// genuinely different query with its own pagination, not a resumption of the main walk.
+        /// Exists because an item flagged this way is completely absent from every page of a plain
+        /// query - confirmed live (app 4704690: an item only shown on Steam's own workshop page
+        /// with its "incompatible items" filter ticked, which itself just adds
+        /// requiredflags[]=incompatible to that page's own request) - no amount of re-running the
+        /// main walk would ever find it. Expected to be a small fraction of a workshop, so unlike
+        /// the main walk this has no -max-items-style early stop and no manifests-only progress
+        /// throttling beyond the shared per-item pacing.
+        ///
+        /// Deliberately NOT gated by IncompatibleWalkCompleted the way the main walk is gated by
+        /// BootstrapCompleted - "incompatible" is a mutable, time-varying status (a compatible item
+        /// can be flagged incompatible later, e.g. after a game update; a brand-new item could be
+        /// created already-incompatible), unlike the main walk's fixed, completable "every item
+        /// published as of this walk" set. A one-shot "done forever" flag would silently stop
+        /// catching newly-flagged items after the first bootstrap run - this always re-walks fully
+        /// from "*" instead, every time bootstrap is invoked on a completed catalog. Cheap in
+        /// practice (confirmed: a handful of items at most on the app this was found on), so full
+        /// re-verification each time costs little - IncompatibleWalkCompleted is kept only as a
+        /// "has this ever run successfully" indicator for "workshop status", not a skip condition.</summary>
+        private static async Task<int> WalkIncompatibleItemsAsync(WorkshopCatalogDb catalog, uint appId, string outputRoot, uint pageSize, bool manifestsOnly, bool shallow)
+        {
+            catalog.IncompatibleWalkCursor = "*";
+
+            Console.WriteLine("Checking for items only visible via Steam's \"incompatible items\" filter (required_flags=[\"incompatible\"])...");
+
+            var recordedCount = 0;
+            // This class of item is expected to be a small fraction of a workshop (a handful of
+            // pages at most) - generous headroom against an API misbehavior, not a real estimate.
+            var safetyPageBudget = 10000;
+
+            try
+            {
+                while (true)
+                {
+                    var (result, body) = await WithTransientRetryAsync("QueryFiles (incompatible)",
+                        () => steam3.QueryFiles(appId, catalog.IncompatibleWalkCursor, pageSize, catalog.QueryType, dateRangeCreatedEnd: null, requiredFlags: ["incompatible"]));
+
+                    if (result != EResult.OK || body == null)
+                    {
+                        Console.WriteLine($"QueryFiles (incompatible) failed: {result}. Progress saved - re-run to resume; the main catalog is unaffected.");
+                        catalog.SaveMeta();
+                        return 1;
+                    }
+
+                    var now = (uint)DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+                    foreach (var d in body.publishedfiledetails)
+                    {
+                        if (await ProcessQueryFilesItemAsync(catalog, outputRoot, d, shallow, manifestsOnly, now, trackRecoveryAnchor: false))
+                        {
+                            recordedCount++;
+                        }
+                    }
+
+                    // Compare against the cursor we just queried WITH, same reasoning as the main
+                    // walk's own donePaging check above.
+                    var donePaging = string.IsNullOrEmpty(body.next_cursor)
+                        || body.next_cursor == catalog.IncompatibleWalkCursor
+                        || body.publishedfiledetails.Count == 0;
+
+                    if (donePaging)
+                    {
+                        catalog.IncompatibleWalkCompleted = true;
+                        catalog.SaveMeta();
+                        Console.WriteLine(recordedCount > 0
+                            ? $"Found {recordedCount:N0} item(s) only visible via the incompatible-items filter - added to the catalog."
+                            : "No incompatible-flagged items found for this app.");
+                        return 0;
+                    }
+
+                    catalog.IncompatibleWalkCursor = body.next_cursor;
+                    catalog.SaveMeta();
+
+                    if (--safetyPageBudget <= 0)
+                    {
+                        Console.WriteLine("Warning: incompatible-items pass exceeded its expected page budget - stopping to avoid an unbounded loop. Progress saved; re-run to resume.");
+                        return 1;
+                    }
+
+                    await Task.Delay(WorkshopApiPacingDelay);
+                }
+            }
+            catch (Exception ex) when (IsTransientNetworkException(ex))
+            {
+                Console.WriteLine($"Incompatible-items pass stopped after repeated {ex.GetType().Name}s - the main catalog is unaffected; re-run to resume this pass.");
+                catalog.SaveMeta();
                 return 1;
             }
         }
@@ -785,6 +906,7 @@ namespace DepotDownloader
             Console.WriteLine($"Full history known: {historyComplete:N0} of {total:N0}" +
                 (historyComplete < total ? " - the rest will backfill gradually on future bootstrap/poll runs (see -backfill-batch)." : ""));
             Console.WriteLine($"Bootstrap complete: {catalog.BootstrapCompleted}");
+            Console.WriteLine($"Incompatible-items pass complete: {catalog.IncompatibleWalkCompleted}");
             Console.WriteLine($"Query type:         {catalog.QueryType}" +
                 (catalog.QueryType == 1 ? " (RankedByPublicationDate - stable)" : catalog.QueryType == 21 ? " (RankedByLastUpdatedDate - NOT stable under concurrent activity, see README)" : ""));
 

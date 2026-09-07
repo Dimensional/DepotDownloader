@@ -751,6 +751,43 @@ ordinary `NEW` entry - identical handling to a genuinely new item - as long as p
 watermark window described under Poll below. `-shallow` does not affect this recovery; it only
 changes whether the recovered item's full history is fetched immediately or backfilled later.
 
+**A third gap, not fixable by re-running the walk at all: items Steam gates behind `required_flags`.**
+Confirmed live against a small app (4704690): an item shown on that app's own workshop page only
+after ticking "show incompatible items" (which itself just adds `requiredflags[]=incompatible` to
+that page's own request) was completely absent from every page of a plain `QueryFiles` walk, no
+matter how many times it was re-run, despite resolving perfectly normally via a direct by-ID lookup.
+This isn't a timing race like the two gaps above - a flag-gated item is structurally invisible to a
+request that doesn't ask for that flag. `bootstrap` now runs a second pass with
+`required_flags: ["incompatible"]` every time the main walk is complete (or immediately, if it
+already had), using its own independent cursor state (`IncompatibleWalkCursor`) since it's a
+genuinely different query, not a resumption of the main one. Unlike the main walk, **this pass is
+never treated as permanently done** - `IncompatibleWalkCompleted` (shown in `workshop status`) is
+only a "has this ever run successfully" indicator, not a skip condition, and every `bootstrap`
+invocation always re-walks it fully from scratch. That's deliberate: "incompatible" is a mutable,
+time-varying status - an item can go from compatible to flagged incompatible after a game update, or
+be created already-incompatible - unlike the main walk's fixed, completable "everything published as
+of this walk" set. A one-shot "done forever" flag here would silently stop catching newly-flagged
+items after the first run, defeating the point of fixing this at all. In practice this is cheap: the
+class is expected to be a small fraction of any workshop, so a full re-check on every `bootstrap`
+call costs little. Only `incompatible` is confirmed to behave this way - if another gating flag is
+ever found, it would need its own pass added the same way. `poll`'s `GetItemChanges` has no
+equivalent request field at all (confirmed via its request/response shape) - there's no way to ask
+it to include or exclude this class, so whether its deltas cover a later compatible→incompatible
+transition is unknown and not something a code change here can control either way.
+
+**A related, separate bug this surfaced: a malformed `QueryFiles` result being recorded as a normal
+item.** One `PublishedFileId` came back from a plain walk with no title, no manifest handle
+(`hcontent_file`), and no `time_updated` - all three at once. It resolves via neither `GetDetails`
+(`EResult.AccessDenied`) nor Steam's own community site (a generic "there was a problem accessing the
+item" error, not a normal removed/private/age-gated page) - not a real, currently-viewable item by
+any path, just a real, enumerable ID that `QueryFiles` still lists. `bootstrap` previously recorded
+this blindly as a normal catalog entry (a real-looking `PublishedFileId` with blank data), inflating
+the item count with a phantom that looks legitimate at a glance. It's now skipped (with a printed
+warning naming the ID) rather than recorded whenever all three fields are empty/zero at once - narrow
+enough that a normal, merely sparse item won't trip it. An already-recorded one from before this fix
+isn't cleaned up automatically; delete it directly (`DELETE FROM items WHERE PublishedFileId = <id>;`
+via any SQLite tool) if one's already in an existing catalog.
+
 **A catalog's `QueryType` is pinned on its first bootstrap run and does not change afterward.** A
 resumed walk always uses the catalog's own recorded `QueryType`, printing a note (and ignoring the
 mismatch) if a different `-query-type` is passed than what's on record - an in-progress cursor only

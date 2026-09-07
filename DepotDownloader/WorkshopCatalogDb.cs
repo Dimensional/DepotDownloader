@@ -188,6 +188,18 @@ namespace DepotDownloader
         /// re-entry point by.</summary>
         public uint LastRecordedCreationTime { get; set; }
 
+        /// <summary>Cursor/completion state for "workshop bootstrap"'s second QueryFiles pass -
+        /// required_flags=["incompatible"] - kept separate from BootstrapCursor/BootstrapCompleted
+        /// because it's a genuinely different query (different required_flags, so a different
+        /// result set and its own independent pagination), not a resumption of the main walk. See
+        /// ContentDownloader.WorkshopTracker.cs and the README for why this pass exists: an item
+        /// Steam's own workshop page only shows with "show incompatible items" ticked is completely
+        /// absent from every page of a plain (no required_flags) QueryFiles walk, confirmed live -
+        /// this is what actually reaches those.</summary>
+        public string IncompatibleWalkCursor { get; set; } = "*";
+
+        public bool IncompatibleWalkCompleted { get; set; }
+
         private WorkshopCatalogDb(SqliteConnection connection, uint appId)
         {
             _connection = connection;
@@ -238,7 +250,9 @@ namespace DepotDownloader
                         LastWatermark INTEGER NOT NULL DEFAULT 0,
                         LastPolledAt INTEGER NOT NULL DEFAULT 0,
                         LastPollResult TEXT,
-                        LastRecordedCreationTime INTEGER NOT NULL DEFAULT 0
+                        LastRecordedCreationTime INTEGER NOT NULL DEFAULT 0,
+                        IncompatibleWalkCursor TEXT NOT NULL DEFAULT '*',
+                        IncompatibleWalkCompleted INTEGER NOT NULL DEFAULT 0
                     );
 
                     CREATE TABLE IF NOT EXISTS items (
@@ -292,6 +306,35 @@ namespace DepotDownloader
                     insert.ExecuteNonQuery();
                 }
             }
+
+            // Migration for a catalog created before IncompatibleWalkCursor/IncompatibleWalkCompleted
+            // existed - "CREATE TABLE IF NOT EXISTS" above is a no-op against an already-existing
+            // table, so an existing file needs these columns added explicitly. SQLite has no
+            // "ADD COLUMN IF NOT EXISTS", so check via PRAGMA table_info first.
+            var existingColumns = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            using (var pragmaCheck = connection.CreateCommand())
+            {
+                pragmaCheck.CommandText = "PRAGMA table_info(catalog_meta)";
+                using var reader = pragmaCheck.ExecuteReader();
+                while (reader.Read())
+                {
+                    existingColumns.Add(reader.GetString(1));
+                }
+            }
+
+            if (!existingColumns.Contains("IncompatibleWalkCursor"))
+            {
+                using var alter = connection.CreateCommand();
+                alter.CommandText = "ALTER TABLE catalog_meta ADD COLUMN IncompatibleWalkCursor TEXT NOT NULL DEFAULT '*'";
+                alter.ExecuteNonQuery();
+            }
+
+            if (!existingColumns.Contains("IncompatibleWalkCompleted"))
+            {
+                using var alter = connection.CreateCommand();
+                alter.CommandText = "ALTER TABLE catalog_meta ADD COLUMN IncompatibleWalkCompleted INTEGER NOT NULL DEFAULT 0";
+                alter.ExecuteNonQuery();
+            }
         }
 
         private void LoadMeta()
@@ -299,7 +342,8 @@ namespace DepotDownloader
             using var cmd = _connection.CreateCommand();
             cmd.CommandText = """
                 SELECT QueryType, BootstrapCompleted, BootstrapCursor, BootstrapStartedAt, BootstrapCompletedAt,
-                       BootstrapTotalAsOfStart, LastWatermark, LastPolledAt, LastPollResult, LastRecordedCreationTime
+                       BootstrapTotalAsOfStart, LastWatermark, LastPolledAt, LastPollResult, LastRecordedCreationTime,
+                       IncompatibleWalkCursor, IncompatibleWalkCompleted
                 FROM catalog_meta LIMIT 1
                 """;
             using var reader = cmd.ExecuteReader();
@@ -314,6 +358,8 @@ namespace DepotDownloader
             LastPolledAt = (uint)reader.GetInt64(7);
             LastPollResult = reader.IsDBNull(8) ? null : reader.GetString(8);
             LastRecordedCreationTime = (uint)reader.GetInt64(9);
+            IncompatibleWalkCursor = reader.GetString(10);
+            IncompatibleWalkCompleted = reader.GetInt64(11) != 0;
         }
 
         /// <summary>Flushes the in-memory meta fields (bootstrap cursor, poll watermark, etc.) to
@@ -330,7 +376,8 @@ namespace DepotDownloader
                     BootstrapStartedAt = @bootstrapStartedAt, BootstrapCompletedAt = @bootstrapCompletedAt,
                     BootstrapTotalAsOfStart = @bootstrapTotalAsOfStart, LastWatermark = @lastWatermark,
                     LastPolledAt = @lastPolledAt, LastPollResult = @lastPollResult,
-                    LastRecordedCreationTime = @lastRecordedCreationTime
+                    LastRecordedCreationTime = @lastRecordedCreationTime,
+                    IncompatibleWalkCursor = @incompatibleWalkCursor, IncompatibleWalkCompleted = @incompatibleWalkCompleted
                 """;
             cmd.Parameters.AddWithValue("@queryType", QueryType);
             cmd.Parameters.AddWithValue("@bootstrapCompleted", BootstrapCompleted ? 1 : 0);
@@ -342,6 +389,8 @@ namespace DepotDownloader
             cmd.Parameters.AddWithValue("@lastPolledAt", LastPolledAt);
             cmd.Parameters.AddWithValue("@lastPollResult", (object)LastPollResult ?? DBNull.Value);
             cmd.Parameters.AddWithValue("@lastRecordedCreationTime", LastRecordedCreationTime);
+            cmd.Parameters.AddWithValue("@incompatibleWalkCursor", IncompatibleWalkCursor ?? "*");
+            cmd.Parameters.AddWithValue("@incompatibleWalkCompleted", IncompatibleWalkCompleted ? 1 : 0);
             cmd.ExecuteNonQuery();
         }
 

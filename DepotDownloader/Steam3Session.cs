@@ -463,7 +463,16 @@ namespace DepotDownloader
         /// WHOLE query including this bound - so passing an ever-shrinking bound on every page made
         /// the reported total shrink right along with it, misleadingly, every single page).
         /// </param>
-        public async Task<(EResult Result, CPublishedFile_QueryFiles_Response Body)> QueryFiles(uint appId, string cursor, uint numPerPage, uint queryType = 1, uint? dateRangeCreatedEnd = null)
+        /// <param name="requiredFlags">
+        /// Maps to the request's own required_flags field - confirmed live (app 4704690) to gate a
+        /// whole class of items out of a plain query entirely: an item Steam's own workshop page
+        /// only shows with its "incompatible items" checkbox ticked (which adds
+        /// requiredflags[]=incompatible to that page's own request) was completely absent from an
+        /// unflagged QueryFiles walk, in every page, despite resolving normally via a direct by-ID
+        /// lookup. Passing ["incompatible"] here is what actually surfaces that class - "workshop
+        /// bootstrap" runs a second pass with this set specifically to catch it (see README).
+        /// </param>
+        public async Task<(EResult Result, CPublishedFile_QueryFiles_Response Body)> QueryFiles(uint appId, string cursor, uint numPerPage, uint queryType = 1, uint? dateRangeCreatedEnd = null, IReadOnlyCollection<string> requiredFlags = null)
         {
             var request = new CPublishedFile_QueryFiles_Request
             {
@@ -477,6 +486,11 @@ namespace DepotDownloader
             if (dateRangeCreatedEnd is > 0)
             {
                 request.date_range_created = new CPublishedFile_QueryFiles_Request.DateRange { timestamp_end = dateRangeCreatedEnd.Value };
+            }
+
+            if (requiredFlags is { Count: > 0 })
+            {
+                request.required_flags.AddRange(requiredFlags);
             }
 
             var response = await steamPublishedFile.QueryFiles(request);
