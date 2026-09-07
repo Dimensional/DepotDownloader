@@ -512,8 +512,8 @@ namespace DepotDownloader
             if (result == EResult.Ignored)
             {
                 catalog.SaveMeta();
-                Console.WriteLine("Result: Ignored - the watermark is older than GetItemChanges will currently honor (empirically somewhere between 96h and 7 days on a high-churn app - see README).");
-                Console.WriteLine($"Run 'workshop bootstrap -app {appId}' again to catch up (it resumes/refreshes the existing catalog) - this also resets the watermark.");
+                Console.WriteLine("Result: Ignored - Steam declined to report a delta for this request. The original theory (a watermark older than ~96h-7d on a high-churn app - see README) is confirmed NOT the only cause: a watermark manually set to this app's own recent bootstrap-start time (well under 96h old) was rejected the exact same way. This may simply mean nothing on the workshop has changed since that watermark's timestamp, or it may be an app-specific limitation of this endpoint - the response gives no way to tell which apart.");
+                Console.WriteLine("There's no way to force a different outcome from here right now: a plain 'bootstrap' re-run does not touch the watermark once this catalog is already complete, and re-running poll will ask Steam the identical question again. 'bootstrap' and 'refresh' remain reliable ways to keep this app's catalog current regardless of what poll reports.");
                 return 2;
             }
 

@@ -640,19 +640,18 @@ The single place all workshop acquisition and tracking happens - replaces the ol
 `download` options (moved here as `workshop download`) and adds automatic update tracking across
 **an entire app's workshop**, covering both storage kinds:
 - **Chunk-based** items (depot ID == app ID, the modern format most current workshop content uses)
-- **Ancient UGC** items (direct-URL content, some dating back to 2012) - these still show up in the
-  same `QueryFiles`/`GetItemChanges` sweep as everything else, so there's no separate walk needed,
-  but they need different handling to archive correctly (see below).
+- **Ancient UGC** items (direct-URL content, some dating back to 2012) - handled automatically, no
+  separate walk needed, but archived differently (see Download below)
 
 Built on SteamKit2 unified-messages calls, not the public Steamworks Web API:
 
 - **`PublishedFile.QueryFiles`** - the same backend the workshop browse page itself uses. Works
   anonymously. Used by `bootstrap` to walk an entire app's workshop once.
 - **`PublishedFile.GetItemChanges`** - a per-app delta feed: "everything changed since this
-  timestamp," each entry already carrying its new content handle. Used by `poll`. **Requires an
-  authenticated login - anonymous returns `EResult.AccessDenied`.**
-- **`PublishedFile.GetChangeHistory`** - one item's full changelog (every historical content
-  handle + timestamp). Works anonymously, for both kinds. Used by `download -history`.
+  timestamp." Used by `poll`. **Requires an authenticated login - anonymous returns
+  `EResult.AccessDenied`.**
+- **`PublishedFile.GetChangeHistory`** - one item's full changelog. Works anonymously. Used by
+  `download -history`.
 
 ```bash
 depotdownloader workshop bootstrap -app <appid> [OPTIONS...]
@@ -666,37 +665,14 @@ depotdownloader workshop status -app <appid> [-output <dir>] [-list [-kind chunk
 ### Storage
 
 Each app's catalog is a SQLite database, `depot/<appid>/workshop_catalog.db`, in WAL (write-ahead
-log) mode. This replaced an earlier design where the whole catalog was one protobuf/Deflate blob,
-rewritten in full on every checkpoint. That worked but didn't scale: measured directly against a
-real ~2M-item/119MB catalog, a single full-file save took 6.6-6.7s - a cost that scaled with total
-catalog size rather than with how much actually changed, and pure write amplification on real
-storage (rewriting ~120MB to persist a few hundred KB of actual change is a genuine concern for an
-NVMe's finite total-bytes-written life, not just a speed one). A checkpoint cadence sized for a
-small catalog turned out to spend more time re-writing already-saved data than doing useful work
-once the catalog got large - caught directly in the backfill sweep, which was checkpointing every
-20 items against a save that by then cost more than the actual API work between checkpoints.
+log) mode - safe for one writer plus any number of concurrent readers (e.g. running `status` while a
+`bootstrap` is in progress). Open it directly with the `sqlite3` CLI, DB Browser for SQLite, or any
+other standard SQLite tool for ad-hoc queries.
 
-WAL mode fixes this at the source rather than by tuning an interval: a write only appends the
-changed pages to a separate file - an update touching one row costs roughly one row's worth of
-I/O, not the whole database - and it allows exactly one writer plus unlimited concurrent readers
-with neither blocking the other. That second property is also the direct fix for a real crash hit
-earlier in this project's life (`status` reading the catalog at the same moment a long bootstrap
-run saved a checkpoint, throwing `UnauthorizedAccessException`) - confirmed live: ten concurrent
-`status` reads fired against an actively-writing bootstrap process, all succeeded immediately with
-correct, increasing counts, no retries needed. Every write (a new/changed item, a history fetch,
-a meta field like the bootstrap cursor) commits immediately and independently now - there is no
-separate "checkpoint" left to tune or lose progress from between saves.
-
-Being a real SQLite file is also a genuine upgrade for anyone who wants to look at or build on this
-data beyond what `status` itself prints: open it directly with the `sqlite3` CLI, DB Browser for
-SQLite, or any other standard SQLite tool for ad-hoc queries, instead of it being an opaque blob.
-
-**Migrating an existing catalog from before this change**: a standalone tool at
-`tools/MigrateWorkshopCatalog/` (not part of the main `depotdownloader` binary or its `workshop`
-subcommands - built once, run by hand) converts an old `workshop_catalog.bin` into the new
-`workshop_catalog.db`. It never modifies or deletes the source file, refuses to overwrite an
-existing destination (delete it first to re-run), and does the whole import inside one transaction
-for a real bulk-load speedup. Live-verified against a real ~2M-item catalog, item-for-item.
+**Migrating a catalog from before this project used SQLite**: a standalone tool at
+`tools/MigrateWorkshopCatalog/` converts an old `workshop_catalog.bin` into the new
+`workshop_catalog.db`. It never modifies the source file and refuses to overwrite an existing
+destination (delete it first to re-run).
 
 ```bash
 dotnet run --project tools/MigrateWorkshopCatalog -c Release -- <path-to-old-workshop_catalog.bin> <appid> <output-root>
@@ -705,263 +681,127 @@ dotnet run --project tools/MigrateWorkshopCatalog -c Release -- <path-to-old-wor
 ### Bootstrap
 
 One-time per app, resumable. Pages through the entire workshop via `QueryFiles` and records every
-item's current content handle, title, and update time into `depot/<appid>/workshop_catalog.db` (see
-Storage above),
-classifying each item as chunk-based or ancient UGC as it goes (a genuinely ancient item's
-`hcontent_file` field is still populated, but it's the CDN handle embedded in its `file_url`, not a
-depot manifest ID - classification, not that field, is what `workshop download` relies on to tell
-the two apart). **Catalog-only by default**: it records metadata and does not download any
-manifest/chunk/UGC content - that's `download`'s job (`-manifests-only` is the opt-in exception, for
-prefetching manifests during the same walk). This is expensive for a large workshop - depot 4000
-(Garry's Mod) alone has on the order of **2 million items** - but safe to interrupt and resume; it
-picks up from its last saved page rather than restarting, checkpointing every 5 pages.
+item's current content handle, title, and update time into the catalog, classifying each item as
+chunk-based or ancient UGC as it goes. **Catalog-only by default**: it records metadata and does not
+download any manifest/chunk/UGC content - that's `download`'s job (`-manifests-only` is the opt-in
+exception, for prefetching manifests during the same walk). Safe to interrupt and resume; it resumes
+from its last saved page. Requests are paced and retried automatically to tolerate throttling on a
+long run.
 
-Requests are paced (~250ms between pages) and wrapped in exponential backoff (up to 5 attempts) to
-tolerate Steam-side throttling on a long run; if retries are exhausted, the run exits with progress
-already saved rather than losing unsaved state.
+#### Ranking, completeness, and known gaps
 
-#### Ranking and completeness
+Bootstrap walks `query_type` 1 (`RankedByPublicationDate`, sorted by creation time) by default -
+`-query-type` can override this, but 21 (`RankedByLastUpdatedDate`) is not a safe choice for a
+long-running walk of an actively-changing workshop, since an item updated mid-scan can move to a
+position the walk has already passed and go unrecorded by that run.
 
-`QueryFiles`'s ranking choice affects whether a long-running walk of a live, actively-changing
-workshop can miss items, and is not obvious from the API surface itself. `query_type` 21
-(`RankedByLastUpdatedDate`) sorts **descending by `time_updated`** - unstable during a live scan,
-because updating an item mid-scan moves it toward the front of the ranking. Since bootstrap walks a
-ranking forward exactly once via `next_cursor` and never revisits earlier pages, an item updated
-concurrently with a multi-hour or multi-day scan can land in a position the walk has already passed
-and go unrecorded by that run.
+Even under the safe ranking, a single bootstrap pass can still miss two kinds of item:
+- A brand-new item published after the scan has already passed the "newest" end of the ranking.
+- An existing item transiently absent from one page's results at the moment the cursor reaches it.
 
-Bootstrap therefore defaults to `query_type` 1 (`RankedByPublicationDate`) instead, sorted
-descending by `time_created` - a value that never changes once an item exists, so the ranking stays
-stable regardless of concurrent activity elsewhere. `-query-type` still accepts either value (or
-others) if there's a reason to override the default.
+Both are recovered by running `poll` regularly after bootstrap - a previously-missed item surfaces
+there as an ordinary new entry, as long as poll runs within the window described under Poll below.
+This is why bootstrap-once-then-poll-regularly is the intended usage, not bootstrap alone.
 
-The stable ranking does not make a single bootstrap pass complete under all conditions. Two
-narrower gaps remain, both structural to any one-shot forward walk of a live list rather than a
-defect in either ranking:
+**A third, different gap: items Steam gates behind `required_flags`** (e.g. `incompatible`) are
+invisible to a plain `QueryFiles` request no matter how many times it's re-run, even though the item
+resolves normally by direct ID lookup - re-running the main walk never finds these. `bootstrap`
+therefore also runs a `required_flags: ["incompatible"]` pass every time the main walk is complete,
+using its own independent cursor (`IncompatibleWalkCursor`). This pass always re-walks fully on every
+`bootstrap` invocation rather than running once - an item's incompatible status can change over time
+(e.g. after a game update), so a one-shot "done" flag would stop catching newly-flagged items.
+`IncompatibleWalkCompleted` (shown in `workshop status`) only indicates it has run at least once.
+`poll`'s `GetItemChanges` has no equivalent flag field, so whether its own deltas cover a later
+compatible→incompatible transition is unknown.
 
-- **A brand-new item published after the scan has already passed the "newest" end of the ranking**
-  lands ahead of the walk's current position, in territory a forward-only pass won't revisit.
-- **An existing item transiently absent from one page's results** at the moment the cursor reaches
-  its position (without necessarily being reordered) would similarly be skipped by that run.
+A `QueryFiles` result can occasionally carry no title, no manifest handle, and no update time at
+once - not a normal item, and not independently resolvable via `GetDetails` either. Such results are
+skipped (with a printed warning naming the ID) rather than recorded as a catalog entry. An
+already-recorded one from before this fix isn't cleaned up automatically - delete it directly
+(`DELETE FROM items WHERE PublishedFileId = <id>;`) if one turns up in an existing catalog.
 
-Both are closed the same way, which is why bootstrap-once-then-poll-regularly is the intended usage
-rather than bootstrap alone: `poll`'s `GetItemChanges` is a direct server-side query by timestamp,
-not a diff against what bootstrap already recorded, so a previously-missed item surfaces there as an
-ordinary `NEW` entry - identical handling to a genuinely new item - as long as poll runs within the
-watermark window described under Poll below. `-shallow` does not affect this recovery; it only
-changes whether the recovered item's full history is fetched immediately or backfilled later.
-
-**A third gap, not fixable by re-running the walk at all: items Steam gates behind `required_flags`.**
-Confirmed live against a small app (4704690): an item shown on that app's own workshop page only
-after ticking "show incompatible items" (which itself just adds `requiredflags[]=incompatible` to
-that page's own request) was completely absent from every page of a plain `QueryFiles` walk, no
-matter how many times it was re-run, despite resolving perfectly normally via a direct by-ID lookup.
-This isn't a timing race like the two gaps above - a flag-gated item is structurally invisible to a
-request that doesn't ask for that flag. `bootstrap` now runs a second pass with
-`required_flags: ["incompatible"]` every time the main walk is complete (or immediately, if it
-already had), using its own independent cursor state (`IncompatibleWalkCursor`) since it's a
-genuinely different query, not a resumption of the main one. Unlike the main walk, **this pass is
-never treated as permanently done** - `IncompatibleWalkCompleted` (shown in `workshop status`) is
-only a "has this ever run successfully" indicator, not a skip condition, and every `bootstrap`
-invocation always re-walks it fully from scratch. That's deliberate: "incompatible" is a mutable,
-time-varying status - an item can go from compatible to flagged incompatible after a game update, or
-be created already-incompatible - unlike the main walk's fixed, completable "everything published as
-of this walk" set. A one-shot "done forever" flag here would silently stop catching newly-flagged
-items after the first run, defeating the point of fixing this at all. In practice this is cheap: the
-class is expected to be a small fraction of any workshop, so a full re-check on every `bootstrap`
-call costs little. Only `incompatible` is confirmed to behave this way - if another gating flag is
-ever found, it would need its own pass added the same way. `poll`'s `GetItemChanges` has no
-equivalent request field at all (confirmed via its request/response shape) - there's no way to ask
-it to include or exclude this class, so whether its deltas cover a later compatible→incompatible
-transition is unknown and not something a code change here can control either way.
-
-**A related, separate bug this surfaced: a malformed `QueryFiles` result being recorded as a normal
-item.** One `PublishedFileId` came back from a plain walk with no title, no manifest handle
-(`hcontent_file`), and no `time_updated` - all three at once. It resolves via neither `GetDetails`
-(`EResult.AccessDenied`) nor Steam's own community site (a generic "there was a problem accessing the
-item" error, not a normal removed/private/age-gated page) - not a real, currently-viewable item by
-any path, just a real, enumerable ID that `QueryFiles` still lists. `bootstrap` previously recorded
-this blindly as a normal catalog entry (a real-looking `PublishedFileId` with blank data), inflating
-the item count with a phantom that looks legitimate at a glance. It's now skipped (with a printed
-warning naming the ID) rather than recorded whenever all three fields are empty/zero at once - narrow
-enough that a normal, merely sparse item won't trip it. An already-recorded one from before this fix
-isn't cleaned up automatically; delete it directly (`DELETE FROM items WHERE PublishedFileId = <id>;`
-via any SQLite tool) if one's already in an existing catalog.
-
-**A catalog's `QueryType` is pinned on its first bootstrap run and does not change afterward.** A
-resumed walk always uses the catalog's own recorded `QueryType`, printing a note (and ignoring the
-mismatch) if a different `-query-type` is passed than what's on record - an in-progress cursor only
-means anything relative to the ranking it was issued under. There is no in-place way to change an
-existing catalog's ranking; doing so requires deleting that app's catalog and re-bootstrapping from
-scratch (safe either way, since the catalog is keyed by ID - the cost is time spent re-scanning what
-was already recorded).
+**A catalog's `QueryType` is pinned on its first bootstrap run and cannot be changed in place** -
+changing it requires deleting that app's catalog and re-bootstrapping from scratch (every
+already-recorded item's history is lost either way, only the time to re-scan is the cost).
 
 **Interleaving `bootstrap` and `poll` on the same catalog is safe**, including pausing a multi-day
-bootstrap to run poll and resuming it afterward - a reasonable way to keep a large workshop's walk
-from leaving too wide a gap before recent changes get checked. The two share no mutable state that
-could interfere with each other: `BootstrapCursor`/`BootstrapCompleted` are written only inside the
-bootstrap loop, and poll only ever overwrites `catalog.Items[id]` by ID - safe regardless of whether
-bootstrap has already recorded that ID, will later reach it, or never will. Bootstrap's cursor is an
-opaque, Steam-issued continuation token bound to the ranking (`time_created`, immutable), not a
-count of items known locally, so nothing poll does to the local catalog can shift what the cursor
-means or where bootstrap resumes.
+bootstrap to run poll and resuming it afterward.
 
-`BootstrapCursor`'s lifetime under Steam is not documented - it's an opaque, server-issued token,
-and whether it's a durable value or a shorter-lived cached-query handle isn't known. It has held up
-across process restarts, fresh logins, and multi-hour gaps between resumes in practice, but a
-confirmed overnight (12-24h+) gap has not been tested. As a safety net, `LastRecordedCreationTime`
-(the lowest `time_created` reached so far, tracked automatically under `query_type` 1) exists as a
-recovery anchor: `workshop bootstrap -reset-cursor` resets `BootstrapCursor` back to `"*"` but
-re-enters the walk bounded by `date_range_created.timestamp_end = LastRecordedCreationTime`, landing
-near where the old cursor left off instead of restarting from the newest item - every already-
-recorded item and its history is kept either way. This bound is applied only on that one fresh/reset
-query, never on an already-advancing cursor's ongoing pages, since it narrows `body.total` (the
-count matching the whole query, including this bound) without changing which items are returned -
-applying it on every page would make the reported total shrink misleadingly as the bound tightened,
-even though pagination itself is unaffected (it does not read `total`).
+`-reset-cursor` is a recovery option, not needed for a normal resume: it resets `BootstrapCursor`
+back to `"*"` but re-enters the walk bounded by the lowest `time_created` already reached, instead of
+restarting from the newest item - every already-recorded item and its history is kept either way.
 
 #### History tracking
 
-Full history is fetched by default, not just each item's current state - both `bootstrap` and
-`poll` also call `GetChangeHistory` per item and store the complete result (every version, oldest
-first) on the catalog entry. This exists because `GetItemChanges`' delta only ever reports "this
-changed since X," never how many times or through what intermediate versions - without a full
-fetch, an item updated twice between two polls would silently lose the version in between. There is
-no incremental fetch: `GetChangeHistory` has no "since" filter of its own, so every fetch (fresh or
-backfilled) retrieves and overwrites the whole history.
-
-For a brand-new item this costs one extra round-trip per item, not per page - at depot 4000's scale
-the pacing delay alone adds multiple days on top of bootstrap's existing cost. Pass **`-shallow`**
-to skip this for a large workshop's first walk: items are recorded with just their current version
-and marked history-incomplete, to be picked up later rather than paid for up front. Poll defaults to
-full history too, but it's normally cheap there since a poll's delta is a small fraction of the
-whole catalog - `-shallow` on poll additionally skips that run's backfill sweep (below), not just
-the per-item fetch.
+Full history is fetched by default, not just each item's current state - both `bootstrap` and `poll`
+call `GetChangeHistory` per item and store every version (oldest first). Pass **`-shallow`** to skip
+this during a walk - items are recorded with just their current version and marked
+history-incomplete, backfilled later instead of paid for up front. Worth using on a large workshop's
+first bootstrap, since a per-item history fetch adds real time at scale.
 
 Incomplete items are backfilled two ways:
-- **Organically, for anything that keeps changing**: whenever `poll`'s `GetItemChanges` delta
-  reports an item changed, it always does a full `GetChangeHistory` fetch and overwrite for that
-  item, regardless of the current `HistoryComplete` value - a changed report is itself reason enough
-  to re-fetch, so nothing here relies on the flag to decide. An item that keeps updating never needs
-  the sweep below.
-- **Via a bounded sweep, for anything that's gone quiet**: an item recorded `-shallow` that never
-  updates again would never appear in a future poll delta, so nothing would organically revisit it.
-  `-backfill-batch <n>` (default 200; 0 disables it) is a separate pass, run once at the start of
-  every `bootstrap` or `poll` invocation, that fetches full history for up to `n` items still marked
-  incomplete. It is a per-run cap, not a "keep going until none remain" loop - clearing a large
-  backlog (e.g. hundreds of thousands of incomplete items) takes proportionally many invocations at
-  the default batch size; a larger `-backfill-batch` does more per run at the cost of that run taking
-  longer. Once bootstrap has fully completed, an invocation's only remaining work is this sweep.
-- An older catalog saved before `History`/`HistoryComplete` existed loads them at their protobuf
-  zero-value defaults (empty list, `false`) - equivalent to every item having been recorded
-  `-shallow`, so it backfills the same way. No rebuild or deletion is required for an existing
-  catalog to pick this up.
+- **Organically**: any item `poll` reports as changed gets a full history re-fetch regardless of its
+  current completeness.
+- **Via a bounded sweep**: `-backfill-batch <n>` (default 200; 0 disables) runs at the start of every
+  `bootstrap` or `poll` invocation, fetching full history for up to `n` items still marked
+  incomplete. It's a per-run cap, not "keep going until none remain" - a large backlog is cleared
+  across several invocations.
 
 ### Download
 
 The actual content-acquisition step, in two forms:
-- **Catalog-driven** (`-app <appid>`): walks an app's existing catalog (built by `bootstrap`/`poll`)
-  and archives its items - optionally narrowed with `-only <id,id2,...>`, or capped with
-  `-max-items <n>` for a large catalog processed incrementally across several runs.
+- **Catalog-driven** (`-app <appid>`): walks an app's existing catalog and archives its items -
+  narrow with `-only <id,id2,...>`, or cap with `-max-items <n>` for incremental processing.
 - **Ad-hoc** (`-workshop <id>...`): specific IDs, resolved and downloaded directly - no prior
-  `bootstrap` needed, and a mixed list can span different apps, same as the old `download -workshop`
-  did. Each resolved item is also upserted into its own app's catalog as a side effect, so even a
-  one-off pull still contributes to that app's tracked state rather than being invisible to a later
-  `poll`. There's deliberately no bare-file/CSV variant of this - a list like that carries no
-  tracking data, so anything beyond a handful of IDs should go through the catalog-driven form
-  above instead (`bootstrap` once, then `download -app`).
+  `bootstrap` needed, and a mixed list can span different apps. Each resolved item is also upserted
+  into its own app's catalog as a side effect. There's no bare-file/CSV variant of this - use the
+  catalog-driven form for anything beyond a handful of IDs.
 
-Either form archives through `DownloadPubfileRawAsync`/`DownloadAppRawAsync` - the same underlying
-dispatch a plain raw download always used - so chunk-based items land at
-`depot/<appid>/manifest/<workshopId>_<title>_<manifestId>` exactly as before, and ancient items go
-through the existing UGC direct-download path, including its own `TimeUpdated`-based per-item
-sidecar (`ugc/<appid>/<id>/_meta.json`) - so re-checking an unchanged ancient item is safe and
-cheap, not a wasted re-download.
+Chunk-based items land at `depot/<appid>/manifest/<workshopId>_<title>_<manifestId>`; ancient items
+go through the UGC direct-download path with their own per-item sidecar
+(`ugc/<appid>/<id>/_meta.json`), so re-checking an unchanged ancient item is cheap.
 
-`-history` downloads **every** historical version via `GetChangeHistory`, not just current - for
-chunk-based items this is genuinely retrievable (Steam retains old depot chunk data by design; a
-404 on a very old manifest's chunks is possible - see the CDN cold-storage note elsewhere in this
-codebase - but not expected to be the norm). For ancient UGC, `-history` is necessarily best-effort:
-a `GetChangeHistory` entry there is only ever a timestamp + content handle, never a URL, and Steam's
-`GetDetails` only ever exposes the CURRENT `file_url` - so an old ancient version can be discovered
-and logged (multiple entries) but not necessarily re-downloaded; only the current version is
-actually fetched for those regardless of `-history`, with a note printed when one has more than one
-historical entry.
+`-history` downloads every historical version via `GetChangeHistory`. For ancient UGC this is
+best-effort: only the current version's file is actually fetchable, so an old version can be
+discovered and logged but not necessarily re-downloaded.
 
 ### Poll
 
-Cheap and repeatable - the same command serves both a manual one-off checkup and a scheduled
-task/cron, deliberately not two separate commands that could drift apart. Asks `GetItemChanges` for
-everything changed since the catalog's watermark, then archives just those items the same way
-`download -app` would. The watermark only ever advances to what `GetItemChanges` itself reports
-back, never to "now," so a poll can't silently skip a window it never actually asked about.
+Cheap and repeatable - the same command serves both a manual checkup and a scheduled task/cron. Asks
+`GetItemChanges` for everything changed since the catalog's watermark, then archives just those items
+the same way `download -app` would. The watermark only ever advances to what `GetItemChanges` itself
+reports back, never to "now."
 
-This default (actually archiving each changed item) is a deliberate difference from `bootstrap`,
-which is catalog-only unless `-manifests-only` is passed. `bootstrap` walks the entire workshop, so
-downloading everything by default would be prohibitively expensive; `poll`'s delta is normally a
-small fraction of the catalog, so having a scheduled poll also keep local content in sync is what
-makes it useful without a manual follow-up step. To track changes without archiving any content,
-pass **`-catalog-only`**: the catalog entry (and, unless `-shallow`, its full history) is updated
-exactly as a real poll would, but the archive step itself - including any manifest fetch - is never
-called. This is the poll equivalent of bootstrap's own plain, no-flags default, scoped to just the
-current delta instead of the whole workshop.
+Pass **`-catalog-only`** to update the catalog (and history) for every changed item without archiving
+any content - the poll equivalent of bootstrap's own plain default, scoped to just the current delta.
 
-Item classification isn't assumed permanent: since an ancient item could conceivably be replaced by
-a chunk-based one on some future update, `poll` re-classifies any changed item that isn't already
-confirmed `ChunkBased` rather than trusting a cached `Kind` indefinitely - a confirmed `ChunkBased`
-item skips the extra check, but anything still `AncientUgc`/`Unknown` is re-verified on every change
-that touches it.
-
-**`GetItemChanges`'s time window is limited.** This isn't part of the public Steamworks Web API and
-isn't documented; observed behavior against a high-churn app (Garry's Mod, depot 4000):
-- Anonymous login always returns `AccessDenied`, regardless of parameters.
-- Authenticated, a `last_time_updated` 96 hours in the past succeeded; 7 days back was rejected with
-  `EResult.Ignored` (not a result-size limit - reducing `num_items_max` didn't change the outcome).
-  The real cutoff sits somewhere in that 4-7 day range and may differ on apps with different churn.
-  **Poll at least every 2-3 days** to stay comfortably inside the working range.
-- `poll` treats a rejected watermark as "re-run bootstrap," not a fatal error - it prints that
-  instruction and exits rather than retrying the same request.
+**`GetItemChanges` can return `EResult.Ignored` for more than one reason, and "watermark too old" is
+not always it.**
+- Anonymous login always returns `AccessDenied`.
+- On a high-churn app, a watermark more than roughly 4-7 days old is rejected this way - **poll at
+  least every 2-3 days** to stay inside the working range.
+- On at least one smaller/younger app, `Ignored` has also been observed for a watermark just seconds
+  old. Steam's response doesn't say which situation applies, so `poll` doesn't assert a specific
+  cause on `Ignored` - it exits (code 2) rather than retrying the identical request.
+- There is currently no way to force a different outcome once this happens: a plain `bootstrap`
+  re-run does not touch the watermark on an already-complete catalog. `bootstrap` and `refresh`
+  remain reliable ways to keep an affected app's catalog current regardless of what `poll` reports.
 
 ### Refresh
 
-Re-verifies already-known catalog entries directly against `PublishedFile.GetDetails`, batched,
-instead of relying on `bootstrap`'s ranking walk or `poll`'s `GetItemChanges` delta to notice
-anything. This closes two gaps neither of those can: correcting a stale or wrong title/kind/manifest
-handle for an item that's still perfectly resolvable but wasn't caught by either mechanism, and
-positively detecting a removal - an item Steam moderation banned, or its own author made
-private/unlisted, simply stops appearing in `QueryFiles` pages and `GetItemChanges` deltas with no
-signal distinguishing it from any other reason an item might not show up there. `GetDetails` answers
-about a specific ID directly, so it's the only one of the three RPCs this can be built on.
+Re-verifies already-known catalog entries directly against `PublishedFile.GetDetails`, batched. This
+catches what `bootstrap`/`poll` can't: correcting a stale title/kind/manifest handle, and positively
+detecting a removal (banned, or made private/unlisted by its author) - both simply stop appearing in
+`QueryFiles`/`GetItemChanges` otherwise, with no signal distinguishing why. Catalog-only, like
+`bootstrap`'s plain default - never downloads content. Confirmed anonymous-friendly, unlike `poll`.
 
-`CPublishedFile_GetDetails_Request.publishedfileids` is a genuine repeated field (confirmed via
-reflection against the SteamKit2 package) - every other caller in this project only ever asks about
-one ID at a time, but `refresh` walks the catalog's own known IDs in batches, far cheaper than a
-round trip per item. Confirmed anonymous-friendly, same as the single-ID lookup ad-hoc
-`download -workshop` already uses without a login - unlike `poll`, `refresh` never requires
-`-username`. It's catalog-only, like `bootstrap`'s plain default - it never downloads content.
-
-Steam's own practical limit on how many IDs one `GetDetails` request can carry isn't established
-here; nothing in the request shape documents one. `-batch-size` defaults to 100 - lower it if a run
-starts failing outright rather than failing for individual IDs.
-
-Two new per-item fields exist solely for this command's use, both left at their zero-value default
-(`false`/`null`/`0`, meaning "never refreshed") until a `refresh` actually touches that item: `Banned`
-(+ `BanReason`) from `PublishedFileDetails.banned`/`ban_reason`, and `Visibility` from
-`PublishedFileDetails.visibility` (Steam's published SDK documents 0=Public, 1=FriendsOnly,
-2=Private, 3=Unlisted for this field - not independently re-verified here, so `status -list` and
-`-banned-only` treat any nonzero value as simply "not public" rather than leaning on the exact
-number). `status -list` tags an affected row `[BANNED]` or `[NOT PUBLIC]`, and `-banned-only`
-filters to just what's been found banned - both reflect only what a `refresh` has actually checked,
-not a live guarantee about anything else in the catalog.
-
-A per-item `PublishedFileDetails.result` in the response is distinct from the call's own overall
-result, and is what actually tells apart two different kinds of "gone." Confirmed live against a
-real, actively-moderated 2M-item catalog: a genuinely deleted item comes back with
-`result == EResult.FileNotFound` (9) and otherwise-empty fields (logged as unresolved and left
-untouched, since there's nothing there worth overwriting good data with), while a banned or
-private/unlisted item still resolves normally (`result == OK`) with `banned`/`visibility` set
-instead - `result` is the only field that distinguishes "deleted outright" from "still exists but
-not public," not `banned`/`visibility` alone.
+`-batch-size` (default 100) controls IDs per `GetDetails` request. Two fields exist solely for this
+command: `Banned`/`BanReason` and `Visibility` (0=Public, 1=FriendsOnly, 2=Private, 3=Unlisted) -
+both stay at their zero-value default until a `refresh` actually checks that item. `status -list`
+tags an affected row `[BANNED]` or `[NOT PUBLIC]`; `-banned-only` filters to just what's been found
+banned - both reflect only what `refresh` has actually checked. A genuinely deleted item is reported
+distinctly from a banned/private one (`EResult.FileNotFound` vs. a normal resolve with
+`banned`/`visibility` set) and logged as unresolved rather than overwritten.
 
 ### Options
 
@@ -970,45 +810,33 @@ not public," not `banned`/`visibility` alone.
 - `-max-items <n>` - Stop after at least this many items (testing - leaves bootstrap
   unmarked-complete so a later run continues normally)
 - `-query-type <n>` - `EPublishedFileQueryType` (default 1 = `RankedByPublicationDate`; see
-  "Ranking and completeness" above for why 21 = `RankedByLastUpdatedDate` is not a safe choice)
-- `-manifests-only` (alias `-raw-dry-run`) - Also fetch each item's manifest (chunk-based) or log
-  its metadata without fetching content (ancient UGC) during this same walk, instead of leaving
-  that for a future `download`/`poll` to handle. Reuses the `PublishedFileDetails` this pass
-  already fetched from `QueryFiles`, so it doesn't cost a second lookup per item - but the
-  manifest-request round trip itself (plus `-raw`'s existing 500ms-per-new-manifest throttle) adds
-  up fast: a workshop the size of depot 4000's would take **well over a week**. Pair with
-  `-max-items` unless the workshop is genuinely small, or just use `download`/`poll` for what's
-  actually changed.
-- `-shallow` - Skip fetching full `GetChangeHistory` per item during this walk (see History tracking
-  above)
-- `-backfill-batch <n>` - Items to backfill full history for per run (default 200; 0 disables; see
-  History tracking above)
-- `-reset-cursor` - Recovery only, not needed for a normal resume (see "Ranking and completeness"
-  above)
+  "Ranking, completeness, and known gaps" above)
+- `-manifests-only` (alias `-raw-dry-run`) - Also fetch each item's manifest (chunk-based) or log its
+  metadata (ancient UGC) during this same walk. Much slower for a large workshop - pair with
+  `-max-items`, or just use `download`/`poll` for what's actually changed.
+- `-shallow` - Skip fetching full `GetChangeHistory` per item during this walk
+- `-backfill-batch <n>` - Items to backfill full history for per run (default 200; 0 disables)
+- `-reset-cursor` - Recovery only, not needed for a normal resume
 
 **download:**
-- `-history` - Every historical version, not just current (see History tracking above)
+- `-history` - Every historical version, not just current
 - `-only <id,id2,...>` - Catalog-driven mode only: restrict to specific IDs
 - `-max-items <n>` - Catalog-driven mode only: stop after this many entries (resumable)
-- `-manifests-only` (alias `-raw-dry-run`) - Manifest-only for chunk-based items (no chunk data),
-  metadata-only for ancient UGC (no file content, `"status": "logged"` in its sidecar) - does real
-  work and updates records, just skips the large/expensive payload
+- `-manifests-only` (alias `-raw-dry-run`) - Manifest-only for chunk-based items, metadata-only for
+  ancient UGC
 
 **poll:**
-- `-dry-run` - Report what would be checked/downloaded - fetches and changes nothing (no catalog
-  update, no watermark advance, no backfill sweep), so it's safe to run repeatedly before a real poll
-- `-catalog-only` - Update the catalog (and full history, unless `-shallow`) for every changed item,
-  same as a real poll, but never call the archive step - no manifest fetch, no content/chunk
-  download. The poll equivalent of `bootstrap`'s own plain default (see Poll above)
+- `-dry-run` - Report what would be checked/downloaded - fetches and changes nothing, safe to
+  run repeatedly before a real poll
+- `-catalog-only` - Update the catalog for every changed item without archiving content
 - `-manifests-only` - Same meaning as on `download` above
 - `-shallow` - Same meaning as on `bootstrap` above - also skips this run's `-backfill-batch` sweep
 - `-backfill-batch <n>` - Same meaning as on `bootstrap` above (runs after this poll's own delta)
 
 **refresh:**
 - `-only <id,id2,...>` - Restrict to specific catalog IDs instead of the whole thing
-- `-batch-size <n>` - IDs per `GetDetails` request (default 100 - see Refresh above)
-- `-max-items <n>` - Stop after checking this many IDs (resumable - re-run to continue, or use
-  `-only` to target specific IDs across separate runs)
+- `-batch-size <n>` - IDs per `GetDetails` request (default 100)
+- `-max-items <n>` - Stop after checking this many IDs (resumable)
 
 **Common options:** `-output <dir>`, `-username`/`-remember-password` (bootstrap, refresh, and
 ad-hoc `download` can run anonymously; catalog-driven `download` inherits whatever the items
@@ -1016,52 +844,24 @@ themselves require; `poll` requires an authenticated login).
 
 ### Inspecting a catalog
 
-`status` alone prints aggregate counts, including how many items have full history known versus
-still incomplete. `status -list` is the built-in way to see what was recorded (or open
-`workshop_catalog.db` directly with any SQLite tool - see Storage above - for real ad-hoc queries):
-one row per item (ID, kind,
-manifest/content handle, last-update/last-seen time, a `History` column showing entry count and
-whether it's complete or partial, title - tagged `[DELETED]`, `[BANNED]`, or `[NOT PUBLIC]` if a
-`refresh` found any). Rows are sorted by ID rather than dictionary order, so two snapshots print
-identically and diff cleanly. Defaults to the first 200 matching rows (`-limit 0` for all); narrow
-with `-kind chunk|ancient|unknown`, `-only <id,id2,...>`, `-name <pattern>` - a case-insensitive
-.NET regex matched against title, so plain text works as an ordinary substring search and
-`-name "Mario|Samus|Metroid"` finds any of several names in one pass rather than needing a separate
-multi-term flag - `-banned-only`/`-deleted-only`, which show only what a `refresh` has actually
-found (never set on an entry `refresh` hasn't touched, so an empty result means "not yet checked,"
-not "nothing's wrong") - and/or `-show-history`, which prints each matching row's full recorded
-`History` underneath it (timestamp, manifest ID, change note if any - oldest first). Verbose by
-design; pair it with a tight `-only`/`-name` rather than a whole-catalog listing. This is what's
-stored locally - the same history is also visible straight from Steam for any item at
-`steamcommunity.com/sharedfiles/filedetails/changelog/<id>`.
+`status` alone prints aggregate counts. `status -list` shows what was recorded: one row per item
+(ID, kind, manifest/content handle, last-update/last-seen time, history count/completeness, title -
+tagged `[DELETED]`, `[BANNED]`, or `[NOT PUBLIC]` if a `refresh` found any). Defaults to the first
+200 matching rows (`-limit 0` for all); narrow with `-kind chunk|ancient|unknown`,
+`-only <id,id2,...>`, `-name <pattern>` (a case-insensitive regex, so plain text works as a
+substring search and `-name "Mario|Samus|Metroid"` matches any of several names),
+`-banned-only`/`-deleted-only` (only what `refresh` has actually found), and/or `-show-history`
+(prints each matching row's full recorded history underneath it).
 
-A crash mid-write can't corrupt the catalog or leave it in a torn state - see Storage above for why
-(WAL mode's whole point is exactly this guarantee, alongside the concurrent-access one).
-
-**Titles can legitimately contain control characters** - confirmed live on two real depot 4000
-items whose titles end in a literal newline (Steam's own web page hides this via ordinary HTML
-whitespace collapsing; it's really there in the data, not a decoding bug). Every place a title is
-printed shows `\n`/`\r`/`\t`/other control characters as visible escaped text instead of letting a
-raw newline break a table row or log line - display-only, so what's actually stored in the catalog
-stays byte-for-byte accurate to what Steam returned.
-
-A brand-new item discovered only via `poll`/ad-hoc `download` (not previously seen during
-`bootstrap`) costs one extra `GetDetails` call to classify it (chunk-based vs. ancient) and learn
-its title, since `GetItemChanges` returns neither - expected to be rare relative to updates on
-already-known items.
+Titles can legitimately contain control characters (e.g. a trailing newline) - every place a title
+is printed shows these as visible escaped text instead of letting them break a table row, though
+what's stored in the catalog stays byte-for-byte accurate to what Steam returned.
 
 ### Planned: standalone poll daemon
 
 `poll` today is a single non-interactive pass with a clean exit code (0 success, 1 error, 2 =
-"watermark rejected, re-bootstrap"), specifically so it's already schedulable as-is - point cron/
-Task Scheduler/systemd timer at it for any one app today.
-
-A dedicated, separate process (not part of the main `depotdownloader` binary) is the planned real
-solution for tracking many apps at once: something that reads a small config listing tracked app
-IDs and a poll interval, then loops calling the same underlying catalog/poll logic in-process on
-its own schedule - a persistent service rather than an externally-scheduled one-shot per app. Not
-built yet; `poll` itself already carries all the logic such a daemon would call into, so building
-it is a wrapper/scheduling exercise, not a redesign.
+`EResult.Ignored`), schedulable as-is via cron/Task Scheduler/systemd for any one app. A dedicated
+process for tracking many apps at once on their own schedule is planned but not built yet.
 
 **Examples:**
 ```bash
