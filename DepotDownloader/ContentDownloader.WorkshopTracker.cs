@@ -876,7 +876,19 @@ namespace DepotDownloader
                         foreach (var entry in item.History)
                         {
                             var when = entry.Timestamp == 0 ? "-" : DateTimeOffset.FromUnixTimeSeconds(entry.Timestamp).ToString("u");
-                            var desc = string.IsNullOrEmpty(entry.ChangeDescription) ? "" : $" - {entry.ChangeDescription}";
+                            // Trimmed, not just null/empty-checked - confirmed live (a real item
+                            // with 56 history entries, apparently from an automated build
+                            // pipeline given how tightly clustered the timestamps are) that a
+                            // change_description can be "technically non-empty" while carrying no
+                            // real content at all - just a lone newline/whitespace. Untrimmed, that
+                            // still passed the old IsNullOrEmpty check and got appended, turning
+                            // every single entry into two lines (" - " followed by a blank one)
+                            // for zero information. Trimming leading/trailing whitespace fixes
+                            // exactly that without touching genuine multi-paragraph notes (their
+                            // real content survives trimming untouched, internal blank lines and
+                            // all - see the README's own note on this).
+                            var trimmedDesc = entry.ChangeDescription?.Trim();
+                            var desc = string.IsNullOrEmpty(trimmedDesc) ? "" : $" - {trimmedDesc}";
                             Console.WriteLine($"    {when}  manifest {entry.ManifestId}{desc}");
                         }
                     }
