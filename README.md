@@ -636,6 +636,11 @@ depotdownloader help reconstruct
 
 ## Workshop Update Tracking
 
+**Experimental.** `bootstrap`, `poll`, and `refresh` have only been validated against a small number
+of apps so far - behavior on an untested app's workshop may differ from what's documented below.
+`poll` in particular is confirmed unreliable on at least one app for reasons still unresolved (see
+Poll below); treat its output as a hint to verify, not a guarantee.
+
 The single place all workshop acquisition and tracking happens - replaces the old workshop-related
 `download` options (moved here as `workshop download`) and adds automatic update tracking across
 **an entire app's workshop**, covering both storage kinds:
@@ -701,7 +706,9 @@ Even under the safe ranking, a single bootstrap pass can still miss two kinds of
 
 Both are recovered by running `poll` regularly after bootstrap - a previously-missed item surfaces
 there as an ordinary new entry, as long as poll runs within the window described under Poll below.
-This is why bootstrap-once-then-poll-regularly is the intended usage, not bootstrap alone.
+This is why bootstrap-once-then-poll-regularly is the intended usage, not bootstrap alone. If `poll`
+can't be relied on for a given app, `bootstrap -catch-up` (see Options below) closes the same two
+gaps without it.
 
 **A third, different gap: items Steam gates behind `required_flags`** (e.g. `incompatible`) are
 invisible to a plain `QueryFiles` request no matter how many times it's re-run, even though the item
@@ -784,8 +791,9 @@ not always it.**
   old. Steam's response doesn't say which situation applies, so `poll` doesn't assert a specific
   cause on `Ignored` - it exits (code 2) rather than retrying the identical request.
 - There is currently no way to force a different outcome once this happens: a plain `bootstrap`
-  re-run does not touch the watermark on an already-complete catalog. `bootstrap` and `refresh`
-  remain reliable ways to keep an affected app's catalog current regardless of what `poll` reports.
+  re-run does not touch the watermark on an already-complete catalog. `bootstrap -catch-up` (see
+  Options below) checks for new items without depending on `poll` at all; `refresh` keeps
+  already-known items correct regardless of what `poll` reports.
 
 ### Refresh
 
@@ -817,6 +825,10 @@ distinctly from a banned/private one (`EResult.FileNotFound` vs. a normal resolv
 - `-shallow` - Skip fetching full `GetChangeHistory` per item during this walk
 - `-backfill-batch <n>` - Items to backfill full history for per run (default 200; 0 disables)
 - `-reset-cursor` - Recovery only, not needed for a normal resume
+- `-catch-up` - Check for new items without relying on `poll`. Walks fresh from the newest item and
+  stops as soon as it reaches one already in the catalog - cheap when nothing's new (one page).
+  Requires a catalog pinned to query-type 1 (the default); only meaningful once the main walk is
+  already complete.
 
 **download:**
 - `-history` - Every historical version, not just current

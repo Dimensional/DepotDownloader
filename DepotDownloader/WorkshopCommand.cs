@@ -69,6 +69,7 @@ namespace DepotDownloader
             var shallow = parser.HasFlag("-shallow");
             var backfillBatch = parser.Get<uint>(200, "-backfill-batch");
             var resetCursor = parser.HasFlag("-reset-cursor");
+            var catchUp = parser.HasFlag("-catch-up");
             var output = parser.Get<string>(null, "-output", "-dir");
             var username = parser.Get<string>(null, "-username", "-user");
             var password = parser.Get<string>(null, "-password", "-pass");
@@ -77,7 +78,7 @@ namespace DepotDownloader
 
             if (appId == null)
             {
-                Console.WriteLine("Usage: depotdownloader workshop bootstrap -app <appid> [-page-size 100] [-max-items N] [-manifests-only] [-shallow] [-backfill-batch 200] [-reset-cursor] [-output <dir>] [-username <user> [-remember-password]]");
+                Console.WriteLine("Usage: depotdownloader workshop bootstrap -app <appid> [-page-size 100] [-max-items N] [-manifests-only] [-shallow] [-backfill-batch 200] [-reset-cursor] [-catch-up] [-output <dir>] [-username <user> [-remember-password]]");
                 return 1;
             }
 
@@ -88,7 +89,7 @@ namespace DepotDownloader
 
             try
             {
-                return await ContentDownloader.BootstrapWorkshopCatalogAsync(appId.Value, output, pageSize, maxItems, queryType, manifestsOnly, shallow, backfillBatch, resetCursor);
+                return await ContentDownloader.BootstrapWorkshopCatalogAsync(appId.Value, output, pageSize, maxItems, queryType, manifestsOnly, shallow, backfillBatch, resetCursor, catchUp);
             }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or SqliteException)
             {
@@ -461,6 +462,12 @@ namespace DepotDownloader
             Console.WriteLine("                     time_created already recorded so it re-enters near where the");
             Console.WriteLine("                     old cursor left off instead of from the newest item. Every");
             Console.WriteLine("                     already-recorded item is kept either way.");
+            Console.WriteLine("  -catch-up          Check for new items without relying on \"poll\". Walks fresh");
+            Console.WriteLine("                     from the newest item and stops as soon as it reaches one");
+            Console.WriteLine("                     already in the catalog - cheap in the common case (nothing");
+            Console.WriteLine("                     new costs one page). Only works on a catalog pinned to");
+            Console.WriteLine("                     query-type 1 (the default); only meaningful once the main");
+            Console.WriteLine("                     walk is already complete.");
             Console.WriteLine();
             Console.WriteLine("DOWNLOAD - the actual content-acquisition step, in two forms:");
             Console.WriteLine("  -app <appid>       Catalog-driven: walk an app's existing catalog (from bootstrap/");

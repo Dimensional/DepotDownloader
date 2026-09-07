@@ -99,7 +99,7 @@ namespace DepotDownloader
             return sb.ToString();
         }
 
-        public static async Task<int> BootstrapWorkshopCatalogAsync(uint appId, string outputRoot, uint pageSize, uint maxItems, uint queryType, bool manifestsOnly = false, bool shallow = false, uint backfillBatch = 200, bool resetCursor = false)
+        public static async Task<int> BootstrapWorkshopCatalogAsync(uint appId, string outputRoot, uint pageSize, uint maxItems, uint queryType, bool manifestsOnly = false, bool shallow = false, uint backfillBatch = 200, bool resetCursor = false, bool catchUp = false)
         {
             outputRoot = ResolveOutputRoot(outputRoot);
             using var catalog = WorkshopCatalogDb.Open(outputRoot, appId);
@@ -140,14 +140,32 @@ namespace DepotDownloader
             {
                 Console.WriteLine($"Bootstrap already completed for app {appId} ({catalog.ItemCount():N0} items recorded).");
 
+                if (catchUp)
+                {
+                    var catchUpResult = await WalkCatchUpAsync(catalog, appId, outputRoot, pageSize, manifestsOnly, shallow);
+                    if (catchUpResult != 0)
+                    {
+                        return catchUpResult;
+                    }
+                }
+
                 var incompatibleResult = await WalkIncompatibleItemsAsync(catalog, appId, outputRoot, pageSize, manifestsOnly, shallow);
                 if (incompatibleResult != 0)
                 {
                     return incompatibleResult;
                 }
 
-                Console.WriteLine($"Delete {WorkshopCatalogDb.GetPath(outputRoot, appId)} to force a full re-bootstrap, or run 'workshop poll' to pick up changes since.");
+                Console.WriteLine($"Delete {WorkshopCatalogDb.GetPath(outputRoot, appId)} to force a full re-bootstrap, run 'workshop poll' to pick up changes since, or pass -catch-up to check for new items directly.");
                 return 0;
+            }
+
+            if (catchUp)
+            {
+                // -catch-up only means anything once the main walk is done (see WalkCatchUpAsync's
+                // own doc comment for why there's no "force" mode for an in-progress walk) - silently
+                // ignoring it here instead would be confusing, so this is explicit rather than a
+                // no-op.
+                Console.WriteLine("-catch-up ignored: this catalog's main walk isn't complete yet - finish it first (catch-up only matters once there's a stable baseline to compare against).");
             }
 
             if (catalog.BootstrapStartedAt == 0)
@@ -375,6 +393,110 @@ namespace DepotDownloader
             }
 
             return true;
+        }
+
+        /// <summary>-catch-up: an alternative to relying on "poll" for discovering brand-new items,
+        /// for an app where GetItemChanges can't be trusted (confirmed unreliable independent of
+        /// watermark handling on at least one app - see README). Walks fresh from the newest item
+        /// (cursor "*") and stops the moment it reaches a PublishedFileId already in the catalog -
+        /// bounded by how many items are genuinely new since the last check, not by total catalog
+        /// size, so the common case (nothing new) costs exactly one page.
+        ///
+        /// Only sound under query_type 1 (RankedByPublicationDate): time_created never changes once
+        /// an item exists, so "everything at or before the first known item is already known" holds.
+        /// Under RankedByLastUpdatedDate (21) it would not - an old item bumped to the front by a
+        /// fresh update could be reached first and cause an incorrect early stop, silently hiding
+        /// genuinely new items further back. Refuses to run under any other query-type.
+        ///
+        /// Deliberately only reachable once the main walk is already complete (enforced by the
+        /// caller) - no "force" mode for an in-progress walk exists or is planned: reconciling this
+        /// against an active BootstrapCursor would add real complexity (deciding which items the main
+        /// walk simply hasn't reached yet vs. ones that are genuinely new) for a case a full
+        /// delete-and-rebootstrap already covers more simply.</summary>
+        private static async Task<int> WalkCatchUpAsync(WorkshopCatalogDb catalog, uint appId, string outputRoot, uint pageSize, bool manifestsOnly, bool shallow)
+        {
+            if (catalog.QueryType != 1)
+            {
+                Console.WriteLine($"-catch-up requires the stable RankedByPublicationDate ranking (query-type 1) - this catalog is pinned to query-type {catalog.QueryType}, so catch-up cannot run safely for it (see README). Delete the catalog and re-bootstrap under query-type 1 to use this.");
+                return 0;
+            }
+
+            Console.WriteLine("Checking for new items published since the last check (-catch-up)...");
+
+            var cursor = "*";
+            var newCount = 0;
+            // Bounded against an API misbehavior only - a real catch-up walk is expected to stop
+            // within a handful of pages in the common case (see summary above).
+            var safetyPageBudget = 10000;
+
+            try
+            {
+                while (true)
+                {
+                    var (result, body) = await WithTransientRetryAsync("QueryFiles (catch-up)",
+                        () => steam3.QueryFiles(appId, cursor, pageSize, catalog.QueryType));
+
+                    if (result != EResult.OK || body == null)
+                    {
+                        Console.WriteLine($"QueryFiles (catch-up) failed: {result}. Items found before this point are already saved; re-run -catch-up to retry.");
+                        return 1;
+                    }
+
+                    var now = (uint)DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+                    var reachedKnownItem = false;
+
+                    foreach (var d in body.publishedfiledetails)
+                    {
+                        if (catalog.TryGetItem(d.publishedfileid, out _))
+                        {
+                            reachedKnownItem = true;
+                            break;
+                        }
+
+                        if (await ProcessQueryFilesItemAsync(catalog, outputRoot, d, shallow, manifestsOnly, now, trackRecoveryAnchor: false))
+                        {
+                            newCount++;
+                        }
+                    }
+
+                    catalog.SaveMeta();
+
+                    if (reachedKnownItem)
+                    {
+                        Console.WriteLine(newCount > 0
+                            ? $"Catch-up complete: {newCount:N0} new item(s) found and added."
+                            : "Catch-up complete: nothing new since the last check.");
+                        return 0;
+                    }
+
+                    var donePaging = string.IsNullOrEmpty(body.next_cursor)
+                        || body.next_cursor == cursor
+                        || body.publishedfiledetails.Count == 0;
+
+                    if (donePaging)
+                    {
+                        // Walked the entire workshop without ever reaching a previously-known item -
+                        // unusual, but not unsafe: everything found is recorded either way.
+                        Console.WriteLine($"Catch-up complete: walked the entire workshop ({newCount:N0} item(s) recorded) without finding a previously-known item - unexpected if this catalog wasn't empty; check 'workshop status'.");
+                        return 0;
+                    }
+
+                    cursor = body.next_cursor;
+
+                    if (--safetyPageBudget <= 0)
+                    {
+                        Console.WriteLine("Warning: -catch-up exceeded its expected page budget without finding a known item - stopping to avoid an unbounded loop. Items found so far are saved; investigate before re-running.");
+                        return 1;
+                    }
+
+                    await Task.Delay(WorkshopApiPacingDelay);
+                }
+            }
+            catch (Exception ex) when (IsTransientNetworkException(ex))
+            {
+                Console.WriteLine($"-catch-up stopped after repeated {ex.GetType().Name}s - items found so far are saved; re-run -catch-up to continue.");
+                return 1;
+            }
         }
 
         /// <summary>Second QueryFiles pass, required_flags=["incompatible"] - runs every time the
