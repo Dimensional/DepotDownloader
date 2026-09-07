@@ -63,6 +63,42 @@ namespace DepotDownloader
         private static bool IsTransientNetworkException(Exception ex) =>
             ex is TaskCanceledException or OperationCanceledException or System.Net.Http.HttpRequestException;
 
+        /// <summary>
+        /// Titles are free-form user text and can legitimately contain control characters -
+        /// confirmed live against two real depot 4000 items whose titles end in a literal
+        /// newline (U+000A). Steam's own workshop page hides this via ordinary HTML whitespace
+        /// collapsing; a raw Console.WriteLine has no such collapsing and renders it as an actual
+        /// line break, visually breaking a single-line log entry or a "status -list" table row.
+        /// Display-only - never applied to what's actually stored, so the catalog stays byte-for-
+        /// byte accurate to what Steam returned. Deliberately NOT applied to History entries'
+        /// ChangeDescription (see "-show-history"): that field is free-form prose that can be
+        /// genuinely, intentionally multi-paragraph (a real change note recorded earlier this
+        /// project's life reads fine, arguably better, with its own newlines left alone) - a title
+        /// is different, structurally meant to be one line, since Steam's own UI never shows it as
+        /// more than that.
+        /// </summary>
+        private static string SanitizeTitleForDisplay(string title)
+        {
+            if (string.IsNullOrEmpty(title))
+            {
+                return title;
+            }
+
+            var sb = new System.Text.StringBuilder(title.Length);
+            foreach (var c in title)
+            {
+                sb.Append(c switch
+                {
+                    '\n' => "\\n",
+                    '\r' => "\\r",
+                    '\t' => "\\t",
+                    _ when char.IsControl(c) => $"\\u{(int)c:x4}",
+                    _ => c.ToString(),
+                });
+            }
+            return sb.ToString();
+        }
+
         public static async Task<int> BootstrapWorkshopCatalogAsync(uint appId, string outputRoot, uint pageSize, uint maxItems, uint queryType, bool manifestsOnly = false, bool shallow = false, uint backfillBatch = 200, bool resetCursor = false)
         {
             outputRoot = ResolveOutputRoot(outputRoot);
@@ -390,7 +426,7 @@ namespace DepotDownloader
                     var skipDry = existing?.Kind == WorkshopItemKind.ChunkBased && existing.ManifestId == change.manifest_id;
                     if (!skipDry)
                     {
-                        Console.WriteLine($"  {(isNew ? "NEW" : "CHANGED")} {change.published_file_id} \"{existing?.Title ?? $"unknown_{change.published_file_id}"}\" [{existing?.Kind ?? WorkshopItemKind.Unknown}]");
+                        Console.WriteLine($"  {(isNew ? "NEW" : "CHANGED")} {change.published_file_id} \"{SanitizeTitleForDisplay(existing?.Title) ?? $"unknown_{change.published_file_id}"}\" [{existing?.Kind ?? WorkshopItemKind.Unknown}]");
                     }
                     continue;
                 }
@@ -465,7 +501,7 @@ namespace DepotDownloader
                     continue;
                 }
 
-                Console.WriteLine($"  {(isNew ? "NEW" : "CHANGED")} {change.published_file_id} \"{title}\" [{kind}]");
+                Console.WriteLine($"  {(isNew ? "NEW" : "CHANGED")} {change.published_file_id} \"{SanitizeTitleForDisplay(title)}\" [{kind}]");
 
                 // Full history by default - GetItemChanges only ever says "this changed since X,"
                 // never how many times or through what intermediate versions, so without this an
@@ -653,12 +689,12 @@ namespace DepotDownloader
                             catalog.UpsertItem(item);
                             changedCount++;
                             newlyDeleted++;
-                            Console.WriteLine($"  DELETED {id} \"{item.Title}\"");
+                            Console.WriteLine($"  DELETED {id} \"{SanitizeTitleForDisplay(item.Title)}\"");
                         }
                         else
                         {
                             var code = d != null ? resultCode.ToString() : "no entry returned";
-                            Console.WriteLine($"  {id} \"{item.Title}\" - did not resolve ({code})");
+                            Console.WriteLine($"  {id} \"{SanitizeTitleForDisplay(item.Title)}\" - did not resolve ({code})");
                         }
 
                         continue;
@@ -706,15 +742,15 @@ namespace DepotDownloader
                         if (d.banned && !wasBanned)
                         {
                             newlyBanned++;
-                            Console.WriteLine($"  BANNED {id} \"{d.title}\"{(string.IsNullOrEmpty(d.ban_reason) ? "" : $" - {d.ban_reason}")}");
+                            Console.WriteLine($"  BANNED {id} \"{SanitizeTitleForDisplay(d.title)}\"{(string.IsNullOrEmpty(d.ban_reason) ? "" : $" - {d.ban_reason}")}");
                         }
                         else if (wasDeleted)
                         {
-                            Console.WriteLine($"  RESTORED {id} \"{d.title}\" - a previous refresh had found this deleted; it resolves again now.");
+                            Console.WriteLine($"  RESTORED {id} \"{SanitizeTitleForDisplay(d.title)}\" - a previous refresh had found this deleted; it resolves again now.");
                         }
                         else
                         {
-                            Console.WriteLine($"  CORRECTED {id} \"{d.title}\"");
+                            Console.WriteLine($"  CORRECTED {id} \"{SanitizeTitleForDisplay(d.title)}\"");
                         }
                     }
                 }
@@ -821,7 +857,7 @@ namespace DepotDownloader
                 var hist = item.HistoryComplete ? $"{item.HistoryCount} (complete)" : $"{item.HistoryCount}? (partial)";
                 // Only ever populated by "workshop refresh" - never touched by bootstrap/poll.
                 var tag = item.Deleted ? " [DELETED]" : item.Banned ? " [BANNED]" : item.Visibility != 0 ? " [NOT PUBLIC]" : "";
-                Console.WriteLine($"{item.PublishedFileId,-20} {item.Kind,-11} {item.ManifestId,-20} {updated,-20} {seen,-20} {hist,-16} {item.Title}{tag}");
+                Console.WriteLine($"{item.PublishedFileId,-20} {item.Kind,-11} {item.ManifestId,-20} {updated,-20} {seen,-20} {hist,-16} {SanitizeTitleForDisplay(item.Title)}{tag}");
 
                 // Verbose by design - only worth combining with a tight filter (-only a handful of
                 // IDs, or a narrow -name) rather than a whole-catalog listing. Oldest first,
@@ -1016,12 +1052,12 @@ namespace DepotDownloader
 
                 if (changes.Count == 0)
                 {
-                    Console.WriteLine($"  {publishedFileId} \"{title}\": no change history available, falling back to current version");
+                    Console.WriteLine($"  {publishedFileId} \"{SanitizeTitleForDisplay(title)}\": no change history available, falling back to current version");
                     changes = [new CPublishedFile_GetChangeHistory_Response.ChangeLog { manifest_id = currentManifestId }];
                 }
                 else
                 {
-                    Console.WriteLine($"  {publishedFileId} \"{title}\": {changes.Count} historical version(s)");
+                    Console.WriteLine($"  {publishedFileId} \"{SanitizeTitleForDisplay(title)}\": {changes.Count} historical version(s)");
                 }
 
                 foreach (var change in changes)
@@ -1049,7 +1085,7 @@ namespace DepotDownloader
 
                 if (changes.Count > 1)
                 {
-                    Console.WriteLine($"  Note: {publishedFileId} \"{title}\" has {changes.Count} historical versions, but only the current one is retrievable - Steam doesn't expose old direct-URL content through this API (see README).");
+                    Console.WriteLine($"  Note: {publishedFileId} \"{SanitizeTitleForDisplay(title)}\" has {changes.Count} historical versions, but only the current one is retrievable - Steam doesn't expose old direct-URL content through this API (see README).");
                 }
             }
 

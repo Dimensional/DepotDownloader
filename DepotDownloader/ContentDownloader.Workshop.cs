@@ -54,7 +54,7 @@ namespace DepotDownloader
                 else if (details?.hcontent_file > 0)
                 {
                     // Modern UGC - manifest-based content, use consumer_appid as depot
-                    Console.WriteLine("Retrieved data for workshop item {0}: '{1}' for app {2}", pubFileId, details.title, details.consumer_appid);
+                    Console.WriteLine("Retrieved data for workshop item {0}: '{1}' for app {2}", pubFileId, SanitizeTitleForDisplay(details.title), details.consumer_appid);
                     await DownloadAppAsync(details.consumer_appid, new List<(uint, ulong)> { (details.consumer_appid, details.hcontent_file) }, DEFAULT_BRANCH, null, null, null, false, true, pubFileId.ToString(), details.title);
                 }
                 else
@@ -122,7 +122,7 @@ namespace DepotDownloader
             else if (details?.hcontent_file > 0)
             {
                 // Modern UGC - manifest-based content, use raw archiving
-                Console.WriteLine("Retrieved data for workshop item {0}: '{1}' for app {2}", publishedFileId, details.title, details.consumer_appid);
+                Console.WriteLine("Retrieved data for workshop item {0}: '{1}' for app {2}", publishedFileId, SanitizeTitleForDisplay(details.title), details.consumer_appid);
                 await DownloadAppRawAsync(details.consumer_appid, new List<(uint, ulong)> { (details.consumer_appid, details.hcontent_file) }, DEFAULT_BRANCH, null, null, null, false, options, publishedFileId.ToString(), details.title);
             }
             else
@@ -278,7 +278,7 @@ namespace DepotDownloader
                 // fully downloaded. latest.TimeUpdated == timeUpdated but the file itself missing
                 // (destPath not found above) still falls through to here and logs again - that's
                 // deliberate, since dry-run mode never actually writes destPath in the first place.
-                Console.WriteLine("Dry run: logging UGC item {0} ('{1}') - metadata recorded, content not downloaded", workshopId, title ?? internalFileName ?? "Unknown");
+                Console.WriteLine("Dry run: logging UGC item {0} ('{1}') - metadata recorded, content not downloaded", workshopId, SanitizeTitleForDisplay(title) ?? internalFileName ?? "Unknown");
 
                 if (latest == null || latest.TimeUpdated != timeUpdated)
                 {
@@ -308,7 +308,7 @@ namespace DepotDownloader
                     workshopId, latest.Filename ?? "(unknown)", internalFileName ?? "(unknown)");
             }
 
-            Console.WriteLine("Downloading UGC workshop item {0}: '{1}'", workshopId, title ?? internalFileName ?? "Unknown");
+            Console.WriteLine("Downloading UGC workshop item {0}: '{1}'", workshopId, SanitizeTitleForDisplay(title) ?? internalFileName ?? "Unknown");
             Console.WriteLine("URL: {0}", url);
 
             var destDir = Path.GetDirectoryName(destPath);

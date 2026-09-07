@@ -1001,6 +1001,13 @@ stored locally - the same history is also visible straight from Steam for any it
 A crash mid-write can't corrupt the catalog or leave it in a torn state - see Storage above for why
 (WAL mode's whole point is exactly this guarantee, alongside the concurrent-access one).
 
+**Titles can legitimately contain control characters** - confirmed live on two real depot 4000
+items whose titles end in a literal newline (Steam's own web page hides this via ordinary HTML
+whitespace collapsing; it's really there in the data, not a decoding bug). Every place a title is
+printed shows `\n`/`\r`/`\t`/other control characters as visible escaped text instead of letting a
+raw newline break a table row or log line - display-only, so what's actually stored in the catalog
+stays byte-for-byte accurate to what Steam returned.
+
 A brand-new item discovered only via `poll`/ad-hoc `download` (not previously seen during
 `bootstrap`) costs one extra `GetDetails` call to classify it (chunk-based vs. ancient) and learn
 its title, since `GetItemChanges` returns neither - expected to be rare relative to updates on
