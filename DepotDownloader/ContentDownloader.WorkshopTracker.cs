@@ -645,10 +645,14 @@ namespace DepotDownloader
                 catalog.TryGetItem(d.publishedfileid, out var existing, includeHistory: false);
 
                 // Re-listed inside the overlap, or simply unchanged since the catalog last saw it -
-                // nothing to do. A refresh-marked Deleted item showing up in a live listing again,
-                // or one never classified (an ad-hoc download's record), still gets a pass.
+                // nothing to do. A refresh-marked Deleted/Inaccessible item showing up in a live
+                // listing again, one never classified (an ad-hoc download's record), or one flagged
+                // NeedsPoll (whose recorded state can look current without having been processed)
+                // still gets a pass.
                 if (existing != null
                     && !existing.Deleted
+                    && !existing.Inaccessible
+                    && !existing.NeedsPoll
                     && existing.Kind != WorkshopItemKind.Unknown
                     && existing.TimeUpdated >= d.time_updated
                     && existing.ManifestId == d.hcontent_file)
@@ -727,6 +731,73 @@ namespace DepotDownloader
             return (0, candidates, body.update_time);
         }
 
+        /// <summary>Items flagged NeedsPoll (see WorkshopCatalogItem.NeedsPoll) that this poll's own
+        /// discovery didn't already turn up - typically a change "workshop refresh" recorded, or
+        /// an archive step that failed last time, possibly long before this poll's window. Looked
+        /// up fresh via GetDetails (batched) so they're processed against what's live now. One
+        /// that's since been deleted is marked so and unflagged - nothing left to process; one now
+        /// inaccessible is marked so but stays flagged, in case it comes back. Neither is written
+        /// under -dry-run. Any lookup that fails just leaves its items flagged for next time.</summary>
+        private static async Task<List<PollCandidate>> ListFlaggedItemsAsync(WorkshopCatalogDb catalog, HashSet<ulong> alreadyListed, bool dryRun)
+        {
+            var candidates = new List<PollCandidate>();
+            var ids = catalog.GetNeedsPollIds().Where(id => !alreadyListed.Contains(id)).ToList();
+            if (ids.Count == 0)
+            {
+                return candidates;
+            }
+
+            Console.WriteLine($"{ids.Count:N0} more item(s) flagged for this poll (new content 'workshop refresh' recorded, or an archive step that failed last time) - looking them up...");
+
+            try
+            {
+                foreach (var batch in ids.Chunk(100))
+                {
+                    var (result, details) = await WithTransientRetryAsync("GetDetails", () => steam3.GetPublishedFileDetailsBatch(batch));
+                    if (result != EResult.OK || details == null)
+                    {
+                        Console.WriteLine($"  GetDetails failed ({result}) - those items stay flagged for the next poll.");
+                        continue;
+                    }
+
+                    foreach (var d in details)
+                    {
+                        if (!catalog.TryGetItem(d.publishedfileid, out var existing, includeHistory: false))
+                        {
+                            continue;
+                        }
+
+                        switch ((EResult)d.result)
+                        {
+                            case EResult.OK:
+                                candidates.Add(new PollCandidate(d.publishedfileid, d.hcontent_file, d.time_updated, d, existing));
+                                break;
+
+                            case EResult.FileNotFound when !dryRun:
+                                existing.Deleted = true;
+                                existing.Inaccessible = false;
+                                existing.NeedsPoll = false;
+                                catalog.UpsertItem(existing);
+                                break;
+
+                            case EResult.AccessDenied when !dryRun:
+                                existing.Inaccessible = true;
+                                catalog.UpsertItem(existing);
+                                break;
+                        }
+                    }
+
+                    await Task.Delay(WorkshopApiPacingDelay);
+                }
+            }
+            catch (Exception ex) when (IsTransientNetworkException(ex))
+            {
+                Console.WriteLine($"  Looking up flagged items stopped after repeated {ex.GetType().Name}s - the rest stay flagged for the next poll.");
+            }
+
+            return candidates;
+        }
+
         public static async Task<int> PollWorkshopCatalogAsync(uint appId, string outputRoot, bool dryRun, bool manifestsOnly = false, bool shallow = false, uint backfillBatch = 200, bool catalogOnly = false, bool itemChanges = false, uint since = 0, uint overlapHours = DefaultPollOverlapHours)
         {
             outputRoot = ResolveOutputRoot(outputRoot);
@@ -756,6 +827,8 @@ namespace DepotDownloader
                 return exitCode;
             }
 
+            candidates.AddRange(await ListFlaggedItemsAsync(catalog, candidates.Select(c => c.PublishedFileId).ToHashSet(), dryRun));
+
             var downloaded = 0;
             var failed = 0;
             var newCount = 0;
@@ -767,6 +840,10 @@ namespace DepotDownloader
                 var existing = c.Existing;
                 var isNew = existing == null;
                 var details = c.Details;
+                // Flagged items always get the full treatment: their recorded manifest can already
+                // match what's live (refresh wrote it) without poll ever having processed it.
+                var flagged = existing?.NeedsPoll == true;
+                var flaggedNote = flagged ? " (flagged earlier)" : "";
 
                 // True preview: no network calls beyond the discovery step itself, no catalog
                 // mutation, nothing persisted - reports using only what's already in memory. A
@@ -779,7 +856,7 @@ namespace DepotDownloader
                 if (dryRun)
                 {
                     var dryKind = details != null ? ClassifyKind(details) : existing?.Kind ?? WorkshopItemKind.Unknown;
-                    if (!isNew && dryKind == WorkshopItemKind.ChunkBased && existing.ManifestId == c.ManifestId)
+                    if (!isNew && !flagged && dryKind == WorkshopItemKind.ChunkBased && existing.ManifestId == c.ManifestId)
                     {
                         metadataOnly++;
                         continue;
@@ -793,7 +870,7 @@ namespace DepotDownloader
                     {
                         changedCount++;
                     }
-                    Console.WriteLine($"  {(isNew ? "NEW" : "CHANGED")} {c.PublishedFileId} \"{SanitizeTitleForDisplay(details?.title ?? existing?.Title) ?? $"unknown_{c.PublishedFileId}"}\" [{dryKind}]");
+                    Console.WriteLine($"  {(isNew ? "NEW" : "CHANGED")} {c.PublishedFileId} \"{SanitizeTitleForDisplay(details?.title ?? existing?.Title) ?? $"unknown_{c.PublishedFileId}"}\" [{dryKind}]{flaggedNote}");
                     continue;
                 }
 
@@ -838,7 +915,8 @@ namespace DepotDownloader
                 // under a direct-URL item isn't confirmed (see WorkshopItemKind), so always
                 // re-check instead. DownloadPubfileRawAsync's own TimeUpdated-based sidecar for
                 // ancient items already makes a no-op re-check cheap when nothing actually changed.
-                var skip = kind == WorkshopItemKind.ChunkBased
+                var skip = !flagged
+                    && kind == WorkshopItemKind.ChunkBased
                     && existing != null
                     && existing.ManifestId == c.ManifestId;
 
@@ -847,8 +925,10 @@ namespace DepotDownloader
                 // marks incomplete instead, even if it happened to look complete before (a
                 // reported change is itself reason enough not to trust the old history anymore).
                 // Removal state: whatever this item just did, it still exists, so Deleted clears;
-                // Banned/Visibility come from fresh details when there are any, and otherwise keep
-                // what "workshop refresh" last found rather than resetting it.
+                // Banned/Visibility/Inaccessible come from fresh details when there are any (an item
+                // that resolved isn't inaccessible), and otherwise keep what "workshop refresh" last
+                // found rather than resetting it. NeedsPoll clears - this is the processing it was
+                // waiting for (re-set below if the archive step fails).
                 var newItem = new WorkshopCatalogItem
                 {
                     PublishedFileId = c.PublishedFileId,
@@ -864,6 +944,8 @@ namespace DepotDownloader
                     BanReason = details != null ? (string.IsNullOrEmpty(details.ban_reason) ? null : details.ban_reason) : existing?.BanReason,
                     Visibility = details?.visibility ?? existing?.Visibility ?? 0u,
                     Deleted = false,
+                    Inaccessible = details == null && (existing?.Inaccessible ?? false),
+                    NeedsPoll = false,
                 };
                 catalog.UpsertItem(newItem);
 
@@ -884,7 +966,7 @@ namespace DepotDownloader
                 {
                     changedCount++;
                 }
-                Console.WriteLine($"  {(isNew ? "NEW" : "CHANGED")} {c.PublishedFileId} \"{SanitizeTitleForDisplay(title)}\" [{kind}]");
+                Console.WriteLine($"  {(isNew ? "NEW" : "CHANGED")} {c.PublishedFileId} \"{SanitizeTitleForDisplay(title)}\" [{kind}]{flaggedNote}");
 
                 // Full history by default - a listing or GetItemChanges only ever shows an item's
                 // current state, never how many times or through what intermediate versions it
@@ -930,8 +1012,11 @@ namespace DepotDownloader
                     }
                     catch (Exception ex)
                     {
+                        // The catalog row above already records the new version, so without this
+                        // flag nothing would ever come back for the content that failed to land.
                         failed++;
-                        Console.WriteLine($"    ERROR downloading {c.PublishedFileId}: {ex.Message}");
+                        catalog.SetNeedsPoll(c.PublishedFileId, true);
+                        Console.WriteLine($"    ERROR downloading {c.PublishedFileId}: {ex.Message} - flagged, so the next poll retries it");
                     }
                 }
                 else
@@ -983,20 +1068,22 @@ namespace DepotDownloader
         /// <summary>
         /// "workshop refresh" - re-verifies already-known catalog entries directly against
         /// PublishedFile.GetDetails, batched, instead of relying on bootstrap's ranking walk or
-        /// poll's GetItemChanges delta to notice anything. Exists for two things neither of those
-        /// can do: (1) correcting a stale or wrong title/kind/manifest handle for an item that's
-        /// still perfectly resolvable but wasn't caught by either mechanism, and (2) positively
-        /// detecting a removal - an item Steam moderation banned, or its own author made
-        /// private/unlisted - which simply stops appearing in QueryFiles pages and GetItemChanges
-        /// deltas with no signal distinguishing it from any other reason an item might not show up
-        /// there. GetDetails answers about a specific ID directly, so it's the only one of the
-        /// three RPCs this feature can be built on.
+        /// poll's listing to notice anything. Exists for two things neither of those can do: (1)
+        /// correcting a stale or wrong title/kind/manifest handle for an item that's still
+        /// perfectly resolvable but wasn't caught by either mechanism, and (2) positively detecting
+        /// a removal - deleted (FileNotFound), inaccessible (AccessDenied), banned, or made
+        /// private/unlisted by its author - which simply stops appearing in QueryFiles pages with
+        /// no signal distinguishing it from any other reason an item might not show up there.
+        /// GetDetails answers about a specific ID directly, so it's the only RPC this feature can
+        /// be built on.
         ///
         /// Confirmed anonymous-friendly (same GetDetails RPC ad-hoc "download -workshop" already
-        /// uses without a login) - this never requires -username. Purely a metadata
-        /// pass - it never downloads content, same as bootstrap's own plain default.
+        /// uses without a login) - this never requires -username. Purely a metadata pass - it
+        /// never downloads content, same as bootstrap's own plain default - so an item it finds
+        /// with new content is flagged NeedsPoll for the next poll to fetch history for and
+        /// archive (see WorkshopCatalogItem.NeedsPoll).
         /// </summary>
-        public static async Task<int> RefreshWorkshopCatalogAsync(uint appId, string outputRoot, HashSet<ulong> onlyIds, uint batchSize, uint maxItems)
+        public static async Task<int> RefreshWorkshopCatalogAsync(uint appId, string outputRoot, HashSet<ulong> onlyIds, uint batchSize, uint maxItems, bool deletedOnly = false, bool inaccessibleOnly = false)
         {
             outputRoot = ResolveOutputRoot(outputRoot);
 
@@ -1013,6 +1100,23 @@ namespace DepotDownloader
             // -max-items) walk IDs in a stable, repeatable order rather than whatever order the
             // database happened to return them in.
             var ids = catalog.GetAllIds();
+            if (deletedOnly || inaccessibleOnly)
+            {
+                // Either group, or both - a quick re-check of just the items whose status could
+                // change back (an author un-hiding an item, Steam restoring one) without a full
+                // pass over a multi-million-item catalog. Refresh already re-checks these on every
+                // full run; this just skips everything else.
+                var flagged = new HashSet<ulong>();
+                if (deletedOnly)
+                {
+                    flagged.UnionWith(catalog.QueryList(null, null, null, bannedOnly: false, deletedOnly: true).Select(i => i.PublishedFileId));
+                }
+                if (inaccessibleOnly)
+                {
+                    flagged.UnionWith(catalog.QueryList(null, null, null, bannedOnly: false, deletedOnly: false, inaccessibleOnly: true).Select(i => i.PublishedFileId));
+                }
+                ids = ids.Where(flagged.Contains).ToList();
+            }
             if (onlyIds is { Count: > 0 })
             {
                 ids = ids.Where(onlyIds.Contains).ToList();
@@ -1034,6 +1138,10 @@ namespace DepotDownloader
             var changedCount = 0;
             var newlyBanned = 0;
             var newlyDeleted = 0;
+            var newlyInaccessible = 0;
+            var flaggedForPoll = 0;
+            var stillDeleted = 0;
+            var stillInaccessible = 0;
             var unresolved = 0;
             var now = (uint)DateTimeOffset.UtcNow.ToUnixTimeSeconds();
 
@@ -1058,7 +1166,10 @@ namespace DepotDownloader
                 {
                     checkedCount++;
 
-                    if (!catalog.TryGetItem(id, out var item))
+                    // No history needed - refresh never reads or writes it (UpsertItem leaves
+                    // history rows alone), and loading it per item was pure overhead across a
+                    // multi-million-item catalog.
+                    if (!catalog.TryGetItem(id, out var item, includeHistory: false))
                     {
                         continue; // shouldn't happen - every id here came from the catalog itself
                     }
@@ -1068,25 +1179,51 @@ namespace DepotDownloader
 
                     if (d == null || resultCode != EResult.OK)
                     {
-                        unresolved++;
-
                         // Confirmed live against a real, actively-moderated 2M-item catalog:
                         // FileNotFound (9) is what a genuinely deleted item's own entry looks like
                         // here - distinct from banned/private, which come back OK with
-                        // Banned/Visibility set instead (see the "changed" branch below). Only
-                        // this specific, confirmed result marks Deleted - "no entry returned at
-                        // all" is a different, unconfirmed case, not worth treating the same on a
-                        // guess.
-                        if (resultCode == EResult.FileNotFound && !item.Deleted)
+                        // Banned/Visibility set instead (see the "changed" branch below).
+                        // AccessDenied is a third, also-confirmed state (~100 items on depot 4000,
+                        // anonymous and logged in alike): the item exists but won't resolve for us.
+                        // Each is reported once, when an item enters that state, and only counted
+                        // after that - re-printing every known-deleted item on every run buried
+                        // anything new. "No entry returned at all" and other codes are different,
+                        // unconfirmed cases, not worth recording on a guess.
+                        if (resultCode == EResult.FileNotFound)
                         {
-                            item.Deleted = true;
-                            catalog.UpsertItem(item);
-                            changedCount++;
-                            newlyDeleted++;
-                            Console.WriteLine($"  DELETED {id} \"{SanitizeTitleForDisplay(item.Title)}\"");
+                            if (item.Deleted)
+                            {
+                                stillDeleted++;
+                            }
+                            else
+                            {
+                                item.Deleted = true;
+                                item.Inaccessible = false;
+                                catalog.UpsertItem(item);
+                                changedCount++;
+                                newlyDeleted++;
+                                Console.WriteLine($"  DELETED {id} \"{SanitizeTitleForDisplay(item.Title)}\"");
+                            }
+                        }
+                        else if (resultCode == EResult.AccessDenied)
+                        {
+                            if (item.Inaccessible)
+                            {
+                                stillInaccessible++;
+                            }
+                            else
+                            {
+                                item.Inaccessible = true;
+                                item.Deleted = false;
+                                catalog.UpsertItem(item);
+                                changedCount++;
+                                newlyInaccessible++;
+                                Console.WriteLine($"  INACCESSIBLE {id} \"{SanitizeTitleForDisplay(item.Title)}\" - GetDetails answers AccessDenied (most likely private or hidden)");
+                            }
                         }
                         else
                         {
+                            unresolved++;
                             var code = d != null ? resultCode.ToString() : "no entry returned";
                             Console.WriteLine($"  {id} \"{SanitizeTitleForDisplay(item.Title)}\" - did not resolve ({code})");
                         }
@@ -1096,6 +1233,7 @@ namespace DepotDownloader
 
                     var wasBanned = item.Banned;
                     var wasDeleted = item.Deleted;
+                    var wasInaccessible = item.Inaccessible;
                     var kind = !string.IsNullOrEmpty(d.file_url) ? WorkshopItemKind.AncientUgc : WorkshopItemKind.ChunkBased;
                     var fileUrl = kind == WorkshopItemKind.AncientUgc ? d.file_url : null;
                     // Normalized before comparing AND storing - GetDetails returns "" for a
@@ -1106,14 +1244,22 @@ namespace DepotDownloader
                     // items reported all three as "corrected" purely from this null-vs-"" gap).
                     var banReason = string.IsNullOrEmpty(d.ban_reason) ? null : d.ban_reason;
 
+                    // New content since the catalog last recorded this item. Refresh records it -
+                    // the catalog stays accurate - but, being catalog-only, never fetches history or
+                    // archives, so it flags the item for the next poll to do both. Without the flag
+                    // poll would see the version refresh recorded and take it as one it had already
+                    // handled.
+                    var contentMoved = d.hcontent_file != 0 && item.ManifestId != d.hcontent_file;
+
                     var changed = item.Title != d.title
                         || item.Kind != kind
                         || item.FileUrl != fileUrl
-                        || item.ManifestId != d.hcontent_file
+                        || contentMoved
                         || item.Banned != d.banned
                         || item.BanReason != banReason
                         || item.Visibility != d.visibility
-                        || wasDeleted;
+                        || wasDeleted
+                        || wasInaccessible;
 
                     item.Title = d.title;
                     item.Kind = kind;
@@ -1124,6 +1270,8 @@ namespace DepotDownloader
                     item.BanReason = banReason;
                     item.Visibility = d.visibility;
                     item.Deleted = false;
+                    item.Inaccessible = false;
+                    item.NeedsPoll |= contentMoved;
                     item.LastSeenAt = now;
                     // History untouched either way - UpsertItem never writes history rows itself
                     // (see its own doc comment), so item.HistoryComplete/HistoryCount (already
@@ -1142,9 +1290,22 @@ namespace DepotDownloader
                         {
                             Console.WriteLine($"  RESTORED {id} \"{SanitizeTitleForDisplay(d.title)}\" - a previous refresh had found this deleted; it resolves again now.");
                         }
+                        else if (wasInaccessible)
+                        {
+                            Console.WriteLine($"  ACCESSIBLE {id} \"{SanitizeTitleForDisplay(d.title)}\" - an earlier check got AccessDenied; it resolves again now.");
+                        }
+                        else if (contentMoved)
+                        {
+                            Console.WriteLine($"  UPDATED {id} \"{SanitizeTitleForDisplay(d.title)}\" - new content; flagged for the next poll to record its history (and archive it, unless -catalog-only)");
+                        }
                         else
                         {
                             Console.WriteLine($"  CORRECTED {id} \"{SanitizeTitleForDisplay(d.title)}\"");
+                        }
+
+                        if (contentMoved)
+                        {
+                            flaggedForPoll++;
                         }
                     }
                 }
@@ -1154,7 +1315,14 @@ namespace DepotDownloader
                 await Task.Delay(WorkshopApiPacingDelay);
             }
 
-            Console.WriteLine($"Refresh complete: {checkedCount:N0} checked, {changedCount:N0} corrected ({newlyBanned:N0} newly banned, {newlyDeleted:N0} newly deleted), {unresolved:N0} did not resolve at all this run.");
+            Console.WriteLine($"Refresh complete: {checkedCount:N0} checked, {changedCount:N0} changed ({newlyBanned:N0} newly banned, {newlyDeleted:N0} newly deleted, {newlyInaccessible:N0} newly inaccessible, {flaggedForPoll:N0} with new content). " +
+                $"Already known: {stillDeleted:N0} deleted, {stillInaccessible:N0} inaccessible." +
+                (unresolved > 0 ? $" {unresolved:N0} did not resolve for another reason." : ""));
+
+            if (flaggedForPoll > 0)
+            {
+                Console.WriteLine($"Run 'workshop poll -app {appId}' to record history for (and archive) the {flaggedForPoll:N0} item(s) with new content.");
+            }
 
             return 0;
         }
@@ -1177,10 +1345,20 @@ namespace DepotDownloader
             Console.WriteLine($"Catalog path:       {catalogPath}");
             Console.WriteLine($"Items recorded:     {total:N0}  (chunk-based: {chunkBased:N0}, ancient UGC: {ancientUgc:N0}, unclassified: {unknownKind:N0})");
             var backfillable = catalog.CountIncompleteHistory();
-            var deletedIncomplete = total - historyComplete - backfillable;
+            var skippedIncomplete = total - historyComplete - backfillable;
             Console.WriteLine($"Full history known: {historyComplete:N0} of {total:N0}" +
                 (backfillable > 0 ? $" - {backfillable:N0} more will backfill gradually on future bootstrap/poll runs (see -backfill-batch)." : "") +
-                (deletedIncomplete > 0 ? $" {deletedIncomplete:N0} deleted item(s) never will." : ""));
+                (skippedIncomplete > 0 ? $" {skippedIncomplete:N0} deleted or inaccessible item(s) are skipped." : ""));
+
+            var (needsPoll, inaccessible) = catalog.CountFlags();
+            if (inaccessible > 0)
+            {
+                Console.WriteLine($"Inaccessible:       {inaccessible:N0} (GetDetails answers AccessDenied - see 'status -list -inaccessible-only')");
+            }
+            if (needsPoll > 0)
+            {
+                Console.WriteLine($"Waiting for poll:   {needsPoll:N0} item(s) with new content from 'refresh' or a failed archive step - the next poll processes them");
+            }
             Console.WriteLine($"Bootstrap complete: {catalog.BootstrapCompleted}");
             Console.WriteLine($"Incompatible-items pass complete: {catalog.IncompatibleWalkCompleted}");
             Console.WriteLine($"Query type:         {catalog.QueryType}" +
@@ -1235,7 +1413,7 @@ namespace DepotDownloader
         /// Sorted by PublishedFileId so two snapshots of the same catalog print identically and
         /// diff cleanly.
         /// </summary>
-        public static int PrintWorkshopCatalogList(uint appId, string outputRoot, HashSet<ulong> onlyIds, WorkshopItemKind? kindFilter, Regex nameFilter, bool bannedOnly, bool deletedOnly, bool showHistory, uint limit)
+        public static int PrintWorkshopCatalogList(uint appId, string outputRoot, HashSet<ulong> onlyIds, WorkshopItemKind? kindFilter, Regex nameFilter, bool bannedOnly, bool deletedOnly, bool showHistory, uint limit, bool inaccessibleOnly = false)
         {
             outputRoot = ResolveOutputRoot(outputRoot);
             var catalogPath = WorkshopCatalogDb.GetPath(outputRoot, appId);
@@ -1248,7 +1426,7 @@ namespace DepotDownloader
 
             using var catalog = WorkshopCatalogDb.Open(outputRoot, appId);
 
-            var matching = catalog.QueryList(onlyIds, kindFilter, nameFilter, bannedOnly, deletedOnly);
+            var matching = catalog.QueryList(onlyIds, kindFilter, nameFilter, bannedOnly, deletedOnly, inaccessibleOnly);
             var shown = limit == 0 ? matching : matching.Take((int)limit).ToList();
 
             Console.WriteLine($"{"PublishedFileId",-20} {"Kind",-11} {"ManifestId",-20} {"TimeUpdated",-20} {"LastSeenAt",-20} {"History",-9} Title");
@@ -1262,7 +1440,8 @@ namespace DepotDownloader
                 // version), not a real total.
                 var hist = item.HistoryComplete ? $"{item.HistoryCount} (complete)" : $"{item.HistoryCount}? (partial)";
                 // Only ever populated by "workshop refresh" - never touched by bootstrap/poll.
-                var tag = item.Deleted ? " [DELETED]" : item.Banned ? " [BANNED]" : item.Visibility != 0 ? " [NOT PUBLIC]" : "";
+                var tag = (item.Deleted ? " [DELETED]" : item.Inaccessible ? " [INACCESSIBLE]" : item.Banned ? " [BANNED]" : item.Visibility != 0 ? " [NOT PUBLIC]" : "")
+                    + (item.NeedsPoll ? " [WAITING FOR POLL]" : "");
                 Console.WriteLine($"{item.PublishedFileId,-20} {item.Kind,-11} {item.ManifestId,-20} {updated,-20} {seen,-20} {hist,-16} {SanitizeTitleForDisplay(item.Title)}{tag}");
 
                 // Verbose by design - only worth combining with a tight filter (-only a handful of
@@ -1421,9 +1600,9 @@ namespace DepotDownloader
         /// whichever single item's fetch was in flight, not a batch of already-fetched-but-unsaved
         /// ones.
         ///
-        /// Items marked Deleted are skipped (see GetIncompleteHistoryIds), and any fetch that fails
-        /// outright is followed up with GetDetails to see whether the item is simply gone - see
-        /// MarkDeletedIfGoneAsync. Without both, the queue's head (always the lowest IDs) filled up
+        /// Items marked Deleted or Inaccessible are skipped (see GetIncompleteHistoryIds), and any
+        /// fetch that fails outright is followed up with GetDetails to see whether the item is
+        /// simply gone or hidden - see MarkGoneOrInaccessibleAsync. Without both, the queue's head (always the lowest IDs) filled up
         /// with items that can never succeed and every run retried the same batch: confirmed live
         /// on depot 4000, where the whole 200-item head was permanently unfetchable and 2,832 of
         /// 3,026 stuck items no longer existed at all.
@@ -1459,22 +1638,25 @@ namespace DepotDownloader
                 await Task.Delay(WorkshopApiPacingDelay);
             }
 
-            var newlyDeleted = await MarkDeletedIfGoneAsync(catalog, failedIds);
+            var (newlyDeleted, newlyInaccessible) = await MarkGoneOrInaccessibleAsync(catalog, failedIds);
 
             var remaining = catalog.CountIncompleteHistory();
             Console.WriteLine($"Backfill: {fetched:N0}/{candidates.Count:N0} succeeded this pass" +
-                (newlyDeleted > 0 ? $"; {newlyDeleted:N0} no longer exist on Steam (GetDetails: FileNotFound) and are now marked deleted, so they won't be retried" : "") +
+                (newlyDeleted > 0 ? $"; {newlyDeleted:N0} no longer exist on Steam (GetDetails: FileNotFound) and are now marked deleted" : "") +
+                (newlyInaccessible > 0 ? $"; {newlyInaccessible:N0} answer AccessDenied and are now marked inaccessible" : "") +
+                (newlyDeleted + newlyInaccessible > 0 ? ", so they won't be retried" : "") +
                 (remaining > 0 ? $". {remaining:N0} item(s) still incomplete - will continue on future runs." : ". No incomplete items remain."));
         }
 
         /// <summary>Asks GetDetails about items whose history fetch just failed, and marks the ones
-        /// Steam reports FileNotFound as Deleted - the same confirmed "gone outright" signal
-        /// "workshop refresh" uses (a later refresh clears it again if the item ever resolves).
-        /// Best-effort: one batched call per 100 IDs, and a failed call just leaves those items for
-        /// next time. Returns how many were newly marked.</summary>
-        private static async Task<int> MarkDeletedIfGoneAsync(WorkshopCatalogDb catalog, List<ulong> ids)
+        /// Steam reports FileNotFound as Deleted, or AccessDenied as Inaccessible - the same
+        /// confirmed signals "workshop refresh" uses (a later refresh clears either if the item
+        /// resolves again). Best-effort: one batched call per 100 IDs, and a failed call just
+        /// leaves those items for next time. Returns how many were newly marked each way.</summary>
+        private static async Task<(int Deleted, int Inaccessible)> MarkGoneOrInaccessibleAsync(WorkshopCatalogDb catalog, List<ulong> ids)
         {
-            var marked = 0;
+            var deleted = 0;
+            var inaccessible = 0;
 
             foreach (var batch in ids.Chunk(100))
             {
@@ -1488,13 +1670,25 @@ namespace DepotDownloader
 
                     foreach (var d in details)
                     {
-                        if ((EResult)d.result == EResult.FileNotFound
-                            && catalog.TryGetItem(d.publishedfileid, out var item, includeHistory: false)
-                            && !item.Deleted)
+                        var code = (EResult)d.result;
+                        if ((code != EResult.FileNotFound && code != EResult.AccessDenied)
+                            || !catalog.TryGetItem(d.publishedfileid, out var item, includeHistory: false))
+                        {
+                            continue;
+                        }
+
+                        if (code == EResult.FileNotFound && !item.Deleted)
                         {
                             item.Deleted = true;
+                            item.Inaccessible = false;
                             catalog.UpsertItem(item);
-                            marked++;
+                            deleted++;
+                        }
+                        else if (code == EResult.AccessDenied && !item.Inaccessible)
+                        {
+                            item.Inaccessible = true;
+                            catalog.UpsertItem(item);
+                            inaccessible++;
                         }
                     }
                 }
@@ -1506,7 +1700,7 @@ namespace DepotDownloader
                 await Task.Delay(WorkshopApiPacingDelay);
             }
 
-            return marked;
+            return (deleted, inaccessible);
         }
 
         /// <summary>
@@ -1560,8 +1754,14 @@ namespace DepotDownloader
                 {
                     try
                     {
-                        await DownloadAppRawAsync(appId, [(appId, change.manifest_id)], DEFAULT_BRANCH, null, null, null, false, options, publishedFileId.ToString(), title);
-                        downloaded++;
+                        if (await DownloadAppRawAsync(appId, [(appId, change.manifest_id)], DEFAULT_BRANCH, null, null, null, false, options, publishedFileId.ToString(), title) > 0)
+                        {
+                            failed++; // already reported as a warning by the raw downloader
+                        }
+                        else
+                        {
+                            downloaded++;
+                        }
                     }
                     catch (Exception ex)
                     {

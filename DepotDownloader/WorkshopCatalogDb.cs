@@ -100,9 +100,9 @@ namespace DepotDownloader
         /// removed this item. Unlike everything else bootstrap/poll record, this can only be
         /// learned by asking about this specific ID directly via GetDetails: a banned item simply
         /// stops appearing in QueryFiles pages and GetItemChanges deltas, indistinguishable from
-        /// any other reason an item might not show up there. Not touched by bootstrap or poll -
-        /// only "workshop refresh" ever sets this (or clears it, if a later refresh finds the ban
-        /// lifted).</summary>
+        /// any other reason an item might not show up there. Set by "workshop refresh" (or cleared,
+        /// if a later refresh finds the ban lifted); poll also updates it from the details of any
+        /// item it lists or looks up, never bootstrap.</summary>
         public bool Banned { get; set; }
 
         /// <summary>PublishedFileDetails.ban_reason, if Banned - whatever text (if any) Steam
@@ -123,9 +123,27 @@ namespace DepotDownloader
         /// catalog) to mean the item is gone outright, not just banned or made private/unlisted
         /// (those still resolve normally, with Banned/Visibility set instead - see there). The
         /// strongest removal signal available, but still only ever learned by asking about this
-        /// specific ID directly; bootstrap/poll never set or clear it. Cleared automatically if a
-        /// later refresh finds the ID resolving again.</summary>
+        /// specific ID directly - by refresh, or by the history backfill when an item's history
+        /// fetch fails. Cleared again when refresh finds the ID resolving, or poll lists it.</summary>
         public bool Deleted { get; set; }
+
+        /// <summary>Set when GetDetails answers EResult.AccessDenied for this ID - seen live for
+        /// ~100 items on depot 4000, anonymous and logged in alike, so most likely private to
+        /// their author or hidden by Steam. Distinct from Deleted (FileNotFound) and from a
+        /// banned/non-public item, which still resolve with Banned/Visibility set. Set by "workshop
+        /// refresh" and the history backfill; cleared by refresh (or any poll that lists the item)
+        /// once it resolves again. Backfill skips these items, since their history can't be
+        /// fetched either.</summary>
+        public bool Inaccessible { get; set; }
+
+        /// <summary>The version recorded here hasn't been through poll's per-item work yet - set by
+        /// "workshop refresh" when it finds an item's content changed (it records the new state
+        /// but, being catalog-only, never fetches history or archives), and by poll itself when an
+        /// item's archive step fails. The next poll processes every flagged item - history fetch,
+        /// and archive unless -catalog-only - however old the change, then clears the flag. Without
+        /// it, a version refresh recorded first was indistinguishable from one poll had already
+        /// handled, so poll skipped it for good.</summary>
+        public bool NeedsPoll { get; set; }
     }
 
     /// <summary>
@@ -280,7 +298,9 @@ namespace DepotDownloader
                         Banned INTEGER NOT NULL DEFAULT 0,
                         BanReason TEXT,
                         Visibility INTEGER NOT NULL DEFAULT 0,
-                        Deleted INTEGER NOT NULL DEFAULT 0
+                        Deleted INTEGER NOT NULL DEFAULT 0,
+                        Inaccessible INTEGER NOT NULL DEFAULT 0,
+                        NeedsPoll INTEGER NOT NULL DEFAULT 0
                     );
                     -- No index on Kind: only 3 possible values, so a full secondary index over
                     -- every row buys query filtering almost nothing (a table scan is already
@@ -360,6 +380,45 @@ namespace DepotDownloader
                 using var alter = connection.CreateCommand();
                 alter.CommandText = "ALTER TABLE catalog_meta ADD COLUMN DataFixLevel INTEGER NOT NULL DEFAULT 0";
                 alter.ExecuteNonQuery();
+            }
+
+            // Same migration for items - ADD COLUMN with a constant default doesn't rewrite the
+            // table, so this is instant even on a ~2M-row catalog.
+            var itemColumns = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            using (var pragmaCheck = connection.CreateCommand())
+            {
+                pragmaCheck.CommandText = "PRAGMA table_info(items)";
+                using var reader = pragmaCheck.ExecuteReader();
+                while (reader.Read())
+                {
+                    itemColumns.Add(reader.GetString(1));
+                }
+            }
+
+            if (!itemColumns.Contains("Inaccessible"))
+            {
+                using var alter = connection.CreateCommand();
+                alter.CommandText = "ALTER TABLE items ADD COLUMN Inaccessible INTEGER NOT NULL DEFAULT 0";
+                alter.ExecuteNonQuery();
+            }
+
+            if (!itemColumns.Contains("NeedsPoll"))
+            {
+                using var alter = connection.CreateCommand();
+                alter.CommandText = "ALTER TABLE items ADD COLUMN NeedsPoll INTEGER NOT NULL DEFAULT 0";
+                alter.ExecuteNonQuery();
+            }
+
+            // After the migration above, not alongside the other indexes - on an older catalog
+            // these columns don't exist until it has run. Partial, like idx_items_banned/deleted:
+            // both flags cover a tiny slice of rows.
+            using (var index = connection.CreateCommand())
+            {
+                index.CommandText = """
+                    CREATE INDEX IF NOT EXISTS idx_items_inaccessible ON items(Inaccessible) WHERE Inaccessible = 1;
+                    CREATE INDEX IF NOT EXISTS idx_items_needspoll ON items(NeedsPoll) WHERE NeedsPoll = 1;
+                    """;
+                index.ExecuteNonQuery();
             }
         }
 
@@ -496,15 +555,17 @@ namespace DepotDownloader
             cmd.Transaction = transaction;
             cmd.CommandText = """
                 INSERT INTO items (PublishedFileId, Title, ManifestId, TimeUpdated, LastSeenAt, Kind, FileUrl,
-                                    HistoryComplete, HistoryCount, Banned, BanReason, Visibility, Deleted)
+                                    HistoryComplete, HistoryCount, Banned, BanReason, Visibility, Deleted,
+                                    Inaccessible, NeedsPoll)
                 VALUES (@id, @title, @manifestId, @timeUpdated, @lastSeenAt, @kind, @fileUrl,
-                        @historyComplete, @historyCount, @banned, @banReason, @visibility, @deleted)
+                        @historyComplete, @historyCount, @banned, @banReason, @visibility, @deleted,
+                        @inaccessible, @needsPoll)
                 ON CONFLICT(PublishedFileId) DO UPDATE SET
                     Title = excluded.Title, ManifestId = excluded.ManifestId, TimeUpdated = excluded.TimeUpdated,
                     LastSeenAt = excluded.LastSeenAt, Kind = excluded.Kind, FileUrl = excluded.FileUrl,
                     HistoryComplete = excluded.HistoryComplete, HistoryCount = excluded.HistoryCount,
                     Banned = excluded.Banned, BanReason = excluded.BanReason, Visibility = excluded.Visibility,
-                    Deleted = excluded.Deleted
+                    Deleted = excluded.Deleted, Inaccessible = excluded.Inaccessible, NeedsPoll = excluded.NeedsPoll
                 """;
             cmd.Parameters.AddWithValue("@id", (long)item.PublishedFileId);
             cmd.Parameters.AddWithValue("@title", (object)item.Title ?? DBNull.Value);
@@ -519,7 +580,45 @@ namespace DepotDownloader
             cmd.Parameters.AddWithValue("@banReason", (object)item.BanReason ?? DBNull.Value);
             cmd.Parameters.AddWithValue("@visibility", item.Visibility);
             cmd.Parameters.AddWithValue("@deleted", item.Deleted ? 1 : 0);
+            cmd.Parameters.AddWithValue("@inaccessible", item.Inaccessible ? 1 : 0);
+            cmd.Parameters.AddWithValue("@needsPoll", item.NeedsPoll ? 1 : 0);
             cmd.ExecuteNonQuery();
+        }
+
+        /// <summary>Flags (or clears) one item for the next poll - see WorkshopCatalogItem.NeedsPoll.
+        /// A single-column UPDATE, for the one place that needs it after the item's row was already
+        /// written: poll re-flagging an item whose archive step just failed.</summary>
+        public void SetNeedsPoll(ulong publishedFileId, bool needsPoll)
+        {
+            using var cmd = _connection.CreateCommand();
+            cmd.CommandText = "UPDATE items SET NeedsPoll = @needsPoll WHERE PublishedFileId = @id";
+            cmd.Parameters.AddWithValue("@needsPoll", needsPoll ? 1 : 0);
+            cmd.Parameters.AddWithValue("@id", (long)publishedFileId);
+            cmd.ExecuteNonQuery();
+        }
+
+        /// <summary>Every item flagged NeedsPoll, ascending - index-backed (partial index), so cheap
+        /// however large the catalog.</summary>
+        public List<ulong> GetNeedsPollIds()
+        {
+            var ids = new List<ulong>();
+            using var cmd = _connection.CreateCommand();
+            cmd.CommandText = "SELECT PublishedFileId FROM items WHERE NeedsPoll = 1 ORDER BY PublishedFileId";
+            using var reader = cmd.ExecuteReader();
+            while (reader.Read())
+            {
+                ids.Add((ulong)reader.GetInt64(0));
+            }
+            return ids;
+        }
+
+        public (int NeedsPoll, int Inaccessible) CountFlags()
+        {
+            using var cmd = _connection.CreateCommand();
+            cmd.CommandText = "SELECT (SELECT COUNT(*) FROM items WHERE NeedsPoll = 1), (SELECT COUNT(*) FROM items WHERE Inaccessible = 1)";
+            using var reader = cmd.ExecuteReader();
+            reader.Read();
+            return (reader.GetInt32(0), reader.GetInt32(1));
         }
 
         /// <summary>The only thing that ever touches the history child table - a full delete+
@@ -598,7 +697,8 @@ namespace DepotDownloader
             {
                 cmd.CommandText = """
                     SELECT PublishedFileId, Title, ManifestId, TimeUpdated, LastSeenAt, Kind, FileUrl,
-                           HistoryComplete, HistoryCount, Banned, BanReason, Visibility, Deleted
+                           HistoryComplete, HistoryCount, Banned, BanReason, Visibility, Deleted,
+                           Inaccessible, NeedsPoll
                     FROM items WHERE PublishedFileId = @id
                     """;
                 cmd.Parameters.AddWithValue("@id", (long)publishedFileId);
@@ -653,6 +753,8 @@ namespace DepotDownloader
             BanReason = reader.IsDBNull(10) ? null : reader.GetString(10),
             Visibility = (uint)reader.GetInt64(11),
             Deleted = reader.GetInt64(12) != 0,
+            Inaccessible = reader.GetInt64(13) != 0,
+            NeedsPoll = reader.GetInt64(14) != 0,
         };
 
         public int ItemCount()
@@ -702,13 +804,13 @@ namespace DepotDownloader
         /// backfill sweep works through. Index-backed (see the partial index in EnsureSchema), so
         /// this stays cheap even once the vast majority of a large catalog is already complete.
         /// No ORDER BY, so in practice the same lowest IDs come back every call until they
-        /// complete - which is why Deleted items are excluded: their history can never be fetched,
-        /// and enough of them at the front used to stall the sweep for good.</summary>
+        /// complete - which is why Deleted and Inaccessible items are excluded: their history can't
+        /// be fetched, and enough of them at the front used to stall the sweep for good.</summary>
         public List<ulong> GetIncompleteHistoryIds(int limit)
         {
             var ids = new List<ulong>();
             using var cmd = _connection.CreateCommand();
-            cmd.CommandText = "SELECT PublishedFileId FROM items WHERE HistoryComplete = 0 AND Deleted = 0 LIMIT @limit";
+            cmd.CommandText = "SELECT PublishedFileId FROM items WHERE HistoryComplete = 0 AND Deleted = 0 AND Inaccessible = 0 LIMIT @limit";
             cmd.Parameters.AddWithValue("@limit", limit);
             using var reader = cmd.ExecuteReader();
             while (reader.Read())
@@ -718,12 +820,12 @@ namespace DepotDownloader
             return ids;
         }
 
-        /// <summary>What the backfill sweep still has left to try - Deleted items excluded, same
-        /// as GetIncompleteHistoryIds.</summary>
+        /// <summary>What the backfill sweep still has left to try - Deleted and Inaccessible items
+        /// excluded, same as GetIncompleteHistoryIds.</summary>
         public int CountIncompleteHistory()
         {
             using var cmd = _connection.CreateCommand();
-            cmd.CommandText = "SELECT COUNT(*) FROM items WHERE HistoryComplete = 0 AND Deleted = 0";
+            cmd.CommandText = "SELECT COUNT(*) FROM items WHERE HistoryComplete = 0 AND Deleted = 0 AND Inaccessible = 0";
             return Convert.ToInt32((long)cmd.ExecuteScalar());
         }
 
@@ -738,7 +840,7 @@ namespace DepotDownloader
         /// needs full history for a few displayed rows (see "-show-history") should call
         /// FillHistory on just those, not have every matching row pay for it here.
         /// </summary>
-        public List<WorkshopCatalogItem> QueryList(HashSet<ulong> onlyIds, WorkshopItemKind? kindFilter, System.Text.RegularExpressions.Regex nameFilter, bool bannedOnly, bool deletedOnly)
+        public List<WorkshopCatalogItem> QueryList(HashSet<ulong> onlyIds, WorkshopItemKind? kindFilter, System.Text.RegularExpressions.Regex nameFilter, bool bannedOnly, bool deletedOnly, bool inaccessibleOnly = false)
         {
             var where = new List<string>();
             var parameters = new List<SqliteParameter>();
@@ -762,6 +864,10 @@ namespace DepotDownloader
             {
                 where.Add("Deleted = 1");
             }
+            if (inaccessibleOnly)
+            {
+                where.Add("Inaccessible = 1");
+            }
 
             var whereClause = where.Count > 0 ? $"WHERE {string.Join(" AND ", where)}" : "";
 
@@ -770,7 +876,8 @@ namespace DepotDownloader
             {
                 cmd.CommandText = $"""
                     SELECT PublishedFileId, Title, ManifestId, TimeUpdated, LastSeenAt, Kind, FileUrl,
-                           HistoryComplete, HistoryCount, Banned, BanReason, Visibility, Deleted
+                           HistoryComplete, HistoryCount, Banned, BanReason, Visibility, Deleted,
+                           Inaccessible, NeedsPoll
                     FROM items {whereClause} ORDER BY PublishedFileId
                     """;
                 foreach (var p in parameters)

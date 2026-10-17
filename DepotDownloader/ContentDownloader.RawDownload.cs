@@ -31,7 +31,11 @@ namespace DepotDownloader
             public bool DryRun { get; init; } = false;
         }
 
-        public static async Task DownloadAppRawAsync(
+        /// <summary>Returns how many of the requested depot manifests weren't archived - each such
+        /// failure is still only reported as a warning and skipped, so one bad manifest never stops
+        /// the rest of a CSV batch. Callers that need to know (the workshop download path) check
+        /// the count; the rest ignore it.</summary>
+        public static async Task<int> DownloadAppRawAsync(
             uint appId,
             List<(uint depotId, ulong manifestId)> depotManifestIds,
             string branch,
@@ -46,7 +50,7 @@ namespace DepotDownloader
             if (options == null)
             {
                 await DownloadAppAsync(appId, depotManifestIds, branch, os, arch, language, lv, false);
-                return;
+                return 0;
             }
 
             cdnPool = new CDNClientPool(steam3, appId);
@@ -171,6 +175,10 @@ namespace DepotDownloader
 
             await cdnPool.UpdateServerList();
 
+            // A depot GetDepotInfo couldn't resolve never made it into infos - already reported
+            // there, and just as much "not archived" as one that throws below.
+            var notArchived = depotManifestIds.Count - infos.Count;
+
             // IMPORTANT: make cancellation per-depot so one failure won't cancel the entire app or CSV batch
             foreach (var depot in infos)
             {
@@ -181,20 +189,25 @@ namespace DepotDownloader
                 }
                 catch (ContentDownloaderException ex)
                 {
+                    notArchived++;
                     Console.WriteLine("Warning: Skipping depot {0} manifest {1}: {2}", depot.DepotId, depot.ManifestId, ex.Message);
                     // continue with next manifest
                 }
                 catch (OperationCanceledException ex)
                 {
+                    notArchived++;
                     Console.WriteLine("Warning: Operation cancelled for depot {0} manifest {1}: {2}", depot.DepotId, depot.ManifestId, ex.Message);
                     // continue with next manifest
                 }
                 catch (Exception ex)
                 {
+                    notArchived++;
                     Console.WriteLine("Warning: Unexpected error archiving depot {0} manifest {1}: {2}", depot.DepotId, depot.ManifestId, ex.Message);
                     // continue with next manifest
                 }
             }
+
+            return notArchived;
         }
 
         private static async Task ArchiveDepotRawAsync(CancellationTokenSource cts, DepotDownloadInfo depot, string outputRoot, RawDownloadOptions options, string workshopId, string workshopName)

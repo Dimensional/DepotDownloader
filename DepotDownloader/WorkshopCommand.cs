@@ -214,6 +214,8 @@ namespace DepotDownloader
             var onlyRaw = parser.Get<string>(null, "-only");
             var batchSize = parser.Get<uint>(100, "-batch-size");
             var maxItems = parser.Get<uint>(0, "-max-items");
+            var deletedOnly = parser.HasFlag("-deleted-only");
+            var inaccessibleOnly = parser.HasFlag("-inaccessible-only");
             var username = parser.Get<string>(null, "-username", "-user");
             var password = parser.Get<string>(null, "-password", "-pass");
             var rememberPassword = parser.HasFlag("-remember-password");
@@ -221,7 +223,7 @@ namespace DepotDownloader
 
             if (appId == null)
             {
-                Console.WriteLine("Usage: depotdownloader workshop refresh -app <appid> [-only <id,id2,...>] [-batch-size 100] [-max-items N] [-output <dir>]");
+                Console.WriteLine("Usage: depotdownloader workshop refresh -app <appid> [-only <id,id2,...>] [-deleted-only] [-inaccessible-only] [-batch-size 100] [-max-items N] [-output <dir>]");
                 return 1;
             }
 
@@ -254,7 +256,7 @@ namespace DepotDownloader
 
             try
             {
-                return await ContentDownloader.RefreshWorkshopCatalogAsync(appId.Value, output, onlyIds, batchSize, maxItems);
+                return await ContentDownloader.RefreshWorkshopCatalogAsync(appId.Value, output, onlyIds, batchSize, maxItems, deletedOnly, inaccessibleOnly);
             }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or SqliteException)
             {
@@ -366,6 +368,7 @@ namespace DepotDownloader
             var nameRaw = parser.Get<string>(null, "-name");
             var bannedOnly = parser.HasFlag("-banned-only");
             var deletedOnly = parser.HasFlag("-deleted-only");
+            var inaccessibleOnly = parser.HasFlag("-inaccessible-only");
             var showHistory = parser.HasFlag("-show-history");
             var limit = parser.Get<uint>(200, "-limit");
             parser.WarnUnconsumed();
@@ -373,7 +376,7 @@ namespace DepotDownloader
             if (appId == null)
             {
                 Console.WriteLine("Usage: depotdownloader workshop status -app <appid> [-output <dir>]");
-                Console.WriteLine("       depotdownloader workshop status -app <appid> -list [-kind chunk|ancient|unknown] [-only <id,id2,...>] [-name <pattern>] [-banned-only] [-deleted-only] [-show-history] [-limit N]");
+                Console.WriteLine("       depotdownloader workshop status -app <appid> -list [-kind chunk|ancient|unknown] [-only <id,id2,...>] [-name <pattern>] [-banned-only] [-deleted-only] [-inaccessible-only] [-show-history] [-limit N]");
                 return 1;
             }
 
@@ -428,7 +431,7 @@ namespace DepotDownloader
             }
 
             Console.WriteLine();
-            return ContentDownloader.PrintWorkshopCatalogList(appId.Value, output, onlyIds, kindFilter, nameFilter, bannedOnly, deletedOnly, showHistory, limit);
+            return ContentDownloader.PrintWorkshopCatalogList(appId.Value, output, onlyIds, kindFilter, nameFilter, bannedOnly, deletedOnly, showHistory, limit, inaccessibleOnly);
         }
 
         private static bool LogOn(string username, string password, bool rememberPassword)
@@ -552,6 +555,8 @@ namespace DepotDownloader
             Console.WriteLine("       re-listed items already current are skipped without further calls. A poll");
             Console.WriteLine("       that fails or is interrupted doesn't advance, so the next one re-asks the");
             Console.WriteLine("       same window. A catalog's first poll lists everything since its bootstrap.");
+            Console.WriteLine("       Also processes any item flagged for it, however old - new content \"refresh\"");
+            Console.WriteLine("       found, or an archive step that failed last time (flagged so it's retried).");
             Console.WriteLine("       Full history is fetched by default for every new/changed item, same reasoning");
             Console.WriteLine("       as bootstrap's own -shallow above - a listing only ever shows an item's current");
             Console.WriteLine("       state, so without it an item updated twice between two polls would silently");
@@ -579,13 +584,20 @@ namespace DepotDownloader
             Console.WriteLine("                     own delta, so a poll schedule doubles as steady backfill progress");
             Console.WriteLine();
             Console.WriteLine("REFRESH - re-verifies already-known catalog entries directly against GetDetails,");
-            Console.WriteLine("          batched, instead of relying on bootstrap's ranking walk or poll's delta to");
+            Console.WriteLine("          batched, instead of relying on bootstrap's ranking walk or poll's listing to");
             Console.WriteLine("          notice anything. The only way to catch two things neither of those can:");
             Console.WriteLine("          a stale/wrong title or kind that was never re-detected by either mechanism,");
-            Console.WriteLine("          and an item Steam banned or its author made private/unlisted - which simply");
-            Console.WriteLine("          stops appearing everywhere else with no signal as to why. Catalog-only, like");
-            Console.WriteLine("          bootstrap's plain default - never downloads content. Anonymous.");
+            Console.WriteLine("          and a removal - deleted, inaccessible (AccessDenied), banned, or made");
+            Console.WriteLine("          private/unlisted - which simply stops appearing everywhere else with no");
+            Console.WriteLine("          signal as to why. Each is reported once, when an item enters that state;");
+            Console.WriteLine("          after that it's only counted. Catalog-only, like bootstrap's plain default -");
+            Console.WriteLine("          never downloads content, so an item it finds with new content is flagged for");
+            Console.WriteLine("          the next poll to fetch history for and archive. Anonymous.");
             Console.WriteLine("  -only <id,id2,...> Restrict to specific catalog IDs instead of the whole thing");
+            Console.WriteLine("  -deleted-only      Re-check only items marked deleted - a quick way to see whether");
+            Console.WriteLine("                     any came back, without refreshing the whole catalog");
+            Console.WriteLine("  -inaccessible-only Re-check only items marked inaccessible (both flags together");
+            Console.WriteLine("                     re-check both groups)");
             Console.WriteLine("  -batch-size <n>    IDs per GetDetails request (default 100). Steam's real per-");
             Console.WriteLine("                     request limit isn't established here - lower this if a run");
             Console.WriteLine("                     starts failing outright rather than for individual IDs");
@@ -598,7 +610,8 @@ namespace DepotDownloader
             Console.WriteLine("         output across runs.");
             Console.WriteLine("  -list              Print each matching item: ID, kind, manifest ID, last update/seen");
             Console.WriteLine("                     time, history entry count + complete/partial, title (tagged");
-            Console.WriteLine("                     [DELETED], [BANNED], or [NOT PUBLIC] if \"workshop refresh\" found any)");
+            Console.WriteLine("                     [DELETED], [INACCESSIBLE], [BANNED], or [NOT PUBLIC] if \"workshop");
+            Console.WriteLine("                     refresh\" found any, and [WAITING FOR POLL] if flagged for the next poll)");
             Console.WriteLine("    -kind <k>            Filter: chunk, ancient, or unknown");
             Console.WriteLine("    -only <id,id2,...>   Filter to specific IDs");
             Console.WriteLine("    -name <pattern>      Filter by title - a case-insensitive regex (.NET syntax),");
@@ -609,6 +622,8 @@ namespace DepotDownloader
             Console.WriteLine("    -deleted-only        Only items \"workshop refresh\" found gone outright (Steam's");
             Console.WriteLine("                         GetDetails returned FileNotFound) - distinct from banned");
             Console.WriteLine("                         (that item still exists; this one no longer does)");
+            Console.WriteLine("    -inaccessible-only   Only items Steam's GetDetails answers AccessDenied for -");
+            Console.WriteLine("                         they exist but won't resolve, anonymous or logged in");
             Console.WriteLine("    -show-history        Print each matching item's full recorded History below its");
             Console.WriteLine("                         row (timestamp, manifest ID, change note if any), oldest");
             Console.WriteLine("                         first. Verbose - meant for a tight -only/-name, not a");

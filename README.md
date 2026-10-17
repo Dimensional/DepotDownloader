@@ -663,7 +663,7 @@ depotdownloader workshop download -app <appid> [OPTIONS...]
 depotdownloader workshop download -workshop <id> [<id>...] [OPTIONS...]
 depotdownloader workshop poll -app <appid> [OPTIONS...]
 depotdownloader workshop refresh -app <appid> [OPTIONS...]
-depotdownloader workshop status -app <appid> [-output <dir>] [-list [-kind chunk|ancient|unknown] [-only <id,id2,...>] [-name <pattern>] [-banned-only] [-deleted-only] [-show-history] [-limit N]]
+depotdownloader workshop status -app <appid> [-output <dir>] [-list [-kind chunk|ancient|unknown] [-only <id,id2,...>] [-name <pattern>] [-banned-only] [-deleted-only] [-inaccessible-only] [-show-history] [-limit N]]
 ```
 
 ### Storage
@@ -754,9 +754,9 @@ Incomplete items are backfilled two ways:
 - **Via a bounded sweep**: `-backfill-batch <n>` (default 200; 0 disables) runs at the start of every
   `bootstrap` or `poll` invocation, fetching full history for up to `n` items still marked
   incomplete. It's a per-run cap, not "keep going until none remain" - a large backlog is cleared
-  across several invocations. Items marked deleted are skipped. When a history fetch fails, the item
-  is checked with `GetDetails`, and if Steam reports it gone (`FileNotFound`) it's marked deleted,
-  the same as `refresh` would. An item Steam answers with an empty changelog (common for older
+  across several invocations. Items marked deleted or inaccessible are skipped. When a history fetch
+  fails, the item is checked with `GetDetails`, and if Steam reports it gone (`FileNotFound`) or
+  hidden (`AccessDenied`) it's marked deleted or inaccessible, the same as `refresh` would. An item Steam answers with an empty changelog (common for older
   ancient-UGC items) counts as complete, with its current version as its only known one.
 
 ### Download
@@ -805,6 +805,12 @@ archiving any content - the poll equivalent of bootstrap's own plain default.
 Removals don't show up in a listing at all - a deleted, banned, or private item just stops appearing.
 Use `refresh` for those.
 
+Poll also processes every item flagged for it, however old the change: new content `refresh` found
+(refresh records it but never fetches history or downloads), and any item whose archive step failed
+on an earlier poll. Flagged items get the full treatment - history, and archive unless
+`-catalog-only` - and the flag clears once they're through. `-catalog-only` clears it too, since
+that's all the processing a catalog-only poll does.
+
 **`-item-changes`** uses the old `GetItemChanges` feed instead of listing, for comparison. It needs an
 authenticated login, it never reports a new item that hasn't been updated since it was created, and
 it returns `EResult.Ignored` (exit code 2) for a starting point more than roughly 4-7 days old on a
@@ -815,17 +821,24 @@ separate from plain poll's.
 
 Re-verifies already-known catalog entries directly against `PublishedFile.GetDetails`, batched. This
 catches what `bootstrap`/`poll` can't: correcting a stale title/kind/manifest handle, and positively
-detecting a removal (banned, or made private/unlisted by its author) - both simply stop appearing in
-`QueryFiles`/`GetItemChanges` otherwise, with no signal distinguishing why. Catalog-only, like
-`bootstrap`'s plain default - never downloads content. Works anonymously.
+detecting a removal - both simply stop appearing in listings otherwise, with no signal
+distinguishing why. Catalog-only, like `bootstrap`'s plain default - never downloads content, so an
+item it finds with new content is recorded and flagged for the next `poll` to fetch history for and
+archive (`UPDATED` in its output). Works anonymously.
 
-`-batch-size` (default 100) controls IDs per `GetDetails` request. Two fields exist solely for this
-command: `Banned`/`BanReason` and `Visibility` (0=Public, 1=FriendsOnly, 2=Private, 3=Unlisted) -
-both stay at their zero-value default until a `refresh` actually checks that item. `status -list`
-tags an affected row `[BANNED]` or `[NOT PUBLIC]`; `-banned-only` filters to just what's been found
-banned - both reflect only what `refresh` has actually checked. A genuinely deleted item is reported
-distinctly from a banned/private one (`EResult.FileNotFound` vs. a normal resolve with
-`banned`/`visibility` set) and logged as unresolved rather than overwritten.
+What it can find about an item that's gone from listings:
+- **Deleted** - `GetDetails` answers `FileNotFound`. The item no longer exists.
+- **Inaccessible** - `GetDetails` answers `AccessDenied`, anonymous and logged in alike. The item
+  exists but won't resolve - most likely private to its author, or hidden by Steam.
+- **Banned** / **not public** - the item still resolves, with `banned` or a nonzero `visibility`
+  (0=Public, 1=FriendsOnly, 2=Private, 3=Unlisted) set.
+
+Each is printed once, when an item first enters that state, and only counted after that - a refresh
+over a large catalog no longer re-lists every known-deleted item on every run. An item that resolves
+again is printed as `RESTORED`/`ACCESSIBLE` and the flag clears. The history backfill skips deleted
+and inaccessible items, and marks them itself when an item's history fetch fails for that reason.
+
+`-batch-size` (default 100) controls IDs per `GetDetails` request.
 
 ### Options
 
@@ -863,6 +876,9 @@ distinctly from a banned/private one (`EResult.FileNotFound` vs. a normal resolv
 
 **refresh:**
 - `-only <id,id2,...>` - Restrict to specific catalog IDs instead of the whole thing
+- `-deleted-only` / `-inaccessible-only` - Re-check only items marked deleted / inaccessible (both
+  together re-check both groups) - a quick way to catch any that came back, without refreshing the
+  whole catalog. A full refresh re-checks them too.
 - `-batch-size <n>` - IDs per `GetDetails` request (default 100)
 - `-max-items <n>` - Stop after checking this many IDs (resumable)
 
@@ -874,11 +890,13 @@ themselves require).
 
 `status` alone prints aggregate counts. `status -list` shows what was recorded: one row per item
 (ID, kind, manifest/content handle, last-update/last-seen time, history count/completeness, title -
-tagged `[DELETED]`, `[BANNED]`, or `[NOT PUBLIC]` if a `refresh` found any). Defaults to the first
+tagged `[DELETED]`, `[INACCESSIBLE]`, `[BANNED]`, or `[NOT PUBLIC]` if a `refresh` found any, and
+`[WAITING FOR POLL]` if flagged for the next poll). Defaults to the first
 200 matching rows (`-limit 0` for all); narrow with `-kind chunk|ancient|unknown`,
 `-only <id,id2,...>`, `-name <pattern>` (a case-insensitive regex, so plain text works as a
 substring search and `-name "Mario|Samus|Metroid"` matches any of several names),
-`-banned-only`/`-deleted-only` (only what `refresh` has actually found), and/or `-show-history`
+`-banned-only`/`-deleted-only`/`-inaccessible-only` (only what `refresh` or backfill has actually
+found), and/or `-show-history`
 (prints each matching row's full recorded history underneath it).
 
 Titles can legitimately contain control characters (e.g. a trailing newline) - every place a title

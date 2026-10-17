@@ -107,6 +107,12 @@ namespace DepotDownloader
         /// PublishedFileDetails on hand (bootstrap's QueryFiles page, or poll's reclassification
         /// fetch) - avoids a redundant GetPublishedFileDetails round-trip per item, which matters
         /// at the scale "workshop bootstrap -manifests-only" operates at.
+        ///
+        /// Throws ContentDownloaderException when the content wasn't archived. The download paths
+        /// underneath only print a warning and carry on (right for a CSV batch, where one bad
+        /// manifest mustn't stop the rest), so without this every caller here - all of which
+        /// already catch per item - counted a failed archive as a success, and "workshop poll"
+        /// never re-flagged it for a retry.
         /// </summary>
         public static async Task DownloadPubfileRawAsync(ulong publishedFileId, PublishedFileDetails details, RawDownloadOptions options)
         {
@@ -117,13 +123,20 @@ namespace DepotDownloader
                 // there's no manifest/chunk split for a direct-URL file the way there is for depot
                 // chunks - see DownloadWebFileToUGCAsync's dryRun handling for what it means here
                 // (log the item's current metadata without fetching its content).
-                await DownloadWebFileToUGCAsync(details.consumer_appid, publishedFileId, details.title, details.filename, details.file_url, details.file_size.ToString(), details.time_updated, options.DryRun);
+                if (!await DownloadWebFileToUGCAsync(details.consumer_appid, publishedFileId, details.title, details.filename, details.file_url, details.file_size.ToString(), details.time_updated, options.DryRun))
+                {
+                    throw new ContentDownloaderException($"workshop item {publishedFileId}'s file wasn't downloaded (see the error above)");
+                }
             }
             else if (details?.hcontent_file > 0)
             {
                 // Modern UGC - manifest-based content, use raw archiving
                 Console.WriteLine("Retrieved data for workshop item {0}: '{1}' for app {2}", publishedFileId, SanitizeTitleForDisplay(details.title), details.consumer_appid);
-                await DownloadAppRawAsync(details.consumer_appid, new List<(uint, ulong)> { (details.consumer_appid, details.hcontent_file) }, DEFAULT_BRANCH, null, null, null, false, options, publishedFileId.ToString(), details.title);
+                var notArchived = await DownloadAppRawAsync(details.consumer_appid, new List<(uint, ulong)> { (details.consumer_appid, details.hcontent_file) }, DEFAULT_BRANCH, null, null, null, false, options, publishedFileId.ToString(), details.title);
+                if (notArchived > 0)
+                {
+                    throw new ContentDownloaderException($"manifest {details.hcontent_file} for workshop item {publishedFileId} wasn't archived (see the warning above)");
+                }
             }
             else
             {
@@ -246,7 +259,10 @@ namespace DepotDownloader
         // library) later. Both come from the same PublishedFileDetails lookup where available;
         // the older SteamCloud.UGCDetailsCallback fallback has no title or update-timestamp, so
         // callers pass null/0 for those and this still works, just without update-detection.
-        private static async Task DownloadWebFileToUGCAsync(uint appId, ulong workshopId, string title, string internalFileName, string url, string fileSize, uint timeUpdated, bool dryRun = false)
+        // Returns false only when the download itself failed (already reported) - a caller that
+        // needs to know (DownloadPubfileRawAsync, for "workshop poll"'s retry) can act on it,
+        // the rest just ignore it as before.
+        private static async Task<bool> DownloadWebFileToUGCAsync(uint appId, ulong workshopId, string title, string internalFileName, string url, string fileSize, uint timeUpdated, bool dryRun = false)
         {
             var itemDir = Path.Combine("ugc", appId.ToString(), workshopId.ToString());
             Directory.CreateDirectory(itemDir);
@@ -265,7 +281,7 @@ namespace DepotDownloader
                 latest.DownloadedAt = DateTime.Now.ToString("O");
                 SaveUgcHistory(sidecarPath, history);
                 RecordUGCDownload(workshopId, url, title, internalFileName, destPath, appId, "exists", fileSize, timeUpdated);
-                return;
+                return true;
             }
 
             if (dryRun)
@@ -298,7 +314,7 @@ namespace DepotDownloader
                 }
 
                 RecordUGCDownload(workshopId, url, title, internalFileName, destPath: null, appId, "logged", fileSize, timeUpdated);
-                return;
+                return true;
             }
 
             if (latest != null && latest.TimeUpdated != timeUpdated)
@@ -329,7 +345,7 @@ namespace DepotDownloader
                 if (!response.IsSuccessStatusCode)
                 {
                     Console.WriteLine("Failed to download UGC file: HTTP {0}", response.StatusCode);
-                    return;
+                    return false;
                 }
 
                 using (var responseStream = await response.Content.ReadAsStreamAsync())
@@ -362,11 +378,13 @@ namespace DepotDownloader
                 SaveUgcHistory(sidecarPath, history);
 
                 RecordUGCDownload(workshopId, url, title, internalFileName, destPath, appId, "downloaded", actualSize, timeUpdated);
+                return true;
             }
             catch (Exception ex)
             {
                 Console.WriteLine("Error downloading UGC file: {0}", ex.Message);
                 try { File.Delete(tempPath); } catch { /* best effort cleanup */ }
+                return false;
             }
         }
 
