@@ -4,12 +4,12 @@
 // "workshop bootstrap"/"poll": a two-phase automatic-update-tracking pipeline covering an app's
 // entire workshop - both chunk-based items (depot ID == app ID) and ancient/direct-URL UGC items
 // (see WorkshopItemKind in WorkshopCatalogDb.cs - see README). Bootstrap walks PublishedFile.
-// QueryFiles once to record every item's current state; poll then calls PublishedFile.
-// GetItemChanges to find just what changed since last time, and archives only those via
-// DownloadPubfileRawAsync - the same per-item entry point "download -workshop -raw" uses, so both
-// kinds land through their already-correct dispatch rather than being re-implemented here (see
-// Steam3Session.GetItemChanges/QueryFiles for the empirically-confirmed access/range restrictions
-// this relies on).
+// QueryFiles once to record every item's current state; poll then lists just what was created or
+// updated since its last sweep (QueryFiles' date filters - or GetItemChanges with -item-changes),
+// and archives only those via DownloadPubfileRawAsync - the same per-item entry point "download
+// -workshop -raw" uses, so both kinds land through their already-correct dispatch rather than
+// being re-implemented here (see Steam3Session.QueryFiles/GetItemChanges for the empirically-
+// confirmed access/range restrictions this relies on).
 
 using System;
 using System.Collections.Generic;
@@ -99,7 +99,7 @@ namespace DepotDownloader
             return sb.ToString();
         }
 
-        public static async Task<int> BootstrapWorkshopCatalogAsync(uint appId, string outputRoot, uint pageSize, uint maxItems, uint queryType, bool manifestsOnly = false, bool shallow = false, uint backfillBatch = 200, bool resetCursor = false, bool catchUp = false)
+        public static async Task<int> BootstrapWorkshopCatalogAsync(uint appId, string outputRoot, uint pageSize, uint maxItems, uint queryType, bool manifestsOnly = false, bool shallow = false, uint backfillBatch = 200, bool resetCursor = false)
         {
             outputRoot = ResolveOutputRoot(outputRoot);
             using var catalog = WorkshopCatalogDb.Open(outputRoot, appId);
@@ -140,32 +140,14 @@ namespace DepotDownloader
             {
                 Console.WriteLine($"Bootstrap already completed for app {appId} ({catalog.ItemCount():N0} items recorded).");
 
-                if (catchUp)
-                {
-                    var catchUpResult = await WalkCatchUpAsync(catalog, appId, outputRoot, pageSize, manifestsOnly, shallow);
-                    if (catchUpResult != 0)
-                    {
-                        return catchUpResult;
-                    }
-                }
-
                 var incompatibleResult = await WalkIncompatibleItemsAsync(catalog, appId, outputRoot, pageSize, manifestsOnly, shallow);
                 if (incompatibleResult != 0)
                 {
                     return incompatibleResult;
                 }
 
-                Console.WriteLine($"Delete {WorkshopCatalogDb.GetPath(outputRoot, appId)} to force a full re-bootstrap, run 'workshop poll' to pick up changes since, or pass -catch-up to check for new items directly.");
+                Console.WriteLine($"Run 'workshop poll' to pick up items created or updated since, or delete {WorkshopCatalogDb.GetPath(outputRoot, appId)} to force a full re-bootstrap.");
                 return 0;
-            }
-
-            if (catchUp)
-            {
-                // -catch-up only means anything once the main walk is done (see WalkCatchUpAsync's
-                // own doc comment for why there's no "force" mode for an in-progress walk) - silently
-                // ignoring it here instead would be confusing, so this is explicit rather than a
-                // no-op.
-                Console.WriteLine("-catch-up ignored: this catalog's main walk isn't complete yet - finish it first (catch-up only matters once there's a stable baseline to compare against).");
             }
 
             if (catalog.BootstrapStartedAt == 0)
@@ -317,27 +299,41 @@ namespace DepotDownloader
             }
         }
 
-        /// <summary>Records one QueryFiles result item into the catalog - shared between the main
-        /// walk above and WalkIncompatibleItemsAsync below. Returns false (without upserting
-        /// anything) for a result carrying no title, no manifest handle, and no update time - all
-        /// three at once, confirmed live (app 4704690, id 3753225706) to be a real, enumerable
+        /// <summary>A QueryFiles result carrying no title, no manifest handle, and no update time -
+        /// all three at once, confirmed live (app 4704690, id 3753225706) to be a real, enumerable
         /// PublishedFileId that no other endpoint (GetDetails, or even Steam's own community site)
         /// can actually resolve, not a normal sparse-but-real item. Recording that blindly as a
         /// catalog entry previously inflated the item count with a phantom that looks legitimate at
-        /// a glance (a real-looking PublishedFileId) but carries no usable data at all.</summary>
-        private static async Task<bool> ProcessQueryFilesItemAsync(WorkshopCatalogDb catalog, string outputRoot, PublishedFileDetails d, bool shallow, bool manifestsOnly, uint now, bool trackRecoveryAnchor)
+        /// a glance (a real-looking PublishedFileId) but carries no usable data at all - so every
+        /// QueryFiles consumer skips it, with a warning.</summary>
+        private static bool SkipAnomalousListing(PublishedFileDetails d)
         {
             if (string.IsNullOrEmpty(d.title) && d.hcontent_file == 0 && d.time_updated == 0)
             {
                 Console.WriteLine($"  Warning: skipping {d.publishedfileid} - QueryFiles returned no title, manifest, or update time for it (a known Steam-side anomaly, not a normal item - see README).");
+                return true;
+            }
+            return false;
+        }
+
+        /// <summary>Same classification DownloadPubfileRawAsync itself uses - file_url wins first.
+        /// Confirmed empirically that ancient (2012-era) items still have hcontent_file populated
+        /// too, but it's just the CDN handle embedded in that URL, not a depot manifest ID - Kind is
+        /// what keeps "poll" from confusing them.</summary>
+        private static WorkshopItemKind ClassifyKind(PublishedFileDetails d) =>
+            !string.IsNullOrEmpty(d.file_url) ? WorkshopItemKind.AncientUgc : WorkshopItemKind.ChunkBased;
+
+        /// <summary>Records one QueryFiles result item into the catalog - shared between the main
+        /// walk above and WalkIncompatibleItemsAsync below. Returns false (without upserting
+        /// anything) for an anomalous result (see SkipAnomalousListing).</summary>
+        private static async Task<bool> ProcessQueryFilesItemAsync(WorkshopCatalogDb catalog, string outputRoot, PublishedFileDetails d, bool shallow, bool manifestsOnly, uint now, bool trackRecoveryAnchor)
+        {
+            if (SkipAnomalousListing(d))
+            {
                 return false;
             }
 
-            // Same classification DownloadPubfileRawAsync itself uses - file_url wins first.
-            // Confirmed empirically that ancient (2012-era) items still have hcontent_file
-            // populated too, but it's just the CDN handle embedded in that URL, not a depot
-            // manifest ID - Kind is what keeps "poll" from confusing them.
-            var kind = !string.IsNullOrEmpty(d.file_url) ? WorkshopItemKind.AncientUgc : WorkshopItemKind.ChunkBased;
+            var kind = ClassifyKind(d);
 
             var item = new WorkshopCatalogItem
             {
@@ -393,110 +389,6 @@ namespace DepotDownloader
             }
 
             return true;
-        }
-
-        /// <summary>-catch-up: an alternative to relying on "poll" for discovering brand-new items,
-        /// for an app where GetItemChanges can't be trusted (confirmed unreliable independent of
-        /// watermark handling on at least one app - see README). Walks fresh from the newest item
-        /// (cursor "*") and stops the moment it reaches a PublishedFileId already in the catalog -
-        /// bounded by how many items are genuinely new since the last check, not by total catalog
-        /// size, so the common case (nothing new) costs exactly one page.
-        ///
-        /// Only sound under query_type 1 (RankedByPublicationDate): time_created never changes once
-        /// an item exists, so "everything at or before the first known item is already known" holds.
-        /// Under RankedByLastUpdatedDate (21) it would not - an old item bumped to the front by a
-        /// fresh update could be reached first and cause an incorrect early stop, silently hiding
-        /// genuinely new items further back. Refuses to run under any other query-type.
-        ///
-        /// Deliberately only reachable once the main walk is already complete (enforced by the
-        /// caller) - no "force" mode for an in-progress walk exists or is planned: reconciling this
-        /// against an active BootstrapCursor would add real complexity (deciding which items the main
-        /// walk simply hasn't reached yet vs. ones that are genuinely new) for a case a full
-        /// delete-and-rebootstrap already covers more simply.</summary>
-        private static async Task<int> WalkCatchUpAsync(WorkshopCatalogDb catalog, uint appId, string outputRoot, uint pageSize, bool manifestsOnly, bool shallow)
-        {
-            if (catalog.QueryType != 1)
-            {
-                Console.WriteLine($"-catch-up requires the stable RankedByPublicationDate ranking (query-type 1) - this catalog is pinned to query-type {catalog.QueryType}, so catch-up cannot run safely for it (see README). Delete the catalog and re-bootstrap under query-type 1 to use this.");
-                return 0;
-            }
-
-            Console.WriteLine("Checking for new items published since the last check (-catch-up)...");
-
-            var cursor = "*";
-            var newCount = 0;
-            // Bounded against an API misbehavior only - a real catch-up walk is expected to stop
-            // within a handful of pages in the common case (see summary above).
-            var safetyPageBudget = 10000;
-
-            try
-            {
-                while (true)
-                {
-                    var (result, body) = await WithTransientRetryAsync("QueryFiles (catch-up)",
-                        () => steam3.QueryFiles(appId, cursor, pageSize, catalog.QueryType));
-
-                    if (result != EResult.OK || body == null)
-                    {
-                        Console.WriteLine($"QueryFiles (catch-up) failed: {result}. Items found before this point are already saved; re-run -catch-up to retry.");
-                        return 1;
-                    }
-
-                    var now = (uint)DateTimeOffset.UtcNow.ToUnixTimeSeconds();
-                    var reachedKnownItem = false;
-
-                    foreach (var d in body.publishedfiledetails)
-                    {
-                        if (catalog.TryGetItem(d.publishedfileid, out _))
-                        {
-                            reachedKnownItem = true;
-                            break;
-                        }
-
-                        if (await ProcessQueryFilesItemAsync(catalog, outputRoot, d, shallow, manifestsOnly, now, trackRecoveryAnchor: false))
-                        {
-                            newCount++;
-                        }
-                    }
-
-                    catalog.SaveMeta();
-
-                    if (reachedKnownItem)
-                    {
-                        Console.WriteLine(newCount > 0
-                            ? $"Catch-up complete: {newCount:N0} new item(s) found and added."
-                            : "Catch-up complete: nothing new since the last check.");
-                        return 0;
-                    }
-
-                    var donePaging = string.IsNullOrEmpty(body.next_cursor)
-                        || body.next_cursor == cursor
-                        || body.publishedfiledetails.Count == 0;
-
-                    if (donePaging)
-                    {
-                        // Walked the entire workshop without ever reaching a previously-known item -
-                        // unusual, but not unsafe: everything found is recorded either way.
-                        Console.WriteLine($"Catch-up complete: walked the entire workshop ({newCount:N0} item(s) recorded) without finding a previously-known item - unexpected if this catalog wasn't empty; check 'workshop status'.");
-                        return 0;
-                    }
-
-                    cursor = body.next_cursor;
-
-                    if (--safetyPageBudget <= 0)
-                    {
-                        Console.WriteLine("Warning: -catch-up exceeded its expected page budget without finding a known item - stopping to avoid an unbounded loop. Items found so far are saved; investigate before re-running.");
-                        return 1;
-                    }
-
-                    await Task.Delay(WorkshopApiPacingDelay);
-                }
-            }
-            catch (Exception ex) when (IsTransientNetworkException(ex))
-            {
-                Console.WriteLine($"-catch-up stopped after repeated {ex.GetType().Name}s - items found so far are saved; re-run -catch-up to continue.");
-                return 1;
-            }
         }
 
         /// <summary>Second QueryFiles pass, required_flags=["incompatible"] - runs every time the
@@ -591,7 +483,251 @@ namespace DepotDownloader
             }
         }
 
-        public static async Task<int> PollWorkshopCatalogAsync(uint appId, string outputRoot, bool dryRun, bool manifestsOnly = false, bool shallow = false, uint backfillBatch = 200, bool catalogOnly = false)
+        /// <summary>
+        /// How far before the last completed sweep's start each new sweep re-lists, by default.
+        /// Measured live on depot 4000: an item can first show up in QueryFiles well after its own
+        /// time_created/time_updated (a ~15-25 minute delay was common; one item was still hidden
+        /// ~17h after its last update), and becoming visible moves neither timestamp - so without
+        /// overlap such an item would fall behind the window for good. Two days of overlap costs
+        /// roughly 30 extra pages per run on a workshop as busy as GMod's, and every re-listed item
+        /// that's already current is skipped without any further call.
+        /// </summary>
+        public const uint DefaultPollOverlapHours = 48;
+
+        /// <summary>One item poll is about to record (and, unless what it archives by didn't move,
+        /// archive). Details is the full QueryFiles result when the sweep listed it, or null when
+        /// it came from GetItemChanges, which carries no title/file_url/visibility.</summary>
+        private sealed record PollCandidate(ulong PublishedFileId, ulong ManifestId, uint TimeUpdated, PublishedFileDetails Details, WorkshopCatalogItem Existing);
+
+        private static string FormatUnixTime(uint t) => $"{t} ({DateTimeOffset.FromUnixTimeSeconds(t):u})";
+
+        /// <summary>
+        /// Plain poll's discovery step: lists every item created or updated since the window start
+        /// via four filtered QueryFiles walks under the stable RankedByPublicationDate ranking -
+        /// created-since and updated-since, each once plain and once with
+        /// required_flags=["incompatible"] (an item flagged that way is absent from a plain query
+        /// entirely - see WalkIncompatibleItemsAsync). Both date filters are needed: updated-since
+        /// alone never sees an item that hasn't been updated since its creation, which on a busy
+        /// workshop is most brand-new items (see Steam3Session.QueryFiles) - the same blind spot
+        /// GetItemChanges has. Each walk is bounded by how much actually changed, not by catalog
+        /// size, and needs no login.
+        ///
+        /// Window start: -since when given, else SweepMark (or, for a catalog never swept yet,
+        /// BootstrapStartedAt) minus the overlap. The new mark is this sweep's own start time, only
+        /// committed by the caller once every walk finished - an interrupted sweep re-asks the same
+        /// window next time instead of leaving a gap behind. (The newest-first "stop at the first
+        /// already-known item" walk this replaced could not: an interrupted run left everything
+        /// below where it stopped unreachable for good, since the next run stopped at the items the
+        /// interrupted one had just recorded.)
+        /// </summary>
+        private static async Task<(int ExitCode, List<PollCandidate> Candidates, uint NewMark)> SweepForChangesAsync(WorkshopCatalogDb catalog, uint appId, bool dryRun, uint since, uint overlapHours)
+        {
+            const uint pageSize = 100;
+            var sweepStartedAt = (uint)DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+
+            if (since == 0)
+            {
+                var baseline = catalog.SweepMark > 0 ? catalog.SweepMark : catalog.BootstrapStartedAt;
+                if (baseline == 0)
+                {
+                    Console.WriteLine("This catalog has no bootstrap start time or earlier sweep to list changes from - run 'workshop bootstrap' first, or pass -since <date> to choose the window explicitly.");
+                    return (1, null, 0);
+                }
+
+                var overlap = overlapHours * 3600u;
+                since = baseline > overlap ? baseline - overlap : 1;
+                Console.WriteLine(catalog.SweepMark > 0
+                    ? $"Listing app {appId} items created or updated since {FormatUnixTime(since)} (last sweep's start minus {overlapHours}h overlap)..."
+                    : $"Listing app {appId} items created or updated since {FormatUnixTime(since)} - this catalog's first sweep, so the window starts at its bootstrap (minus {overlapHours}h overlap)...");
+            }
+            else
+            {
+                Console.WriteLine($"Listing app {appId} items created or updated since {FormatUnixTime(since)} (-since)...");
+            }
+
+            var passes = new (string Label, bool ByCreation, string[] RequiredFlags)[]
+            {
+                ("created", true, null),
+                ("updated", false, null),
+                ("created, incompatible-flagged", true, ["incompatible"]),
+                ("updated, incompatible-flagged", false, ["incompatible"]),
+            };
+
+            // Keyed by ID - an item created and then updated inside the window comes back from both
+            // walks.
+            var listed = new Dictionary<ulong, PublishedFileDetails>();
+
+            try
+            {
+                foreach (var (label, byCreation, requiredFlags) in passes)
+                {
+                    var cursor = "*";
+                    var passCount = 0;
+                    var safetyPageBudget = int.MaxValue;
+
+                    while (true)
+                    {
+                        var (result, body) = await WithTransientRetryAsync($"QueryFiles ({label})",
+                            () => steam3.QueryFiles(appId, cursor, pageSize, queryType: 1, requiredFlags: requiredFlags,
+                                dateRangeCreatedStart: byCreation ? since : null,
+                                dateRangeUpdatedStart: byCreation ? null : since));
+
+                        if (result != EResult.OK || body == null)
+                        {
+                            catalog.LastPollResult = $"QueryFiles {result}";
+                            if (!dryRun)
+                            {
+                                catalog.SaveMeta();
+                            }
+                            Console.WriteLine($"QueryFiles ({label}) failed: {result}. Nothing was recorded and the sweep mark was not advanced - a re-run lists the same window again.");
+                            return (1, null, 0);
+                        }
+
+                        if (safetyPageBudget == int.MaxValue)
+                        {
+                            // The filter is fixed for the whole walk, so total holds steady - still
+                            // only a generous backstop against an API misbehavior, not a progress
+                            // estimate.
+                            safetyPageBudget = (int)(body.total / pageSize) * 3 + 100;
+                        }
+
+                        foreach (var d in body.publishedfiledetails)
+                        {
+                            if (SkipAnomalousListing(d))
+                            {
+                                continue;
+                            }
+
+                            passCount++;
+                            // Never read anywhere downstream, and by far the largest field - a first
+                            // sweep of a busy workshop can hold tens of thousands of these at once.
+                            d.file_description = null;
+                            if (!listed.TryGetValue(d.publishedfileid, out var seen) || d.time_updated > seen.time_updated)
+                            {
+                                listed[d.publishedfileid] = d;
+                            }
+                        }
+
+                        var donePaging = string.IsNullOrEmpty(body.next_cursor)
+                            || body.next_cursor == cursor
+                            || body.publishedfiledetails.Count == 0;
+
+                        if (donePaging)
+                        {
+                            break;
+                        }
+
+                        cursor = body.next_cursor;
+
+                        if (--safetyPageBudget <= 0)
+                        {
+                            Console.WriteLine($"Warning: QueryFiles ({label}) far exceeded its expected page count - stopping to avoid an unbounded loop. Nothing was recorded and the sweep mark was not advanced; investigate before re-running.");
+                            return (1, null, 0);
+                        }
+
+                        await Task.Delay(WorkshopApiPacingDelay);
+                    }
+
+                    Console.WriteLine($"  {label} since then: {passCount:N0}");
+                }
+            }
+            catch (Exception ex) when (IsTransientNetworkException(ex))
+            {
+                Console.WriteLine($"Poll stopped after repeated {ex.GetType().Name}s - this looks like throttling or a sustained network issue. Nothing was recorded and the sweep mark was not advanced - a re-run lists the same window again.");
+                return (1, null, 0);
+            }
+
+            var candidates = new List<PollCandidate>();
+            var current = 0;
+
+            foreach (var d in listed.Values.OrderBy(d => d.time_updated))
+            {
+                catalog.TryGetItem(d.publishedfileid, out var existing, includeHistory: false);
+
+                // Re-listed inside the overlap, or simply unchanged since the catalog last saw it -
+                // nothing to do. A refresh-marked Deleted item showing up in a live listing again,
+                // or one never classified (an ad-hoc download's record), still gets a pass.
+                if (existing != null
+                    && !existing.Deleted
+                    && existing.Kind != WorkshopItemKind.Unknown
+                    && existing.TimeUpdated >= d.time_updated
+                    && existing.ManifestId == d.hcontent_file)
+                {
+                    current++;
+                    continue;
+                }
+
+                candidates.Add(new PollCandidate(d.publishedfileid, d.hcontent_file, d.time_updated, d, existing));
+            }
+
+            catalog.LastPollResult = "OK";
+            Console.WriteLine($"{listed.Count:N0} item(s) listed: {current:N0} already current, {candidates.Count:N0} to check.");
+            return (0, candidates, sweepStartedAt);
+        }
+
+        /// <summary>"poll -item-changes": the original discovery step, kept for comparison. Asks
+        /// GetItemChanges for everything changed since LastWatermark - needs an authenticated
+        /// login, rejects (EResult.Ignored) a watermark more than a few days old on a busy app, and
+        /// never reports a brand-new item that hasn't been updated since its creation (see
+        /// Steam3Session.GetItemChanges) - which is why plain poll no longer uses it. The new mark
+        /// is what GetItemChanges itself reported, never "now", so a poll can never silently skip
+        /// a window it didn't actually ask Steam about.</summary>
+        private static async Task<(int ExitCode, List<PollCandidate> Candidates, uint NewMark)> ListItemChangesAsync(WorkshopCatalogDb catalog, uint appId, bool dryRun)
+        {
+            var since = catalog.LastWatermark > 0 ? catalog.LastWatermark : catalog.BootstrapStartedAt;
+            if (since == 0)
+            {
+                since = 1;
+            }
+
+            Console.WriteLine($"Polling app {appId} via GetItemChanges for changes since {FormatUnixTime(since)}...");
+
+            EResult result;
+            CPublishedFile_GetItemChanges_Response body;
+            try
+            {
+                (result, body) = await WithTransientRetryAsync("GetItemChanges", () => steam3.GetItemChanges(appId, since));
+            }
+            catch (Exception ex) when (IsTransientNetworkException(ex))
+            {
+                Console.WriteLine($"Poll stopped after repeated {ex.GetType().Name}s - this looks like throttling or a sustained network issue. The watermark was not advanced, so a re-run will ask about the same window again.");
+                return (1, null, 0);
+            }
+            catalog.LastPollResult = result.ToString();
+
+            if (result == EResult.Ignored)
+            {
+                if (!dryRun)
+                {
+                    catalog.SaveMeta();
+                }
+                Console.WriteLine("Result: Ignored - Steam declined to report a delta for this request. Seen for a watermark older than ~96h-7d on a busy app, and on at least one app for a watermark only seconds old - the response gives no way to tell which applies here.");
+                Console.WriteLine("Re-running with -item-changes asks Steam the identical question again. Plain 'workshop poll' (without -item-changes) doesn't depend on GetItemChanges at all.");
+                return (2, null, 0);
+            }
+
+            if (result != EResult.OK || body == null)
+            {
+                if (!dryRun)
+                {
+                    catalog.SaveMeta();
+                }
+                Console.WriteLine($"GetItemChanges failed: {result}");
+                return (1, null, 0);
+            }
+
+            Console.WriteLine($"{body.workshop_items.Count:N0} item(s) reported changed.");
+
+            var candidates = body.workshop_items.Select(change =>
+            {
+                catalog.TryGetItem(change.published_file_id, out var existing, includeHistory: false);
+                return new PollCandidate(change.published_file_id, change.manifest_id, change.time_updated, null, existing);
+            }).ToList();
+
+            return (0, candidates, body.update_time);
+        }
+
+        public static async Task<int> PollWorkshopCatalogAsync(uint appId, string outputRoot, bool dryRun, bool manifestsOnly = false, bool shallow = false, uint backfillBatch = 200, bool catalogOnly = false, bool itemChanges = false, uint since = 0, uint overlapHours = DefaultPollOverlapHours)
         {
             outputRoot = ResolveOutputRoot(outputRoot);
 
@@ -606,57 +742,33 @@ namespace DepotDownloader
 
             if (!catalog.BootstrapCompleted)
             {
-                Console.WriteLine("Warning: bootstrap has not finished for this app yet - polling now only ever sees items already recorded plus whatever changes after the watermark below. Consider finishing 'workshop bootstrap' first.");
+                Console.WriteLine("Warning: bootstrap has not finished for this app yet - poll only covers what changed after the window start below; older items the bootstrap walk hasn't reached yet stay unrecorded until it does. Consider finishing 'workshop bootstrap' first.");
             }
 
-            var since = catalog.LastWatermark > 0 ? catalog.LastWatermark : catalog.BootstrapStartedAt;
-            if (since == 0)
-            {
-                since = 1;
-            }
-
-            Console.WriteLine($"Polling app {appId} for changes since {since} ({DateTimeOffset.FromUnixTimeSeconds(since):u})...");
-
-            EResult result;
-            CPublishedFile_GetItemChanges_Response body;
-            try
-            {
-                (result, body) = await WithTransientRetryAsync("GetItemChanges", () => steam3.GetItemChanges(appId, since));
-            }
-            catch (Exception ex) when (IsTransientNetworkException(ex))
-            {
-                Console.WriteLine($"Poll stopped after repeated {ex.GetType().Name}s - this looks like throttling or a sustained network issue. The watermark was not advanced, so a re-run will ask about the same window again.");
-                return 1;
-            }
             catalog.LastPolledAt = (uint)DateTimeOffset.UtcNow.ToUnixTimeSeconds();
-            catalog.LastPollResult = result.ToString();
 
-            if (result == EResult.Ignored)
+            var (exitCode, candidates, newMark) = itemChanges
+                ? await ListItemChangesAsync(catalog, appId, dryRun)
+                : await SweepForChangesAsync(catalog, appId, dryRun, since, overlapHours);
+
+            if (exitCode != 0)
             {
-                catalog.SaveMeta();
-                Console.WriteLine("Result: Ignored - Steam declined to report a delta for this request. The original theory (a watermark older than ~96h-7d on a high-churn app - see README) is confirmed NOT the only cause: a watermark manually set to this app's own recent bootstrap-start time (well under 96h old) was rejected the exact same way. This may simply mean nothing on the workshop has changed since that watermark's timestamp, or it may be an app-specific limitation of this endpoint - the response gives no way to tell which apart.");
-                Console.WriteLine("There's no way to force a different outcome from here right now: a plain 'bootstrap' re-run does not touch the watermark once this catalog is already complete, and re-running poll will ask Steam the identical question again. 'bootstrap' and 'refresh' remain reliable ways to keep this app's catalog current regardless of what poll reports.");
-                return 2;
+                return exitCode;
             }
-
-            if (result != EResult.OK || body == null)
-            {
-                catalog.SaveMeta();
-                Console.WriteLine($"GetItemChanges failed: {result}");
-                return 1;
-            }
-
-            Console.WriteLine($"{body.workshop_items.Count:N0} item(s) reported changed.");
 
             var downloaded = 0;
             var failed = 0;
+            var newCount = 0;
+            var changedCount = 0;
+            var metadataOnly = 0;
 
-            foreach (var change in body.workshop_items)
+            foreach (var c in candidates)
             {
-                catalog.TryGetItem(change.published_file_id, out var existing);
+                var existing = c.Existing;
                 var isNew = existing == null;
+                var details = c.Details;
 
-                // True preview: no network calls beyond GetItemChanges itself, no catalog
+                // True preview: no network calls beyond the discovery step itself, no catalog
                 // mutation, nothing persisted - reports using only what's already in memory. A
                 // real bug lived here previously: this used to fall through to the same
                 // catalog write / reclassification call / watermark advance / meta save as a
@@ -666,11 +778,22 @@ namespace DepotDownloader
                 // the catalog already held its new ManifestId.
                 if (dryRun)
                 {
-                    var skipDry = existing?.Kind == WorkshopItemKind.ChunkBased && existing.ManifestId == change.manifest_id;
-                    if (!skipDry)
+                    var dryKind = details != null ? ClassifyKind(details) : existing?.Kind ?? WorkshopItemKind.Unknown;
+                    if (!isNew && dryKind == WorkshopItemKind.ChunkBased && existing.ManifestId == c.ManifestId)
                     {
-                        Console.WriteLine($"  {(isNew ? "NEW" : "CHANGED")} {change.published_file_id} \"{SanitizeTitleForDisplay(existing?.Title) ?? $"unknown_{change.published_file_id}"}\" [{existing?.Kind ?? WorkshopItemKind.Unknown}]");
+                        metadataOnly++;
+                        continue;
                     }
+
+                    if (isNew)
+                    {
+                        newCount++;
+                    }
+                    else
+                    {
+                        changedCount++;
+                    }
+                    Console.WriteLine($"  {(isNew ? "NEW" : "CHANGED")} {c.PublishedFileId} \"{SanitizeTitleForDisplay(details?.title ?? existing?.Title) ?? $"unknown_{c.PublishedFileId}"}\" [{dryKind}]");
                     continue;
                 }
 
@@ -678,26 +801,21 @@ namespace DepotDownloader
                 var kind = existing?.Kind ?? WorkshopItemKind.Unknown;
                 var fileUrl = existing?.FileUrl;
 
-                // GetItemChanges doesn't return a title, file_url, or anything else that
-                // classifies the item, so re-classifying costs an extra round-trip - only worth
-                // paying for items we've never seen before, OR ones not already confirmed
-                // ChunkBased. That second case matters: an ancient/direct-URL item could
-                // conceivably be replaced by a chunk-based one on some future update (unconfirmed
-                // either way - not something to assume won't happen), and a ChunkBased item is
-                // for all practical purposes never going to revert to ancient - so re-checking
-                // anything not already confirmed ChunkBased is what actually catches that
-                // transition instead of leaving a stale Kind cached forever. Same file_url-first
-                // classification as bootstrap/DownloadPubfileRawAsync.
-                PublishedFileDetails freshDetails = null;
-
-                if (isNew || kind != WorkshopItemKind.ChunkBased)
+                // A sweep-listed item already carries its full details. GetItemChanges doesn't
+                // return a title, file_url, or anything else that classifies the item, so
+                // re-classifying costs an extra round-trip - only worth paying for items we've
+                // never seen before, OR ones not already confirmed ChunkBased. That second case
+                // matters: an ancient/direct-URL item could conceivably be replaced by a
+                // chunk-based one on some future update (unconfirmed either way - not something to
+                // assume won't happen), and a ChunkBased item is for all practical purposes never
+                // going to revert to ancient - so re-checking anything not already confirmed
+                // ChunkBased is what actually catches that transition instead of leaving a stale
+                // Kind cached forever.
+                if (details == null && (isNew || kind != WorkshopItemKind.ChunkBased))
                 {
                     try
                     {
-                        freshDetails = await steam3.GetPublishedFileDetails(change.published_file_id);
-                        title = freshDetails?.title;
-                        fileUrl = freshDetails?.file_url;
-                        kind = !string.IsNullOrEmpty(fileUrl) ? WorkshopItemKind.AncientUgc : WorkshopItemKind.ChunkBased;
+                        details = await steam3.GetPublishedFileDetails(c.PublishedFileId);
                     }
                     catch
                     {
@@ -706,33 +824,46 @@ namespace DepotDownloader
                     }
                 }
 
-                title ??= $"unknown_{change.published_file_id}";
+                if (details != null)
+                {
+                    title = details.title;
+                    kind = ClassifyKind(details);
+                    fileUrl = kind == WorkshopItemKind.AncientUgc ? details.file_url : null;
+                }
 
-                // GetItemChanges' own manifest_id is only trustworthy as a "did content actually
-                // move" shortcut for a confirmed ChunkBased item - for AncientUgc/Unknown, the
-                // field's meaning under a direct-URL item isn't confirmed (see WorkshopItemKind),
-                // so always re-check instead. DownloadPubfileRawAsync's own TimeUpdated-based
-                // sidecar for ancient items already makes a no-op re-check cheap when nothing
-                // actually changed.
+                title ??= $"unknown_{c.PublishedFileId}";
+
+                // The manifest ID is only trustworthy as a "did content actually move" shortcut
+                // for a confirmed ChunkBased item - for AncientUgc/Unknown, the field's meaning
+                // under a direct-URL item isn't confirmed (see WorkshopItemKind), so always
+                // re-check instead. DownloadPubfileRawAsync's own TimeUpdated-based sidecar for
+                // ancient items already makes a no-op re-check cheap when nothing actually changed.
                 var skip = kind == WorkshopItemKind.ChunkBased
                     && existing != null
-                    && existing.ManifestId == change.manifest_id;
+                    && existing.ManifestId == c.ManifestId;
 
                 // History carried forward, not reset - a fresh fetch below (unless -shallow)
                 // overwrites both the entries and these two fields for real; -shallow explicitly
                 // marks incomplete instead, even if it happened to look complete before (a
                 // reported change is itself reason enough not to trust the old history anymore).
+                // Removal state: whatever this item just did, it still exists, so Deleted clears;
+                // Banned/Visibility come from fresh details when there are any, and otherwise keep
+                // what "workshop refresh" last found rather than resetting it.
                 var newItem = new WorkshopCatalogItem
                 {
-                    PublishedFileId = change.published_file_id,
+                    PublishedFileId = c.PublishedFileId,
                     Title = title,
                     Kind = kind,
                     FileUrl = fileUrl,
-                    ManifestId = change.manifest_id,
-                    TimeUpdated = change.time_updated,
+                    ManifestId = c.ManifestId,
+                    TimeUpdated = c.TimeUpdated,
                     LastSeenAt = catalog.LastPolledAt,
                     HistoryCount = existing?.HistoryCount ?? 0,
                     HistoryComplete = !shallow && (existing?.HistoryComplete ?? false),
+                    Banned = details?.banned ?? existing?.Banned ?? false,
+                    BanReason = details != null ? (string.IsNullOrEmpty(details.ban_reason) ? null : details.ban_reason) : existing?.BanReason,
+                    Visibility = details?.visibility ?? existing?.Visibility ?? 0u,
+                    Deleted = false,
                 };
                 catalog.UpsertItem(newItem);
 
@@ -741,20 +872,29 @@ namespace DepotDownloader
                     // Steam counted it as "changed" (could be a metadata-only edit) but the
                     // manifest we'd archive by didn't move - nothing new to download, and (since
                     // nothing about the archived content changed) nothing new to backfill either.
+                    metadataOnly++;
                     continue;
                 }
 
-                Console.WriteLine($"  {(isNew ? "NEW" : "CHANGED")} {change.published_file_id} \"{SanitizeTitleForDisplay(title)}\" [{kind}]");
+                if (isNew)
+                {
+                    newCount++;
+                }
+                else
+                {
+                    changedCount++;
+                }
+                Console.WriteLine($"  {(isNew ? "NEW" : "CHANGED")} {c.PublishedFileId} \"{SanitizeTitleForDisplay(title)}\" [{kind}]");
 
-                // Full history by default - GetItemChanges only ever says "this changed since X,"
-                // never how many times or through what intermediate versions, so without this an
-                // item that updated more than once between polls would silently lose everything
-                // but its latest state. No incremental fetch exists (see ReplaceHistory) - this
-                // always re-fetches and overwrites the whole list, whether or not it was already
-                // complete.
+                // Full history by default - a listing or GetItemChanges only ever shows an item's
+                // current state, never how many times or through what intermediate versions it
+                // changed, so without this an item that updated more than once between polls would
+                // silently lose everything but its latest state. No incremental fetch exists (see
+                // ReplaceHistory) - this always re-fetches and overwrites the whole list, whether or
+                // not it was already complete.
                 if (!shallow)
                 {
-                    await FetchAndRecordHistoryAsync(catalog, change.published_file_id);
+                    await FetchAndRecordHistoryAsync(catalog, c.PublishedFileId);
                     await Task.Delay(WorkshopApiPacingDelay);
                 }
 
@@ -772,26 +912,26 @@ namespace DepotDownloader
                         // uses, not a hand-rolled DownloadAppRawAsync call - it does its own
                         // file_url/hcontent_file dispatch internally, so both ChunkBased and
                         // AncientUgc items land correctly without duplicating that logic here.
-                        // Reuse freshDetails when the reclassification step above already
-                        // fetched it, rather than fetching the same PublishedFileDetails twice.
-                        // manifestsOnly maps to RawDownloadOptions.DryRun - manifest-only for
-                        // ChunkBased, metadata-logged-not-fetched for AncientUgc (see
+                        // Reuse details when the listing or the reclassification step above
+                        // already has them, rather than fetching the same PublishedFileDetails
+                        // twice. manifestsOnly maps to RawDownloadOptions.DryRun - manifest-only
+                        // for ChunkBased, metadata-logged-not-fetched for AncientUgc (see
                         // DownloadWebFileToUGCAsync).
                         var options = new RawDownloadOptions { OutputRoot = outputRoot, DryRun = manifestsOnly };
-                        if (freshDetails != null)
+                        if (details != null)
                         {
-                            await DownloadPubfileRawAsync(change.published_file_id, freshDetails, options);
+                            await DownloadPubfileRawAsync(c.PublishedFileId, details, options);
                         }
                         else
                         {
-                            await DownloadPubfileRawAsync(change.published_file_id, options);
+                            await DownloadPubfileRawAsync(c.PublishedFileId, options);
                         }
                         downloaded++;
                     }
                     catch (Exception ex)
                     {
                         failed++;
-                        Console.WriteLine($"    ERROR downloading {change.published_file_id}: {ex.Message}");
+                        Console.WriteLine($"    ERROR downloading {c.PublishedFileId}: {ex.Message}");
                     }
                 }
                 else
@@ -800,15 +940,22 @@ namespace DepotDownloader
                 }
             }
 
-            // Nothing below this point runs for -dry-run: no watermark advance, no backfill
+            // Nothing below this point runs for -dry-run: no mark/watermark advance, no backfill
             // sweep, no meta save - a dry run must leave the catalog byte-for-byte as it found
             // it, or a later real poll could silently never re-see (and so never archive)
             // whatever this one "previewed."
             if (!dryRun)
             {
-                // Advance only to what GetItemChanges itself reported, never to "now" - so a poll
-                // can never silently skip a window it didn't actually ask Steam about.
-                catalog.LastWatermark = body.update_time;
+                // Only reached once discovery fully succeeded - see SweepForChangesAsync/
+                // ListItemChangesAsync for what each mark means.
+                if (itemChanges)
+                {
+                    catalog.LastWatermark = newMark;
+                }
+                else
+                {
+                    catalog.SweepMark = newMark;
+                }
                 catalog.SaveMeta();
 
                 // Beyond this poll's own delta, also chip away at any items still marked
@@ -822,9 +969,13 @@ namespace DepotDownloader
             }
 
             var verb = catalogOnly ? "Recorded catalog entries for" : manifestsOnly ? "Recorded manifests/metadata for" : "Downloaded";
+            var counts = $"{newCount:N0} new, {changedCount:N0} changed, {metadataOnly:N0} metadata-only";
+            var advanced = itemChanges
+                ? $"Watermark advanced to {FormatUnixTime(catalog.LastWatermark)}."
+                : $"Sweep mark advanced to {FormatUnixTime(catalog.SweepMark)} - the next poll lists from there minus its overlap.";
             Console.WriteLine(dryRun
-                ? $"Dry run: {body.workshop_items.Count:N0} item(s) would be checked/downloaded - nothing was actually fetched."
-                : $"{verb} {downloaded:N0} item(s), {failed:N0} failed. Watermark advanced to {catalog.LastWatermark} ({DateTimeOffset.FromUnixTimeSeconds(catalog.LastWatermark):u}).");
+                ? $"Dry run: {counts} - nothing was fetched or recorded, and the {(itemChanges ? "watermark" : "sweep mark")} was not advanced."
+                : $"{counts}. {verb} {downloaded:N0} item(s), {failed:N0} failed. {advanced}");
 
             return failed > 0 ? 1 : 0;
         }
@@ -842,7 +993,7 @@ namespace DepotDownloader
         /// three RPCs this feature can be built on.
         ///
         /// Confirmed anonymous-friendly (same GetDetails RPC ad-hoc "download -workshop" already
-        /// uses without a login) - unlike "poll", this never requires -username. Purely a metadata
+        /// uses without a login) - this never requires -username. Purely a metadata
         /// pass - it never downloads content, same as bootstrap's own plain default.
         /// </summary>
         public static async Task<int> RefreshWorkshopCatalogAsync(uint appId, string outputRoot, HashSet<ulong> onlyIds, uint batchSize, uint maxItems)
@@ -1055,11 +1206,19 @@ namespace DepotDownloader
             if (catalog.LastPolledAt != 0)
             {
                 Console.WriteLine($"Last polled:        {DateTimeOffset.FromUnixTimeSeconds(catalog.LastPolledAt):u} (result: {catalog.LastPollResult})");
-                Console.WriteLine($"Current watermark:  {catalog.LastWatermark} ({DateTimeOffset.FromUnixTimeSeconds(catalog.LastWatermark):u})");
             }
             else
             {
                 Console.WriteLine("Last polled:        never");
+            }
+
+            Console.WriteLine(catalog.SweepMark != 0
+                ? $"Poll sweep mark:    {FormatUnixTime(catalog.SweepMark)} - the next poll lists from here minus its overlap (default {DefaultPollOverlapHours}h)"
+                : "Poll sweep mark:    none yet - the first poll lists from this catalog's bootstrap start");
+
+            if (catalog.LastWatermark != 0)
+            {
+                Console.WriteLine($"-item-changes mark: {FormatUnixTime(catalog.LastWatermark)} (GetItemChanges' own watermark - only 'poll -item-changes' uses it)");
             }
 
             return 0;

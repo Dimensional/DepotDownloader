@@ -386,17 +386,19 @@ namespace DepotDownloader
         /// <summary>
         /// PublishedFile.GetItemChanges - a per-app delta feed ("items updated since
         /// last_time_updated", each with its new manifest_id already attached - no per-item
-        /// follow-up needed). What "workshop poll" calls on every run.
+        /// follow-up needed). Only used by "workshop poll -item-changes" now - plain poll lists
+        /// via QueryFiles' date filters instead, because of the blind spot below.
         ///
-        /// Two access restrictions, both confirmed empirically against a real account/app (depot
-        /// 4000 - see README):
+        /// Restrictions, all confirmed empirically (see README):
         ///  - Anonymous login always gets EResult.AccessDenied. An authenticated login is required.
         ///  - Even authenticated, lastTimeUpdated can't be arbitrarily old: confirmed working 96
-        ///    hours back, confirmed EResult.Ignored 7 days back (with num_items_max varied down to
-        ///    50, ruling out a result-size cap - this is a hard elapsed-time cutoff). The exact
-        ///    boundary within that range, and whether it's fixed or scales with an app's own
-        ///    churn, is not pinned down - treat Ignored as "watermark too stale, re-bootstrap this
-        ///    app" rather than a transient failure worth retrying as-is.
+        ///    hours back, confirmed EResult.Ignored 7 days back on depot 4000 (with num_items_max
+        ///    varied down to 50, ruling out a result-size cap). On app 4704690 it returned Ignored
+        ///    even for a watermark seconds old - cause unknown.
+        ///  - It never reports a brand-new item that hasn't been updated since creation: of 13,615
+        ///    GMod items created across a month of working polls, poll recorded 3,100 - every one
+        ///    updated after creation - and none of the 9,753 that weren't. Same blind spot as
+        ///    QueryFiles' date_range_updated (see QueryFiles).
         /// The Result is returned to the caller unwrapped (not thrown on non-OK) specifically so
         /// "workshop poll" can branch on Ignored vs. a real error.
         /// </summary>
@@ -445,10 +447,18 @@ namespace DepotDownloader
         /// descending (newest-published first) - direction doesn't matter for this property, only
         /// that the sort key itself is immutable does.
         ///
-        /// "workshop poll" is comparatively immune to either ordering hazard regardless, since
-        /// GetItemChanges works off a time watermark rather than a position in any ranking -
-        /// running poll after (or soon after starting) a bootstrap is a second, independent way to
-        /// close any gap the chosen query_type's ranking might still leave.
+        /// "workshop poll" is comparatively immune to either ordering hazard regardless, since it
+        /// filters by time (dateRangeCreatedStart/dateRangeUpdatedStart below) rather than relying
+        /// on a position in any ranking - running poll after (or soon after starting) a bootstrap
+        /// is a second, independent way to close any gap the chosen query_type's ranking might
+        /// still leave.
+        ///
+        /// Confirmed live (apps 4000 and 4704690): an item never updated since its creation
+        /// (time_updated == time_created) has no "last updated" value in whatever index backs
+        /// ranking 21 and date_range_updated - ranking 21 sorts every such item to the very end,
+        /// and date_range_updated excludes them outright. On a busy workshop that's most brand-new
+        /// items (88 of GMod's newest 100 at the time), so "updated since X" alone never finds new
+        /// items - pair it with date_range_created for those.
         /// </summary>
         /// <param name="dateRangeCreatedEnd">
         /// Optional upper bound on time_created (the request's own date_range_created.timestamp_end
@@ -472,7 +482,19 @@ namespace DepotDownloader
         /// lookup. Passing ["incompatible"] here is what actually surfaces that class - "workshop
         /// bootstrap" runs a second pass with this set specifically to catch it (see README).
         /// </param>
-        public async Task<(EResult Result, CPublishedFile_QueryFiles_Response Body)> QueryFiles(uint appId, string cursor, uint numPerPage, uint queryType = 1, uint? dateRangeCreatedEnd = null, IReadOnlyCollection<string> requiredFlags = null)
+        /// <param name="dateRangeCreatedStart">
+        /// Lower bound on time_created (date_range_created.timestamp_start). Unlike
+        /// dateRangeCreatedEnd above, this is a fixed bound for a whole walk, so it's safe (and
+        /// necessary) to pass on every page alongside the cursor - body.total stays constant.
+        /// Confirmed honored server-side: "workshop poll" uses it to list just the items created
+        /// since its window start, including never-updated ones date_range_updated can't see.
+        /// </param>
+        /// <param name="dateRangeUpdatedStart">
+        /// Lower bound on time_updated (date_range_updated.timestamp_start), passed on every page
+        /// for the same reason. Confirmed honored server-side, under ranking 1 as well as 21, and
+        /// combined with requiredFlags - but blind to never-updated items (see summary above).
+        /// </param>
+        public async Task<(EResult Result, CPublishedFile_QueryFiles_Response Body)> QueryFiles(uint appId, string cursor, uint numPerPage, uint queryType = 1, uint? dateRangeCreatedEnd = null, IReadOnlyCollection<string> requiredFlags = null, uint? dateRangeCreatedStart = null, uint? dateRangeUpdatedStart = null)
         {
             var request = new CPublishedFile_QueryFiles_Request
             {
@@ -483,9 +505,24 @@ namespace DepotDownloader
                 return_details = true,
             };
 
-            if (dateRangeCreatedEnd is > 0)
+            // Only the bounds actually asked for are set - an explicitly-set 0 is serialized as a
+            // present field, unlike one never assigned.
+            if (dateRangeCreatedStart is > 0 || dateRangeCreatedEnd is > 0)
             {
-                request.date_range_created = new CPublishedFile_QueryFiles_Request.DateRange { timestamp_end = dateRangeCreatedEnd.Value };
+                request.date_range_created = new CPublishedFile_QueryFiles_Request.DateRange();
+                if (dateRangeCreatedStart is > 0)
+                {
+                    request.date_range_created.timestamp_start = dateRangeCreatedStart.Value;
+                }
+                if (dateRangeCreatedEnd is > 0)
+                {
+                    request.date_range_created.timestamp_end = dateRangeCreatedEnd.Value;
+                }
+            }
+
+            if (dateRangeUpdatedStart is > 0)
+            {
+                request.date_range_updated = new CPublishedFile_QueryFiles_Request.DateRange { timestamp_start = dateRangeUpdatedStart.Value };
             }
 
             if (requiredFlags is { Count: > 0 })

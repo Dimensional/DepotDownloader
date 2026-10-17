@@ -638,8 +638,6 @@ depotdownloader help reconstruct
 
 **Experimental.** `bootstrap`, `poll`, and `refresh` have only been validated against a small number
 of apps so far - behavior on an untested app's workshop may differ from what's documented below.
-`poll` in particular is confirmed unreliable on at least one app for reasons still unresolved (see
-Poll below); treat its output as a hint to verify, not a guarantee.
 
 The single place all workshop acquisition and tracking happens - replaces the old workshop-related
 `download` options (moved here as `workshop download`) and adds automatic update tracking across
@@ -651,10 +649,11 @@ The single place all workshop acquisition and tracking happens - replaces the ol
 Built on SteamKit2 unified-messages calls, not the public Steamworks Web API:
 
 - **`PublishedFile.QueryFiles`** - the same backend the workshop browse page itself uses. Works
-  anonymously. Used by `bootstrap` to walk an entire app's workshop once.
+  anonymously. Used by `bootstrap` to walk an entire app's workshop once, and by `poll` (with its
+  created/updated date filters) to list just what changed since.
 - **`PublishedFile.GetItemChanges`** - a per-app delta feed: "everything changed since this
-  timestamp." Used by `poll`. **Requires an authenticated login - anonymous returns
-  `EResult.AccessDenied`.**
+  timestamp." Only used by `poll -item-changes`. **Requires an authenticated login - anonymous
+  returns `EResult.AccessDenied`.**
 - **`PublishedFile.GetChangeHistory`** - one item's full changelog. Works anonymously. Used by
   `download -history`.
 
@@ -704,11 +703,9 @@ Even under the safe ranking, a single bootstrap pass can still miss two kinds of
 - A brand-new item published after the scan has already passed the "newest" end of the ranking.
 - An existing item transiently absent from one page's results at the moment the cursor reaches it.
 
-Both are recovered by running `poll` regularly after bootstrap - a previously-missed item surfaces
-there as an ordinary new entry, as long as poll runs within the window described under Poll below.
-This is why bootstrap-once-then-poll-regularly is the intended usage, not bootstrap alone. If `poll`
-can't be relied on for a given app, `bootstrap -catch-up` (see Options below) closes the same two
-gaps without it.
+Both are recovered by running `poll` after bootstrap - its first run lists everything created or
+updated since bootstrap started, so a previously-missed item surfaces there as an ordinary new entry.
+This is why bootstrap-once-then-poll-regularly is the intended usage, not bootstrap alone.
 
 **A third, different gap: items Steam gates behind `required_flags`** (e.g. `incompatible`) are
 invisible to a plain `QueryFiles` request no matter how many times it's re-run, even though the item
@@ -718,8 +715,7 @@ using its own independent cursor (`IncompatibleWalkCursor`). This pass always re
 `bootstrap` invocation rather than running once - an item's incompatible status can change over time
 (e.g. after a game update), so a one-shot "done" flag would stop catching newly-flagged items.
 `IncompatibleWalkCompleted` (shown in `workshop status`) only indicates it has run at least once.
-`poll`'s `GetItemChanges` has no equivalent flag field, so whether its own deltas cover a later
-compatible→incompatible transition is unknown.
+`poll` runs the same `required_flags` pass for items created or updated inside its own window.
 
 A `QueryFiles` result can occasionally carry no title, no manifest handle, and no update time at
 once - not a normal item, and not independently resolvable via `GetDetails` either. Such results are
@@ -774,26 +770,36 @@ discovered and logged but not necessarily re-downloaded.
 
 ### Poll
 
-Cheap and repeatable - the same command serves both a manual checkup and a scheduled task/cron. Asks
-`GetItemChanges` for everything changed since the catalog's watermark, then archives just those items
-the same way `download -app` would. The watermark only ever advances to what `GetItemChanges` itself
-reports back, never to "now."
+Cheap and repeatable - the same command serves both a manual checkup and a scheduled task/cron. Lists
+every item created or updated since the last poll, then archives just the new and changed ones the
+same way `download -app` would. Works anonymously, and there's no limit on how long you can go
+between polls - a longer gap just means more to list.
 
-Pass **`-catalog-only`** to update the catalog (and history) for every changed item without archiving
-any content - the poll equivalent of bootstrap's own plain default, scoped to just the current delta.
+How the window works:
+- It uses `QueryFiles` with a created-since filter and an updated-since filter, each run once plain
+  and once for `incompatible`-flagged items. Both filters are needed: an item that hasn't been
+  updated since it was created never matches "updated since", and on a busy workshop that's most new
+  items.
+- Each poll starts 48 hours (`-overlap-hours`) before the previous poll's start, because an item can
+  show up in listings hours after its own creation or update time. Re-listed items that are already
+  current are skipped with no further requests.
+- The window only moves forward after every listing finished. A poll that fails or is interrupted
+  leaves it alone, so the next one asks for the same window again instead of leaving a gap.
+- A catalog's first poll starts at its bootstrap, so it picks up everything since then. On a busy
+  workshop that can be thousands of items - try `-dry-run` or `-catalog-only` first.
+- `-since <date>` lists from an earlier point for one run, e.g. as an occasional deeper re-check.
 
-**`GetItemChanges` can return `EResult.Ignored` for more than one reason, and "watermark too old" is
-not always it.**
-- Anonymous login always returns `AccessDenied`.
-- On a high-churn app, a watermark more than roughly 4-7 days old is rejected this way - **poll at
-  least every 2-3 days** to stay inside the working range.
-- On at least one smaller/younger app, `Ignored` has also been observed for a watermark just seconds
-  old. Steam's response doesn't say which situation applies, so `poll` doesn't assert a specific
-  cause on `Ignored` - it exits (code 2) rather than retrying the identical request.
-- There is currently no way to force a different outcome once this happens: a plain `bootstrap`
-  re-run does not touch the watermark on an already-complete catalog. `bootstrap -catch-up` (see
-  Options below) checks for new items without depending on `poll` at all; `refresh` keeps
-  already-known items correct regardless of what `poll` reports.
+Pass **`-catalog-only`** to update the catalog (and history) for every new/changed item without
+archiving any content - the poll equivalent of bootstrap's own plain default.
+
+Removals don't show up in a listing at all - a deleted, banned, or private item just stops appearing.
+Use `refresh` for those.
+
+**`-item-changes`** uses the old `GetItemChanges` feed instead of listing, for comparison. It needs an
+authenticated login, it never reports a new item that hasn't been updated since it was created, and
+it returns `EResult.Ignored` (exit code 2) for a starting point more than roughly 4-7 days old on a
+busy app - and on at least one app even for a starting point seconds old. It keeps its own watermark,
+separate from plain poll's.
 
 ### Refresh
 
@@ -801,7 +807,7 @@ Re-verifies already-known catalog entries directly against `PublishedFile.GetDet
 catches what `bootstrap`/`poll` can't: correcting a stale title/kind/manifest handle, and positively
 detecting a removal (banned, or made private/unlisted by its author) - both simply stop appearing in
 `QueryFiles`/`GetItemChanges` otherwise, with no signal distinguishing why. Catalog-only, like
-`bootstrap`'s plain default - never downloads content. Confirmed anonymous-friendly, unlike `poll`.
+`bootstrap`'s plain default - never downloads content. Works anonymously.
 
 `-batch-size` (default 100) controls IDs per `GetDetails` request. Two fields exist solely for this
 command: `Banned`/`BanReason` and `Visibility` (0=Public, 1=FriendsOnly, 2=Private, 3=Unlisted) -
@@ -825,10 +831,6 @@ distinctly from a banned/private one (`EResult.FileNotFound` vs. a normal resolv
 - `-shallow` - Skip fetching full `GetChangeHistory` per item during this walk
 - `-backfill-batch <n>` - Items to backfill full history for per run (default 200; 0 disables)
 - `-reset-cursor` - Recovery only, not needed for a normal resume
-- `-catch-up` - Check for new items without relying on `poll`. Walks fresh from the newest item and
-  stops as soon as it reaches one already in the catalog - cheap when nothing's new (one page).
-  Requires a catalog pinned to query-type 1 (the default); only meaningful once the main walk is
-  already complete.
 
 **download:**
 - `-history` - Every historical version, not just current
@@ -838,21 +840,25 @@ distinctly from a banned/private one (`EResult.FileNotFound` vs. a normal resolv
   ancient UGC
 
 **poll:**
-- `-dry-run` - Report what would be checked/downloaded - fetches and changes nothing, safe to
-  run repeatedly before a real poll
-- `-catalog-only` - Update the catalog for every changed item without archiving content
+- `-dry-run` - Report what would be checked/downloaded - lists, but fetches and changes nothing
+  else; safe to run repeatedly before a real poll
+- `-catalog-only` - Update the catalog for every new/changed item without archiving content
 - `-manifests-only` - Same meaning as on `download` above
 - `-shallow` - Same meaning as on `bootstrap` above - also skips this run's `-backfill-batch` sweep
-- `-backfill-batch <n>` - Same meaning as on `bootstrap` above (runs after this poll's own delta)
+- `-backfill-batch <n>` - Same meaning as on `bootstrap` above (runs after this poll's own items)
+- `-since <date>` - List from this point for one run (`yyyy-mm-dd`, read as UTC, or a Unix
+  timestamp) instead of the last poll's start minus the overlap
+- `-overlap-hours <n>` - How far before the last poll's start to re-list (default 48)
+- `-item-changes` - Use `GetItemChanges` instead of listing (see Poll above)
 
 **refresh:**
 - `-only <id,id2,...>` - Restrict to specific catalog IDs instead of the whole thing
 - `-batch-size <n>` - IDs per `GetDetails` request (default 100)
 - `-max-items <n>` - Stop after checking this many IDs (resumable)
 
-**Common options:** `-output <dir>`, `-username`/`-remember-password` (bootstrap, refresh, and
-ad-hoc `download` can run anonymously; catalog-driven `download` inherits whatever the items
-themselves require; `poll` requires an authenticated login).
+**Common options:** `-output <dir>`, `-username`/`-remember-password` (everything here runs
+anonymously except `poll -item-changes`; catalog-driven `download` inherits whatever the items
+themselves require).
 
 ### Inspecting a catalog
 
@@ -872,7 +878,8 @@ what's stored in the catalog stays byte-for-byte accurate to what Steam returned
 ### Planned: standalone poll daemon
 
 `poll` today is a single non-interactive pass with a clean exit code (0 success, 1 error, 2 =
-`EResult.Ignored`), schedulable as-is via cron/Task Scheduler/systemd for any one app. A dedicated
+`EResult.Ignored` under `-item-changes`), schedulable as-is via cron/Task Scheduler/systemd for any
+one app. A dedicated
 process for tracking many apps at once on their own schedule is planned but not built yet.
 
 **Examples:**
@@ -882,7 +889,8 @@ depotdownloader workshop bootstrap -app 4000 -max-items 500 -manifests-only  # s
 depotdownloader workshop download -app 4000                                 # current version of everything tracked
 depotdownloader workshop download -app 4000 -history -only 2956730580       # full version history, one item
 depotdownloader workshop download -workshop 123456 789012                   # ad-hoc, no bootstrap needed
-depotdownloader workshop poll -app 4000 -username myaccount -remember-password
+depotdownloader workshop poll -app 4000                                      # new/changed since the last poll
+depotdownloader workshop poll -app 4000 -catalog-only -since 2026-09-01      # deeper re-check, catalog only
 depotdownloader workshop refresh -app 4000                                   # re-verify/correct everything known
 depotdownloader workshop status -app 4000
 depotdownloader workshop status -app 4000 -list -kind ancient -limit 50      # inspect the actual items

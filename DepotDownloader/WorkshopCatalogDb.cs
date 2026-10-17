@@ -53,8 +53,8 @@ namespace DepotDownloader
     /// place. HistoryComplete is NOT a "verified forever, stop checking" flag - it only records
     /// whether THE LAST TIME this item was touched by bootstrap/poll, that touch fetched full
     /// history or was "-shallow". It never gates whether a future touch re-fetches: bootstrap
-    /// fetches for every genuinely new item, and poll fetches for every item its own
-    /// GetItemChanges delta reports changed, regardless of this flag's current value - so a change
+    /// fetches for every genuinely new item, and poll fetches for every item it finds new or
+    /// changed, regardless of this flag's current value - so a change
     /// is never missed because history looked "complete" already. Its only two actual jobs are
     /// (1) telling the backfill sweep which items still need a first/catch-up fetch, and (2)
     /// surfacing in "status"/"status -list" which items' history might be incomplete.
@@ -64,8 +64,8 @@ namespace DepotDownloader
         public ulong PublishedFileId { get; set; }
 
         /// <summary>Cached here specifically so polling never needs a per-item GetDetails
-        /// round-trip just to build a download filename - GetItemChanges (the poll RPC) does not
-        /// return it.</summary>
+        /// round-trip just to build a download filename - GetItemChanges ("poll -item-changes")
+        /// does not return it.</summary>
         public string Title { get; set; }
 
         /// <summary>Meaningful only when Kind == ChunkBased - a real depot manifest ID for
@@ -200,6 +200,15 @@ namespace DepotDownloader
 
         public bool IncompatibleWalkCompleted { get; set; }
 
+        /// <summary>Unix time (local clock) the last fully-completed "workshop poll" sweep
+        /// started - the next sweep lists everything created or updated since this minus its
+        /// overlap. Set only after every one of a sweep's listing passes finished, so an
+        /// interrupted or failed sweep leaves it alone and the next run re-asks the same window.
+        /// 0 = never swept; the first sweep starts from BootstrapStartedAt instead. Separate from
+        /// LastWatermark, which is GetItemChanges' own server-reported time ("poll -item-changes"
+        /// only).</summary>
+        public uint SweepMark { get; set; }
+
         private WorkshopCatalogDb(SqliteConnection connection, uint appId)
         {
             _connection = connection;
@@ -252,7 +261,8 @@ namespace DepotDownloader
                         LastPollResult TEXT,
                         LastRecordedCreationTime INTEGER NOT NULL DEFAULT 0,
                         IncompatibleWalkCursor TEXT NOT NULL DEFAULT '*',
-                        IncompatibleWalkCompleted INTEGER NOT NULL DEFAULT 0
+                        IncompatibleWalkCompleted INTEGER NOT NULL DEFAULT 0,
+                        SweepMark INTEGER NOT NULL DEFAULT 0
                     );
 
                     CREATE TABLE IF NOT EXISTS items (
@@ -307,8 +317,8 @@ namespace DepotDownloader
                 }
             }
 
-            // Migration for a catalog created before IncompatibleWalkCursor/IncompatibleWalkCompleted
-            // existed - "CREATE TABLE IF NOT EXISTS" above is a no-op against an already-existing
+            // Migration for a catalog created before IncompatibleWalkCursor/IncompatibleWalkCompleted/
+            // SweepMark existed - "CREATE TABLE IF NOT EXISTS" above is a no-op against an already-existing
             // table, so an existing file needs these columns added explicitly. SQLite has no
             // "ADD COLUMN IF NOT EXISTS", so check via PRAGMA table_info first.
             var existingColumns = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -335,6 +345,13 @@ namespace DepotDownloader
                 alter.CommandText = "ALTER TABLE catalog_meta ADD COLUMN IncompatibleWalkCompleted INTEGER NOT NULL DEFAULT 0";
                 alter.ExecuteNonQuery();
             }
+
+            if (!existingColumns.Contains("SweepMark"))
+            {
+                using var alter = connection.CreateCommand();
+                alter.CommandText = "ALTER TABLE catalog_meta ADD COLUMN SweepMark INTEGER NOT NULL DEFAULT 0";
+                alter.ExecuteNonQuery();
+            }
         }
 
         private void LoadMeta()
@@ -343,7 +360,7 @@ namespace DepotDownloader
             cmd.CommandText = """
                 SELECT QueryType, BootstrapCompleted, BootstrapCursor, BootstrapStartedAt, BootstrapCompletedAt,
                        BootstrapTotalAsOfStart, LastWatermark, LastPolledAt, LastPollResult, LastRecordedCreationTime,
-                       IncompatibleWalkCursor, IncompatibleWalkCompleted
+                       IncompatibleWalkCursor, IncompatibleWalkCompleted, SweepMark
                 FROM catalog_meta LIMIT 1
                 """;
             using var reader = cmd.ExecuteReader();
@@ -360,6 +377,7 @@ namespace DepotDownloader
             LastRecordedCreationTime = (uint)reader.GetInt64(9);
             IncompatibleWalkCursor = reader.GetString(10);
             IncompatibleWalkCompleted = reader.GetInt64(11) != 0;
+            SweepMark = (uint)reader.GetInt64(12);
         }
 
         /// <summary>Flushes the in-memory meta fields (bootstrap cursor, poll watermark, etc.) to
@@ -377,7 +395,8 @@ namespace DepotDownloader
                     BootstrapTotalAsOfStart = @bootstrapTotalAsOfStart, LastWatermark = @lastWatermark,
                     LastPolledAt = @lastPolledAt, LastPollResult = @lastPollResult,
                     LastRecordedCreationTime = @lastRecordedCreationTime,
-                    IncompatibleWalkCursor = @incompatibleWalkCursor, IncompatibleWalkCompleted = @incompatibleWalkCompleted
+                    IncompatibleWalkCursor = @incompatibleWalkCursor, IncompatibleWalkCompleted = @incompatibleWalkCompleted,
+                    SweepMark = @sweepMark
                 """;
             cmd.Parameters.AddWithValue("@queryType", QueryType);
             cmd.Parameters.AddWithValue("@bootstrapCompleted", BootstrapCompleted ? 1 : 0);
@@ -391,6 +410,7 @@ namespace DepotDownloader
             cmd.Parameters.AddWithValue("@lastRecordedCreationTime", LastRecordedCreationTime);
             cmd.Parameters.AddWithValue("@incompatibleWalkCursor", IncompatibleWalkCursor ?? "*");
             cmd.Parameters.AddWithValue("@incompatibleWalkCompleted", IncompatibleWalkCompleted ? 1 : 0);
+            cmd.Parameters.AddWithValue("@sweepMark", SweepMark);
             cmd.ExecuteNonQuery();
         }
 
@@ -508,11 +528,12 @@ namespace DepotDownloader
             }
         }
 
-        /// <summary>Always includes the full History list (unlike QueryList's default) - every
-        /// caller of this is a single bounded lookup (poll's per-changed-item carry-forward,
-        /// refresh's per-batch lookup), never a whole-catalog scan, so the extra join here costs
-        /// nothing at the scale it's actually used at.</summary>
-        public bool TryGetItem(ulong publishedFileId, out WorkshopCatalogItem item)
+        /// <summary>Includes the full History list by default (unlike QueryList's default) - most
+        /// callers are a single bounded lookup (refresh's per-batch lookup), so the extra query
+        /// costs nothing at that scale. Poll passes includeHistory: false - it checks every item
+        /// its sweep lists (tens of thousands on a first sweep of a busy workshop) and only ever
+        /// carries HistoryCount/HistoryComplete forward, never the entries themselves.</summary>
+        public bool TryGetItem(ulong publishedFileId, out WorkshopCatalogItem item, bool includeHistory = true)
         {
             using (var cmd = _connection.CreateCommand())
             {
@@ -532,7 +553,10 @@ namespace DepotDownloader
                 item = ReadItem(reader);
             }
 
-            item.History = LoadHistory(publishedFileId);
+            if (includeHistory)
+            {
+                item.History = LoadHistory(publishedFileId);
+            }
             return true;
         }
 

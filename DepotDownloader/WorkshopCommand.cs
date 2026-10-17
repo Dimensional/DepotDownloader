@@ -3,6 +3,7 @@
 
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.IO;
 using System.Text.RegularExpressions;
 using System.Threading.Tasks;
@@ -76,9 +77,17 @@ namespace DepotDownloader
             var rememberPassword = parser.HasFlag("-remember-password");
             parser.WarnUnconsumed();
 
+            if (catchUp)
+            {
+                // Removed rather than left to WarnUnconsumed: silently ignoring it would run a full
+                // incompatible-items re-walk instead of what was asked for.
+                Console.WriteLine("-catch-up has been removed: 'workshop poll' now lists new and updated items directly - anonymously, and without the permanent gap an interrupted catch-up could leave. Run 'workshop poll -app <appid>' instead.");
+                return 1;
+            }
+
             if (appId == null)
             {
-                Console.WriteLine("Usage: depotdownloader workshop bootstrap -app <appid> [-page-size 100] [-max-items N] [-manifests-only] [-shallow] [-backfill-batch 200] [-reset-cursor] [-catch-up] [-output <dir>] [-username <user> [-remember-password]]");
+                Console.WriteLine("Usage: depotdownloader workshop bootstrap -app <appid> [-page-size 100] [-max-items N] [-manifests-only] [-shallow] [-backfill-batch 200] [-reset-cursor] [-output <dir>] [-username <user> [-remember-password]]");
                 return 1;
             }
 
@@ -89,7 +98,7 @@ namespace DepotDownloader
 
             try
             {
-                return await ContentDownloader.BootstrapWorkshopCatalogAsync(appId.Value, output, pageSize, maxItems, queryType, manifestsOnly, shallow, backfillBatch, resetCursor, catchUp);
+                return await ContentDownloader.BootstrapWorkshopCatalogAsync(appId.Value, output, pageSize, maxItems, queryType, manifestsOnly, shallow, backfillBatch, resetCursor);
             }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or SqliteException)
             {
@@ -113,6 +122,9 @@ namespace DepotDownloader
             var catalogOnly = parser.HasFlag("-catalog-only");
             var shallow = parser.HasFlag("-shallow");
             var backfillBatch = parser.Get<uint>(200, "-backfill-batch");
+            var sinceRaw = parser.Get<string>(null, "-since");
+            var overlapHours = parser.GetNullable<uint>("-overlap-hours");
+            var itemChanges = parser.HasFlag("-item-changes");
             var username = parser.Get<string>(null, "-username", "-user");
             var password = parser.Get<string>(null, "-password", "-pass");
             var rememberPassword = parser.HasFlag("-remember-password");
@@ -120,11 +132,24 @@ namespace DepotDownloader
 
             if (appId == null)
             {
-                Console.WriteLine("Usage: depotdownloader workshop poll -app <appid> [-dry-run | -manifests-only | -catalog-only] [-shallow] [-backfill-batch 200] [-output <dir>] [-username <user> [-remember-password]]");
+                Console.WriteLine("Usage: depotdownloader workshop poll -app <appid> [-dry-run | -manifests-only | -catalog-only] [-shallow] [-backfill-batch 200] [-since <yyyy-mm-dd|unix>] [-overlap-hours 48] [-item-changes] [-output <dir>] [-username <user> [-remember-password]]");
                 return 1;
             }
 
-            if (username == null)
+            if (itemChanges && (sinceRaw != null || overlapHours != null))
+            {
+                Console.WriteLine("Error: -since and -overlap-hours shape the listing sweep - -item-changes uses GetItemChanges' own watermark instead, so they can't be combined.");
+                return 1;
+            }
+
+            uint since = 0;
+            if (sinceRaw != null && !TryParseSince(sinceRaw, out since))
+            {
+                Console.WriteLine($"Error: -since '{sinceRaw}' isn't a date (e.g. 2026-09-05, read as UTC) or a Unix timestamp in the past.");
+                return 1;
+            }
+
+            if (itemChanges && username == null)
             {
                 Console.WriteLine("Note: GetItemChanges is confirmed to reject anonymous logins (EResult.AccessDenied). Proceeding anonymously anyway, but expect it to fail without -username.");
             }
@@ -136,7 +161,8 @@ namespace DepotDownloader
 
             try
             {
-                return await ContentDownloader.PollWorkshopCatalogAsync(appId.Value, output, dryRun, manifestsOnly, shallow, backfillBatch, catalogOnly);
+                return await ContentDownloader.PollWorkshopCatalogAsync(appId.Value, output, dryRun, manifestsOnly, shallow, backfillBatch, catalogOnly,
+                    itemChanges, since, overlapHours ?? ContentDownloader.DefaultPollOverlapHours);
             }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or SqliteException)
             {
@@ -147,6 +173,36 @@ namespace DepotDownloader
             {
                 LogOff(rememberPassword);
             }
+        }
+
+        /// <summary>"-since": a plain date (read as UTC midnight) or a raw Unix timestamp - must be
+        /// in the past, or the sweep would list nothing and still advance its mark.</summary>
+        private static bool TryParseSince(string raw, out uint since)
+        {
+            since = 0;
+            var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+            long value;
+
+            if (long.TryParse(raw, NumberStyles.None, CultureInfo.InvariantCulture, out var unix))
+            {
+                value = unix;
+            }
+            else if (DateTimeOffset.TryParse(raw, CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal, out var date))
+            {
+                value = date.ToUnixTimeSeconds();
+            }
+            else
+            {
+                return false;
+            }
+
+            if (value <= 0 || value >= now)
+            {
+                return false;
+            }
+
+            since = (uint)value;
+            return true;
         }
 
         private static async Task<int> RefreshAsync(string[] args)
@@ -176,7 +232,8 @@ namespace DepotDownloader
             }
 
             // Confirmed anonymous-friendly (same GetDetails RPC ad-hoc "download -workshop" already
-            // uses without a login) - -username is accepted but never required, unlike "poll".
+            // uses without a login) - -username is accepted but never required, unlike
+            // "poll -item-changes".
             if (!LogOn(username, password, rememberPassword))
             {
                 return 1;
@@ -462,12 +519,6 @@ namespace DepotDownloader
             Console.WriteLine("                     time_created already recorded so it re-enters near where the");
             Console.WriteLine("                     old cursor left off instead of from the newest item. Every");
             Console.WriteLine("                     already-recorded item is kept either way.");
-            Console.WriteLine("  -catch-up          Check for new items without relying on \"poll\". Walks fresh");
-            Console.WriteLine("                     from the newest item and stops as soon as it reaches one");
-            Console.WriteLine("                     already in the catalog - cheap in the common case (nothing");
-            Console.WriteLine("                     new costs one page). Only works on a catalog pinned to");
-            Console.WriteLine("                     query-type 1 (the default); only meaningful once the main");
-            Console.WriteLine("                     walk is already complete.");
             Console.WriteLine();
             Console.WriteLine("DOWNLOAD - the actual content-acquisition step, in two forms:");
             Console.WriteLine("  -app <appid>       Catalog-driven: walk an app's existing catalog (from bootstrap/");
@@ -492,23 +543,31 @@ namespace DepotDownloader
             Console.WriteLine("                     updates records, just skips the large/expensive payload");
             Console.WriteLine();
             Console.WriteLine("POLL - cheap and repeatable, whether run by hand as a one-off \"checkup\" or from a");
-            Console.WriteLine("       scheduled task/cron - the same command serves both. Asks GetItemChanges for");
-            Console.WriteLine("       everything changed since the catalog's watermark, and archives just those");
-            Console.WriteLine("       items the same way \"download -app\" would, so both chunk-based and ancient-");
-            Console.WriteLine("       UGC items land correctly without re-implementing that dispatch here.");
-            Console.WriteLine("       REQUIRES an authenticated login - anonymous is confirmed to be rejected.");
-            Console.WriteLine("       last_time_updated can't be arbitrarily old either - confirmed working 96h");
-            Console.WriteLine("       back, confirmed rejected (EResult.Ignored) 7 days back on a high-churn app;");
-            Console.WriteLine("       poll at least every couple of days. A rejected poll prints instructions to");
-            Console.WriteLine("       re-run bootstrap rather than treating it as a fatal error.");
-            Console.WriteLine("       Full history is fetched by default for every changed item, same reasoning as");
-            Console.WriteLine("       bootstrap's own -shallow above - GetItemChanges only ever says \"this changed");
-            Console.WriteLine("       since X,\" never how many times, so without it an item updated twice between");
-            Console.WriteLine("       two polls would silently lose the version in between. Cheap here since poll's");
-            Console.WriteLine("       delta set is normally a tiny fraction of the whole catalog.");
-            Console.WriteLine("  -dry-run           Report what would be checked/downloaded - fetches and changes");
-            Console.WriteLine("                     nothing: no catalog update, no watermark advance, no backfill");
-            Console.WriteLine("                     sweep. Safe to run repeatedly before a real poll.");
+            Console.WriteLine("       scheduled task/cron - the same command serves both. Lists every item created");
+            Console.WriteLine("       or updated since the last poll (QueryFiles' date filters, incompatible-flagged");
+            Console.WriteLine("       items included) and archives just the new/changed ones the same way");
+            Console.WriteLine("       \"download -app\" would. Anonymous, and no limit on how long between polls -");
+            Console.WriteLine("       a longer gap just lists more. Each poll re-lists a 48h overlap before the last");
+            Console.WriteLine("       one's start (items can appear in listings hours after their own timestamps);");
+            Console.WriteLine("       re-listed items already current are skipped without further calls. A poll");
+            Console.WriteLine("       that fails or is interrupted doesn't advance, so the next one re-asks the");
+            Console.WriteLine("       same window. A catalog's first poll lists everything since its bootstrap.");
+            Console.WriteLine("       Full history is fetched by default for every new/changed item, same reasoning");
+            Console.WriteLine("       as bootstrap's own -shallow above - a listing only ever shows an item's current");
+            Console.WriteLine("       state, so without it an item updated twice between two polls would silently");
+            Console.WriteLine("       lose the version in between.");
+            Console.WriteLine("  -dry-run           Report what would be checked/downloaded - lists, but fetches");
+            Console.WriteLine("                     and changes nothing else: no catalog update, no mark advance,");
+            Console.WriteLine("                     no backfill sweep. Safe to run repeatedly before a real poll.");
+            Console.WriteLine("  -since <date>      List from this point instead (yyyy-mm-dd as UTC, or a Unix");
+            Console.WriteLine("                     timestamp) - e.g. a periodic deeper re-check. The mark still");
+            Console.WriteLine("                     advances normally afterward.");
+            Console.WriteLine("  -overlap-hours <n> How far before the last poll's start to re-list (default 48)");
+            Console.WriteLine("  -item-changes      Use the old GetItemChanges delta instead of listing. Needs an");
+            Console.WriteLine("                     authenticated login, is rejected (exit code 2) for a watermark");
+            Console.WriteLine("                     more than a few days old on a busy app, and never reports a new");
+            Console.WriteLine("                     item that hasn't been updated since creation - kept for");
+            Console.WriteLine("                     comparison only.");
             Console.WriteLine("  -catalog-only      Update the catalog (and, unless -shallow, full history) for");
             Console.WriteLine("                     every changed item exactly as a real poll would, but never call");
             Console.WriteLine("                     the archive step - no manifest fetch, no content/chunk download.");
@@ -525,7 +584,7 @@ namespace DepotDownloader
             Console.WriteLine("          a stale/wrong title or kind that was never re-detected by either mechanism,");
             Console.WriteLine("          and an item Steam banned or its author made private/unlisted - which simply");
             Console.WriteLine("          stops appearing everywhere else with no signal as to why. Catalog-only, like");
-            Console.WriteLine("          bootstrap's plain default - never downloads content. Anonymous (unlike poll).");
+            Console.WriteLine("          bootstrap's plain default - never downloads content. Anonymous.");
             Console.WriteLine("  -only <id,id2,...> Restrict to specific catalog IDs instead of the whole thing");
             Console.WriteLine("  -batch-size <n>    IDs per GetDetails request (default 100). Steam's real per-");
             Console.WriteLine("                     request limit isn't established here - lower this if a run");
@@ -561,8 +620,8 @@ namespace DepotDownloader
             Console.WriteLine("COMMON OPTIONS:");
             Console.WriteLine("  -output <dir>      Root output directory (default: current directory, same as");
             Console.WriteLine("                     \"download -raw\" - catalog and manifests land under depot/<appid>/)");
-            Console.WriteLine("  -username <user>   Steam account (bootstrap/refresh/ad-hoc download can run");
-            Console.WriteLine("                     anonymously; poll cannot - see above)");
+            Console.WriteLine("  -username <user>   Steam account (everything here runs anonymously except");
+            Console.WriteLine("                     poll -item-changes - see above)");
             Console.WriteLine("  -remember-password Save a login token for reuse on the next run");
             Console.WriteLine();
             Console.WriteLine("EXAMPLES:");
@@ -570,7 +629,8 @@ namespace DepotDownloader
             Console.WriteLine("  depotdownloader workshop download -app 4000                      # current version of everything tracked");
             Console.WriteLine("  depotdownloader workshop download -app 4000 -history -only 2956730580");
             Console.WriteLine("  depotdownloader workshop download -workshop 123456 789012        # ad-hoc, no bootstrap needed");
-            Console.WriteLine("  depotdownloader workshop poll -app 4000 -username myaccount -remember-password");
+            Console.WriteLine("  depotdownloader workshop poll -app 4000                          # new/changed since the last poll");
+            Console.WriteLine("  depotdownloader workshop poll -app 4000 -catalog-only -since 2026-09-01");
             Console.WriteLine("  depotdownloader workshop refresh -app 4000                       # re-verify/correct everything known");
             Console.WriteLine("  depotdownloader workshop status -app 4000 -list -banned-only     # see what refresh found banned");
             Console.WriteLine("  depotdownloader workshop status -app 4000 -only 2956730580 -list -show-history  # one item's full history");
