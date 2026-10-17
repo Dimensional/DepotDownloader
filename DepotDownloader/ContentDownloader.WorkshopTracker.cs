@@ -1363,9 +1363,11 @@ namespace DepotDownloader
         private static async Task<bool> FetchAndRecordHistoryAsync(WorkshopCatalogDb catalog, ulong publishedFileId)
         {
             var (changes, confirmedEmpty) = await GetFullChangeHistoryAsync(publishedFileId);
+            catalog.TryGetItem(publishedFileId, out var item, includeHistory: changes.Count == 0);
+
             if (changes.Count == 0)
             {
-                if (!confirmedEmpty || !catalog.TryGetItem(publishedFileId, out var item))
+                if (!confirmedEmpty || item == null)
                 {
                     return false;
                 }
@@ -1376,17 +1378,30 @@ namespace DepotDownloader
                 return true;
             }
 
-            var entries = changes
-                .OrderBy(c => c.timestamp)
-                .Select(c => new WorkshopHistoryEntry
-                {
-                    Timestamp = c.timestamp,
-                    ManifestId = c.manifest_id,
-                    ChangeDescription = c.change_description,
-                })
-                .ToList();
+            var entries = ToHistoryEntries(item != null ? WithCurrentVersion(changes, item.ManifestId, item.TimeUpdated) : changes);
             catalog.ReplaceHistory(publishedFileId, entries, complete: true);
             return true;
+        }
+
+        /// <summary>
+        /// Steam's changelog (GetChangeHistory) doesn't record every content update - confirmed
+        /// live on depot 4000: ~620 items (chunk-based and ancient alike) had a current manifest
+        /// that wasn't in their changelog, and 19 of 20 re-checked weeks later still didn't have
+        /// it there, their newest entry sometimes years older than their last update. Appends the
+        /// item's current version when the changelog lacks it, so recorded history and "-history"
+        /// downloads always include what's actually live now. Its timestamp is the item's
+        /// time_updated as last recorded - the content change happened at or before then (a later
+        /// metadata-only edit can move time_updated too). An empty changelog is left alone: that's
+        /// either a failed fetch or a confirmed-empty one, which callers handle themselves.
+        /// </summary>
+        private static List<CPublishedFile_GetChangeHistory_Response.ChangeLog> WithCurrentVersion(List<CPublishedFile_GetChangeHistory_Response.ChangeLog> changes, ulong currentManifestId, uint currentTimeUpdated)
+        {
+            if (currentManifestId == 0 || changes.Count == 0 || changes.Any(c => c.manifest_id == currentManifestId))
+            {
+                return changes;
+            }
+
+            return [.. changes, new CPublishedFile_GetChangeHistory_Response.ChangeLog { manifest_id = currentManifestId, timestamp = currentTimeUpdated }];
         }
 
         /// <summary>
@@ -1498,7 +1513,8 @@ namespace DepotDownloader
         /// Archives one item, shared by both the catalog-driven and ad-hoc download entry points
         /// below. Without history: current version only, same as a normal "download -workshop
         /// -raw" per item. With history, for a ChunkBased item: walks GetChangeHistory and
-        /// downloads EVERY historical manifest_id, not just current - Steam retains old depot
+        /// downloads EVERY historical manifest_id, not just current (plus the current one when the
+        /// changelog doesn't list it - see WithCurrentVersion) - Steam retains old depot
         /// chunk data by design, so this is genuinely retrievable (a 404 on a very old manifest's
         /// chunks is possible - see the CDN cold-storage note elsewhere in this codebase - but not
         /// expected to be the norm). With history, for an AncientUgc item: necessarily best-effort
@@ -1518,14 +1534,15 @@ namespace DepotDownloader
         /// live, for a caller to persist back into the catalog if it wants to (a nice side benefit,
         /// not something this method relies on for correctness).
         /// </summary>
-        private static async Task<(int Downloaded, int Failed, List<WorkshopHistoryEntry> FetchedHistory)> ArchiveWorkshopItemAsync(uint appId, ulong publishedFileId, string title, WorkshopItemKind kind, ulong currentManifestId, bool history, RawDownloadOptions options)
+        private static async Task<(int Downloaded, int Failed, List<WorkshopHistoryEntry> FetchedHistory)> ArchiveWorkshopItemAsync(uint appId, ulong publishedFileId, string title, WorkshopItemKind kind, ulong currentManifestId, uint currentTimeUpdated, bool history, RawDownloadOptions options)
         {
             var downloaded = 0;
             var failed = 0;
 
             if (history && kind == WorkshopItemKind.ChunkBased)
             {
-                var (changes, _) = await GetFullChangeHistoryAsync(publishedFileId);
+                var (changelog, _) = await GetFullChangeHistoryAsync(publishedFileId);
+                var changes = WithCurrentVersion(changelog, currentManifestId, currentTimeUpdated);
                 var fetchedHistory = ToHistoryEntries(changes);
 
                 if (changes.Count == 0)
@@ -1535,7 +1552,8 @@ namespace DepotDownloader
                 }
                 else
                 {
-                    Console.WriteLine($"  {publishedFileId} \"{SanitizeTitleForDisplay(title)}\": {changes.Count} historical version(s)");
+                    Console.WriteLine($"  {publishedFileId} \"{SanitizeTitleForDisplay(title)}\": {changes.Count} historical version(s)" +
+                        (changes.Count > changelog.Count ? " (including the current one, which Steam's changelog doesn't list)" : ""));
                 }
 
                 foreach (var change in changes)
@@ -1558,7 +1576,8 @@ namespace DepotDownloader
             List<WorkshopHistoryEntry> fetchedAncientHistory = null;
             if (history && kind == WorkshopItemKind.AncientUgc)
             {
-                var (changes, _) = await GetFullChangeHistoryAsync(publishedFileId);
+                var (changelog, _) = await GetFullChangeHistoryAsync(publishedFileId);
+                var changes = WithCurrentVersion(changelog, currentManifestId, currentTimeUpdated);
                 fetchedAncientHistory = ToHistoryEntries(changes);
 
                 if (changes.Count > 1)
@@ -1676,7 +1695,7 @@ namespace DepotDownloader
                 }
                 processed++;
 
-                var (d, f, fetchedHistory) = await ArchiveWorkshopItemAsync(appId, item.PublishedFileId, item.Title, item.Kind, item.ManifestId, history, options);
+                var (d, f, fetchedHistory) = await ArchiveWorkshopItemAsync(appId, item.PublishedFileId, item.Title, item.Kind, item.ManifestId, item.TimeUpdated, history, options);
                 downloaded += d;
                 failed += f;
 
@@ -1742,7 +1761,7 @@ namespace DepotDownloader
 
                 var kind = !string.IsNullOrEmpty(details.file_url) ? WorkshopItemKind.AncientUgc : WorkshopItemKind.ChunkBased;
 
-                var (d, f, fetchedHistory) = await ArchiveWorkshopItemAsync(details.consumer_appid, id, details.title, kind, details.hcontent_file, history, options);
+                var (d, f, fetchedHistory) = await ArchiveWorkshopItemAsync(details.consumer_appid, id, details.title, kind, details.hcontent_file, details.time_updated, history, options);
                 downloaded += d;
                 failed += f;
 

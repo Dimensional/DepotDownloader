@@ -742,6 +742,12 @@ this during a walk - items are recorded with just their current version and mark
 history-incomplete, backfilled later instead of paid for up front. Worth using on a large workshop's
 first bootstrap, since a per-item history fetch adds real time at scale.
 
+Steam's changelog doesn't list every content update - some items' current version is missing from
+it, sometimes for years. When that happens the current version is added to the recorded history (with
+the item's last-updated time), so history always includes what's live now. Catalogs recorded before
+this was handled get the affected items re-queued for backfill automatically the first time a newer
+build opens them.
+
 Incomplete items are backfilled two ways:
 - **Organically**: any item `poll` reports as changed gets a full history re-fetch regardless of its
   current completeness.
@@ -767,7 +773,8 @@ Chunk-based items land at `depot/<appid>/manifest/<workshopId>_<title>_<manifest
 go through the UGC direct-download path with their own per-item sidecar
 (`ugc/<appid>/<id>/_meta.json`), so re-checking an unchanged ancient item is cheap.
 
-`-history` downloads every historical version via `GetChangeHistory`. For ancient UGC this is
+`-history` downloads every historical version via `GetChangeHistory`, plus the current version when
+the changelog doesn't list it. For ancient UGC this is
 best-effort: only the current version's file is actually fetchable, so an old version can be
 discovered and logged but not necessarily re-downloaded.
 

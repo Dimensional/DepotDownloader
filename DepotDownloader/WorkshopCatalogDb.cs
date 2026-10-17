@@ -237,6 +237,7 @@ namespace DepotDownloader
             }
 
             EnsureSchema(connection, appId);
+            ApplyDataFixes(connection);
 
             var db = new WorkshopCatalogDb(connection, appId);
             db.LoadMeta();
@@ -262,7 +263,8 @@ namespace DepotDownloader
                         LastRecordedCreationTime INTEGER NOT NULL DEFAULT 0,
                         IncompatibleWalkCursor TEXT NOT NULL DEFAULT '*',
                         IncompatibleWalkCompleted INTEGER NOT NULL DEFAULT 0,
-                        SweepMark INTEGER NOT NULL DEFAULT 0
+                        SweepMark INTEGER NOT NULL DEFAULT 0,
+                        DataFixLevel INTEGER NOT NULL DEFAULT 0
                     );
 
                     CREATE TABLE IF NOT EXISTS items (
@@ -318,7 +320,7 @@ namespace DepotDownloader
             }
 
             // Migration for a catalog created before IncompatibleWalkCursor/IncompatibleWalkCompleted/
-            // SweepMark existed - "CREATE TABLE IF NOT EXISTS" above is a no-op against an already-existing
+            // SweepMark/DataFixLevel existed - "CREATE TABLE IF NOT EXISTS" above is a no-op against an already-existing
             // table, so an existing file needs these columns added explicitly. SQLite has no
             // "ADD COLUMN IF NOT EXISTS", so check via PRAGMA table_info first.
             var existingColumns = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -351,6 +353,63 @@ namespace DepotDownloader
                 using var alter = connection.CreateCommand();
                 alter.CommandText = "ALTER TABLE catalog_meta ADD COLUMN SweepMark INTEGER NOT NULL DEFAULT 0";
                 alter.ExecuteNonQuery();
+            }
+
+            if (!existingColumns.Contains("DataFixLevel"))
+            {
+                using var alter = connection.CreateCommand();
+                alter.CommandText = "ALTER TABLE catalog_meta ADD COLUMN DataFixLevel INTEGER NOT NULL DEFAULT 0";
+                alter.ExecuteNonQuery();
+            }
+        }
+
+        /// <summary>One-time repairs to data an older build already recorded - tracked by
+        /// catalog_meta.DataFixLevel so each runs exactly once per catalog, unlike the schema
+        /// changes in EnsureSchema, which can tell from the schema itself whether they're needed.
+        /// Deliberately not one of the in-memory meta fields, so SaveMeta can never write an older
+        /// level back over a newer one.
+        ///
+        /// Level 1: Steam's changelog (GetChangeHistory) doesn't record every content update -
+        /// confirmed live on depot 4000, where ~620 items' history was marked complete without
+        /// containing their current version, and 19 of 20 re-checked weeks later were still
+        /// missing it from Steam's changelog. History fetches now add the current version when
+        /// it's missing (see ContentDownloader.FetchAndRecordHistoryAsync); this re-queues the
+        /// items recorded before that for the backfill sweep, so they get it too.</summary>
+        private static void ApplyDataFixes(SqliteConnection connection)
+        {
+            long level;
+            using (var check = connection.CreateCommand())
+            {
+                check.CommandText = "SELECT DataFixLevel FROM catalog_meta LIMIT 1";
+                level = (long)check.ExecuteScalar();
+            }
+
+            if (level >= 1)
+            {
+                return;
+            }
+
+            int requeued;
+            using (var transaction = connection.BeginTransaction())
+            using (var cmd = connection.CreateCommand())
+            {
+                cmd.Transaction = transaction;
+                cmd.CommandText = """
+                    UPDATE items SET HistoryComplete = 0
+                    WHERE HistoryComplete = 1 AND Deleted = 0 AND ManifestId != 0
+                      AND NOT EXISTS (SELECT 1 FROM history h WHERE h.PublishedFileId = items.PublishedFileId AND h.ManifestId = items.ManifestId)
+                    """;
+                requeued = cmd.ExecuteNonQuery();
+                cmd.CommandText = "UPDATE catalog_meta SET DataFixLevel = 1";
+                cmd.ExecuteNonQuery();
+                transaction.Commit();
+            }
+
+            if (requeued > 0)
+            {
+                // The only console output in this class - a one-time upgrade note, so the next
+                // backfill's larger-than-usual count isn't a mystery.
+                Console.WriteLine($"Catalog upgrade: {requeued:N0} item(s) whose recorded history was missing their current version are queued for the history backfill.");
             }
         }
 
