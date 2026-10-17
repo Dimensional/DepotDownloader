@@ -1176,8 +1176,11 @@ namespace DepotDownloader
             Console.WriteLine($"App:                {catalog.AppId}");
             Console.WriteLine($"Catalog path:       {catalogPath}");
             Console.WriteLine($"Items recorded:     {total:N0}  (chunk-based: {chunkBased:N0}, ancient UGC: {ancientUgc:N0}, unclassified: {unknownKind:N0})");
+            var backfillable = catalog.CountIncompleteHistory();
+            var deletedIncomplete = total - historyComplete - backfillable;
             Console.WriteLine($"Full history known: {historyComplete:N0} of {total:N0}" +
-                (historyComplete < total ? " - the rest will backfill gradually on future bootstrap/poll runs (see -backfill-batch)." : ""));
+                (backfillable > 0 ? $" - {backfillable:N0} more will backfill gradually on future bootstrap/poll runs (see -backfill-batch)." : "") +
+                (deletedIncomplete > 0 ? $" {deletedIncomplete:N0} deleted item(s) never will." : ""));
             Console.WriteLine($"Bootstrap complete: {catalog.BootstrapCompleted}");
             Console.WriteLine($"Incompatible-items pass complete: {catalog.IncompatibleWalkCompleted}");
             Console.WriteLine($"Query type:         {catalog.QueryType}" +
@@ -1298,11 +1301,14 @@ namespace DepotDownloader
         /// Every historical entry for one item, fully paginated - most items have far fewer
         /// changes than one page, but this doesn't assume that. Returns an empty list (rather than
         /// throwing) on any failure, since a single item's history being unavailable shouldn't
-        /// abort a whole catalog-wide "download -history" walk.
+        /// abort a whole catalog-wide "download -history" walk. ConfirmedEmpty distinguishes the
+        /// one empty result that isn't a failure: Steam answering OK with no entries and a total of
+        /// 0 (see FetchAndRecordHistoryAsync).
         /// </summary>
-        private static async Task<List<CPublishedFile_GetChangeHistory_Response.ChangeLog>> GetFullChangeHistoryAsync(ulong publishedFileId)
+        private static async Task<(List<CPublishedFile_GetChangeHistory_Response.ChangeLog> Changes, bool ConfirmedEmpty)> GetFullChangeHistoryAsync(ulong publishedFileId)
         {
             var all = new List<CPublishedFile_GetChangeHistory_Response.ChangeLog>();
+            var confirmedEmpty = false;
             uint startIndex = 0;
             const uint pageSize = 100;
 
@@ -1314,6 +1320,7 @@ namespace DepotDownloader
                         () => steam3.GetChangeHistory(publishedFileId, startIndex, pageSize));
                     if (result != EResult.OK || body == null || body.changes.Count == 0)
                     {
+                        confirmedEmpty = startIndex == 0 && result == EResult.OK && body != null && body.total == 0;
                         break;
                     }
 
@@ -1334,7 +1341,7 @@ namespace DepotDownloader
                 // that, fall through with whatever was gathered before the failure.
             }
 
-            return all;
+            return (all, confirmedEmpty);
         }
 
         /// <summary>
@@ -1343,18 +1350,30 @@ namespace DepotDownloader
         /// item's very first history fetch or a backfill of a previously "-shallow" one. Always a
         /// full overwrite, never a merge (GetChangeHistory has no "since" filter of its own, so
         /// every fetch returns the complete list anyway - see WorkshopCatalogItem's doc comment).
-        /// Does nothing (returns false) when GetChangeHistory came back empty - a real item always
-        /// has at least its own creation as one entry, so an empty result means the fetch failed
-        /// (already retried internally) rather than "genuinely no history"; leaving the item's
-        /// existing HistoryComplete/history untouched lets a later run retry instead of wrongly
-        /// trusting a blank list as the truth.
+        ///
+        /// Returns false, leaving the item's existing HistoryComplete/history untouched so a later
+        /// run retries, when the fetch failed (already retried internally) - a non-OK result, or
+        /// no answer at all. An OK answer with no entries and a total of 0 is different: confirmed
+        /// live on depot 4000, where ~190 still-resolving items (nearly all 2013-2020 ancient UGC)
+        /// answered exactly that way on every retry - Steam genuinely has no changelog for them.
+        /// Treating that as a failure kept them at the front of the backfill queue forever, so it
+        /// counts as complete instead: whatever's already recorded, or failing that the item's
+        /// current version (exactly what -shallow seeds), is its whole known history.
         /// </summary>
         private static async Task<bool> FetchAndRecordHistoryAsync(WorkshopCatalogDb catalog, ulong publishedFileId)
         {
-            var changes = await GetFullChangeHistoryAsync(publishedFileId);
+            var (changes, confirmedEmpty) = await GetFullChangeHistoryAsync(publishedFileId);
             if (changes.Count == 0)
             {
-                return false;
+                if (!confirmedEmpty || !catalog.TryGetItem(publishedFileId, out var item))
+                {
+                    return false;
+                }
+
+                catalog.ReplaceHistory(publishedFileId,
+                    item.History.Count > 0 ? item.History : [new WorkshopHistoryEntry { Timestamp = item.TimeUpdated, ManifestId = item.ManifestId }],
+                    complete: true);
+                return true;
             }
 
             var entries = changes
@@ -1386,6 +1405,13 @@ namespace DepotDownloader
         /// so there's nothing left to buffer or throttle saving. A crash mid-sweep loses at most
         /// whichever single item's fetch was in flight, not a batch of already-fetched-but-unsaved
         /// ones.
+        ///
+        /// Items marked Deleted are skipped (see GetIncompleteHistoryIds), and any fetch that fails
+        /// outright is followed up with GetDetails to see whether the item is simply gone - see
+        /// MarkDeletedIfGoneAsync. Without both, the queue's head (always the lowest IDs) filled up
+        /// with items that can never succeed and every run retried the same batch: confirmed live
+        /// on depot 4000, where the whole 200-item head was permanently unfetchable and 2,832 of
+        /// 3,026 stuck items no longer existed at all.
         /// </summary>
         private static async Task BackfillIncompleteHistoryAsync(WorkshopCatalogDb catalog, uint batchSize)
         {
@@ -1403,20 +1429,69 @@ namespace DepotDownloader
             Console.WriteLine($"Backfilling full history for {candidates.Count:N0} item(s) still marked incomplete...");
 
             var fetched = 0;
+            var failedIds = new List<ulong>();
             foreach (var id in candidates)
             {
                 if (await FetchAndRecordHistoryAsync(catalog, id))
                 {
                     fetched++;
                 }
+                else
+                {
+                    failedIds.Add(id);
+                }
 
                 await Task.Delay(WorkshopApiPacingDelay);
             }
 
+            var newlyDeleted = await MarkDeletedIfGoneAsync(catalog, failedIds);
+
             var remaining = catalog.CountIncompleteHistory();
-            Console.WriteLine(remaining > 0
-                ? $"Backfill: {fetched:N0}/{candidates.Count:N0} succeeded this pass. {remaining:N0} item(s) still incomplete - will continue on future runs."
-                : $"Backfill: {fetched:N0}/{candidates.Count:N0} succeeded this pass. No incomplete items remain.");
+            Console.WriteLine($"Backfill: {fetched:N0}/{candidates.Count:N0} succeeded this pass" +
+                (newlyDeleted > 0 ? $"; {newlyDeleted:N0} no longer exist on Steam (GetDetails: FileNotFound) and are now marked deleted, so they won't be retried" : "") +
+                (remaining > 0 ? $". {remaining:N0} item(s) still incomplete - will continue on future runs." : ". No incomplete items remain."));
+        }
+
+        /// <summary>Asks GetDetails about items whose history fetch just failed, and marks the ones
+        /// Steam reports FileNotFound as Deleted - the same confirmed "gone outright" signal
+        /// "workshop refresh" uses (a later refresh clears it again if the item ever resolves).
+        /// Best-effort: one batched call per 100 IDs, and a failed call just leaves those items for
+        /// next time. Returns how many were newly marked.</summary>
+        private static async Task<int> MarkDeletedIfGoneAsync(WorkshopCatalogDb catalog, List<ulong> ids)
+        {
+            var marked = 0;
+
+            foreach (var batch in ids.Chunk(100))
+            {
+                try
+                {
+                    var (result, details) = await WithTransientRetryAsync("GetDetails", () => steam3.GetPublishedFileDetailsBatch(batch));
+                    if (result != EResult.OK || details == null)
+                    {
+                        continue;
+                    }
+
+                    foreach (var d in details)
+                    {
+                        if ((EResult)d.result == EResult.FileNotFound
+                            && catalog.TryGetItem(d.publishedfileid, out var item, includeHistory: false)
+                            && !item.Deleted)
+                        {
+                            item.Deleted = true;
+                            catalog.UpsertItem(item);
+                            marked++;
+                        }
+                    }
+                }
+                catch (Exception ex) when (IsTransientNetworkException(ex))
+                {
+                    // Retries exhausted - these items stay in the queue for a later run.
+                }
+
+                await Task.Delay(WorkshopApiPacingDelay);
+            }
+
+            return marked;
         }
 
         /// <summary>
@@ -1450,7 +1525,7 @@ namespace DepotDownloader
 
             if (history && kind == WorkshopItemKind.ChunkBased)
             {
-                var changes = await GetFullChangeHistoryAsync(publishedFileId);
+                var (changes, _) = await GetFullChangeHistoryAsync(publishedFileId);
                 var fetchedHistory = ToHistoryEntries(changes);
 
                 if (changes.Count == 0)
@@ -1483,7 +1558,7 @@ namespace DepotDownloader
             List<WorkshopHistoryEntry> fetchedAncientHistory = null;
             if (history && kind == WorkshopItemKind.AncientUgc)
             {
-                var changes = await GetFullChangeHistoryAsync(publishedFileId);
+                var (changes, _) = await GetFullChangeHistoryAsync(publishedFileId);
                 fetchedAncientHistory = ToHistoryEntries(changes);
 
                 if (changes.Count > 1)
@@ -1508,8 +1583,9 @@ namespace DepotDownloader
         }
 
         /// <summary>Maps a raw GetChangeHistory page into catalog-storage form, oldest first. Null
-        /// (not empty) when the fetch came back with nothing - see FetchAndRecordHistoryAsync for
-        /// why that distinction matters (empty means "fetch failed," not "genuinely no history").</summary>
+        /// (not empty) when the fetch came back with nothing, so the caller records the entry as
+        /// incomplete rather than trusting a blank list - see FetchAndRecordHistoryAsync for the
+        /// one empty answer that is trustworthy.</summary>
         private static List<WorkshopHistoryEntry> ToHistoryEntries(List<CPublishedFile_GetChangeHistory_Response.ChangeLog> changes)
         {
             if (changes == null || changes.Count == 0)

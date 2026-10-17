@@ -748,7 +748,10 @@ Incomplete items are backfilled two ways:
 - **Via a bounded sweep**: `-backfill-batch <n>` (default 200; 0 disables) runs at the start of every
   `bootstrap` or `poll` invocation, fetching full history for up to `n` items still marked
   incomplete. It's a per-run cap, not "keep going until none remain" - a large backlog is cleared
-  across several invocations.
+  across several invocations. Items marked deleted are skipped. When a history fetch fails, the item
+  is checked with `GetDetails`, and if Steam reports it gone (`FileNotFound`) it's marked deleted,
+  the same as `refresh` would. An item Steam answers with an empty changelog (common for older
+  ancient-UGC items) counts as complete, with its current version as its only known one.
 
 ### Download
 

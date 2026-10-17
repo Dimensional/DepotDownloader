@@ -641,12 +641,15 @@ namespace DepotDownloader
 
         /// <summary>Up to <paramref name="limit"/> IDs still marked HistoryComplete == 0 - what the
         /// backfill sweep works through. Index-backed (see the partial index in EnsureSchema), so
-        /// this stays cheap even once the vast majority of a large catalog is already complete.</summary>
+        /// this stays cheap even once the vast majority of a large catalog is already complete.
+        /// No ORDER BY, so in practice the same lowest IDs come back every call until they
+        /// complete - which is why Deleted items are excluded: their history can never be fetched,
+        /// and enough of them at the front used to stall the sweep for good.</summary>
         public List<ulong> GetIncompleteHistoryIds(int limit)
         {
             var ids = new List<ulong>();
             using var cmd = _connection.CreateCommand();
-            cmd.CommandText = "SELECT PublishedFileId FROM items WHERE HistoryComplete = 0 LIMIT @limit";
+            cmd.CommandText = "SELECT PublishedFileId FROM items WHERE HistoryComplete = 0 AND Deleted = 0 LIMIT @limit";
             cmd.Parameters.AddWithValue("@limit", limit);
             using var reader = cmd.ExecuteReader();
             while (reader.Read())
@@ -656,10 +659,12 @@ namespace DepotDownloader
             return ids;
         }
 
+        /// <summary>What the backfill sweep still has left to try - Deleted items excluded, same
+        /// as GetIncompleteHistoryIds.</summary>
         public int CountIncompleteHistory()
         {
             using var cmd = _connection.CreateCommand();
-            cmd.CommandText = "SELECT COUNT(*) FROM items WHERE HistoryComplete = 0";
+            cmd.CommandText = "SELECT COUNT(*) FROM items WHERE HistoryComplete = 0 AND Deleted = 0";
             return Convert.ToInt32((long)cmd.ExecuteScalar());
         }
 
